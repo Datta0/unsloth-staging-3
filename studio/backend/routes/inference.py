@@ -1218,9 +1218,11 @@ async def openai_chat_completions(
                         _DONE = object()
                         while True:
                             if cancel_event.is_set():
+                                backend.reset_generation_state()
                                 break
                             if await request.is_disconnected():
                                 cancel_event.set()
+                                backend.reset_generation_state()
                                 return
                             chunk_text = await asyncio.to_thread(next, gen, _DONE)
                             if chunk_text is _DONE:
@@ -1260,15 +1262,19 @@ async def openai_chat_completions(
                     finally:
                         _tracker.__exit__(None, None, None)
 
-                return StreamingResponse(
-                    audio_input_stream(),
-                    media_type = "text/event-stream",
-                    headers = {
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no",
-                    },
-                )
+                try:
+                    return StreamingResponse(
+                        audio_input_stream(),
+                        media_type = "text/event-stream",
+                        headers = {
+                            "Cache-Control": "no-cache",
+                            "Connection": "keep-alive",
+                            "X-Accel-Buffering": "no",
+                        },
+                    )
+                except BaseException:
+                    _tracker.__exit__(None, None, None)
+                    raise
             else:
                 full_text = "".join(audio_input_generate())
                 response = ChatCompletion(
@@ -1640,15 +1646,19 @@ async def openai_chat_completions(
                 finally:
                     _tracker.__exit__(None, None, None)
 
-            return StreamingResponse(
-                gguf_tool_stream(),
-                media_type = "text/event-stream",
-                headers = {
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
+            try:
+                return StreamingResponse(
+                    gguf_tool_stream(),
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            except BaseException:
+                _tracker.__exit__(None, None, None)
+                raise
 
         # ── Standard GGUF path (no tools) ─────────────────────
 
@@ -1785,15 +1795,19 @@ async def openai_chat_completions(
                 finally:
                     _tracker.__exit__(None, None, None)
 
-            return StreamingResponse(
-                gguf_stream_chunks(),
-                media_type = "text/event-stream",
-                headers = {
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                },
-            )
+            try:
+                return StreamingResponse(
+                    gguf_stream_chunks(),
+                    media_type = "text/event-stream",
+                    headers = {
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
+                )
+            except BaseException:
+                _tracker.__exit__(None, None, None)
+                raise
         else:
             try:
                 full_text = ""
@@ -1974,15 +1988,19 @@ async def openai_chat_completions(
             finally:
                 _tracker.__exit__(None, None, None)
 
-        return StreamingResponse(
-            stream_chunks(),
-            media_type = "text/event-stream",
-            headers = {
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no",
-            },
-        )
+        try:
+            return StreamingResponse(
+                stream_chunks(),
+                media_type = "text/event-stream",
+                headers = {
+                    "Cache-Control": "no-cache",
+                    "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                },
+            )
+        except BaseException:
+            _tracker.__exit__(None, None, None)
+            raise
 
     # ── Non-streaming response ────────────────────────────────────
     else:
@@ -2628,6 +2646,7 @@ async def anthropic_messages(
                 presence_penalty = presence_penalty,
                 tool_choice = openai_tool_choice,
                 session_id = payload.session_id,
+                cancel_id = payload.cancel_id,
             )
         return await _anthropic_passthrough_non_streaming(
             llama_backend,
@@ -2745,6 +2764,8 @@ async def anthropic_messages(
                 _run_tool_gen,
                 message_id,
                 model_name,
+                session_id = payload.session_id,
+                cancel_id = payload.cancel_id,
             )
         return await _anthropic_tool_non_streaming(
             _run_tool_gen,
@@ -2774,6 +2795,8 @@ async def anthropic_messages(
             _run_plain_gen,
             message_id,
             model_name,
+            session_id = payload.session_id,
+            cancel_id = payload.cancel_id,
         )
     return await _anthropic_plain_non_streaming(
         _run_plain_gen,
@@ -2788,45 +2811,59 @@ async def _anthropic_tool_stream(
     run_gen,
     message_id,
     model_name,
+    session_id = None,
+    cancel_id = None,
 ):
     """Streaming response for the tool-calling path."""
     _sentinel = object()
 
+    _tracker = _TrackedCancel(cancel_event, cancel_id, session_id, message_id)
+    _tracker.__enter__()
+
     async def _stream():
         emitter = AnthropicStreamEmitter()
-        for line in emitter.start(message_id, model_name):
-            yield line
-
-        gen = run_gen()
         try:
-            while True:
-                if await request.is_disconnected():
-                    cancel_event.set()
-                    return
-                event = await asyncio.to_thread(next, gen, _sentinel)
-                if event is _sentinel:
-                    break
-                # Strip leaked tool-call XML from content events
-                if event.get("type") == "content":
-                    event = dict(event)
-                    event["text"] = _TOOL_XML_RE.sub("", event["text"])
-                for line in emitter.feed(event):
-                    yield line
-        except Exception as e:
-            logger.error("anthropic_messages stream error: %s", e)
+            for line in emitter.start(message_id, model_name):
+                yield line
 
-        for line in emitter.finish("end_turn"):
-            yield line
+            gen = run_gen()
+            try:
+                while True:
+                    if cancel_event.is_set():
+                        break
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        return
+                    event = await asyncio.to_thread(next, gen, _sentinel)
+                    if event is _sentinel:
+                        break
+                    # Strip leaked tool-call XML from content events
+                    if event.get("type") == "content":
+                        event = dict(event)
+                        event["text"] = _TOOL_XML_RE.sub("", event["text"])
+                    for line in emitter.feed(event):
+                        yield line
+            except Exception as e:
+                logger.error("anthropic_messages stream error: %s", e)
 
-    return StreamingResponse(
-        _stream(),
-        media_type = "text/event-stream",
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+            for line in emitter.finish("end_turn"):
+                yield line
+        finally:
+            _tracker.__exit__(None, None, None)
+
+    try:
+        return StreamingResponse(
+            _stream(),
+            media_type = "text/event-stream",
+            headers = {
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except BaseException:
+        _tracker.__exit__(None, None, None)
+        raise
 
 
 async def _anthropic_plain_stream(
@@ -2835,47 +2872,61 @@ async def _anthropic_plain_stream(
     run_gen,
     message_id,
     model_name,
+    session_id = None,
+    cancel_id = None,
 ):
     """Streaming response for the no-tool path."""
     _sentinel = object()
 
+    _tracker = _TrackedCancel(cancel_event, cancel_id, session_id, message_id)
+    _tracker.__enter__()
+
     async def _stream():
         emitter = AnthropicStreamEmitter()
-        for line in emitter.start(message_id, model_name):
-            yield line
-
-        gen = run_gen()
         try:
-            while True:
-                if await request.is_disconnected():
-                    cancel_event.set()
-                    return
-                cumulative = await asyncio.to_thread(next, gen, _sentinel)
-                if cumulative is _sentinel:
-                    break
-                if isinstance(cumulative, dict):
-                    if cumulative.get("type") == "metadata":
-                        for line in emitter.feed(cumulative):
-                            yield line
-                    continue
-                # Plain generator yields cumulative text strings
-                for line in emitter.feed({"type": "content", "text": cumulative}):
-                    yield line
-        except Exception as e:
-            logger.error("anthropic_messages stream error: %s", e)
+            for line in emitter.start(message_id, model_name):
+                yield line
 
-        for line in emitter.finish("end_turn"):
-            yield line
+            gen = run_gen()
+            try:
+                while True:
+                    if cancel_event.is_set():
+                        break
+                    if await request.is_disconnected():
+                        cancel_event.set()
+                        return
+                    cumulative = await asyncio.to_thread(next, gen, _sentinel)
+                    if cumulative is _sentinel:
+                        break
+                    if isinstance(cumulative, dict):
+                        if cumulative.get("type") == "metadata":
+                            for line in emitter.feed(cumulative):
+                                yield line
+                        continue
+                    # Plain generator yields cumulative text strings
+                    for line in emitter.feed({"type": "content", "text": cumulative}):
+                        yield line
+            except Exception as e:
+                logger.error("anthropic_messages stream error: %s", e)
 
-    return StreamingResponse(
-        _stream(),
-        media_type = "text/event-stream",
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+            for line in emitter.finish("end_turn"):
+                yield line
+        finally:
+            _tracker.__exit__(None, None, None)
+
+    try:
+        return StreamingResponse(
+            _stream(),
+            media_type = "text/event-stream",
+            headers = {
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except BaseException:
+        _tracker.__exit__(None, None, None)
+        raise
 
 
 async def _anthropic_tool_non_streaming(run_gen, message_id, model_name):
@@ -3000,8 +3051,8 @@ def _build_passthrough_payload(
     }
     if stream:
         body["stream_options"] = {"include_usage": True}
-    body["max_tokens"] = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
-    body["t_max_predict_ms"] = _DEFAULT_T_MAX_PREDICT_MS
+    if max_tokens is not None:
+        body["max_tokens"] = max_tokens
     if stop:
         body["stop"] = stop
     if min_p is not None:
@@ -3032,6 +3083,7 @@ async def _anthropic_passthrough_stream(
     presence_penalty = None,
     tool_choice = "auto",
     session_id = None,
+    cancel_id = None,
 ):
     """Streaming client-side pass-through: forward tools to llama-server and
     translate its streaming response to Anthropic SSE without executing anything."""
@@ -3051,7 +3103,7 @@ async def _anthropic_passthrough_stream(
         tool_choice = tool_choice,
     )
 
-    _tracker = _TrackedCancel(cancel_event, session_id, message_id)
+    _tracker = _TrackedCancel(cancel_event, cancel_id, session_id, message_id)
     _tracker.__enter__()
 
     async def _stream():
@@ -3136,15 +3188,19 @@ async def _anthropic_passthrough_stream(
         for line in emitter.finish():
             yield line
 
-    return StreamingResponse(
-        _stream(),
-        media_type = "text/event-stream",
-        headers = {
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    try:
+        return StreamingResponse(
+            _stream(),
+            media_type = "text/event-stream",
+            headers = {
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    except BaseException:
+        _tracker.__exit__(None, None, None)
+        raise
 
 
 async def _anthropic_passthrough_non_streaming(
@@ -3351,6 +3407,7 @@ async def _openai_passthrough_stream(
     # a BaseException that bypasses `except httpx.RequestError`; without
     # this the tracker leaks. The generator's finally only runs once
     # iteration starts.
+    client = None
     try:
         # Dispatch BEFORE returning StreamingResponse so transport errors
         # and non-200 upstream statuses surface as real HTTP errors --
@@ -3460,6 +3517,11 @@ async def _openai_passthrough_stream(
             },
         )
     except BaseException:
+        if client is not None:
+            try:
+                await client.aclose()
+            except Exception:
+                pass
         _tracker.__exit__(None, None, None)
         raise
 
