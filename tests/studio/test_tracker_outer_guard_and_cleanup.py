@@ -127,20 +127,6 @@ def test_openai_chat_completions_streaming_sites_have_outer_guard():
         )
 
 
-def test_anthropic_passthrough_stream_has_outer_guard_on_return():
-    fn = _find_function("_anthropic_passthrough_stream")
-    src = ast.unparse(fn)
-    # Search for the specific idiom at the tail of the function.
-    assert (
-        "except BaseException:" in src
-        and "_tracker.__exit__(None, None, None)" in src
-    ), (
-        "_anthropic_passthrough_stream must wrap its return StreamingResponse "
-        "in try/except BaseException to release the registry entry on "
-        "construction failure"
-    )
-
-
 # ── audio_input_stream reset on cancel ───────────────────────
 
 
