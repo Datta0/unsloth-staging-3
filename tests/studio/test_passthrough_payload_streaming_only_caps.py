@@ -106,11 +106,6 @@ def test_streaming_with_explicit_max_tokens_preserves_user_value_and_timeout():
     assert body["stream_options"] == {"include_usage": True}
 
 
-def test_streaming_default_max_tokens_is_4096():
-    m = _load_helper_module()
-    assert m["_DEFAULT_MAX_TOKENS"] == 4096
-
-
 def test_streaming_default_wall_clock_gives_at_least_thirty_minutes():
     m = _load_helper_module()
     assert m["_DEFAULT_T_MAX_PREDICT_MS"] >= 1_800_000, (

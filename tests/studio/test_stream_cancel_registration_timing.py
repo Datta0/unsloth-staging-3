@@ -716,3 +716,100 @@ def test_audio_stream_emits_zero_chunks_on_preset_cancel():
         f"audio loop must not call next() on pre-set cancel; got "
         f"{next_calls[0]} calls"
     )
+
+
+def _find_async_gen_in_tree(name):
+    for node in ast.walk(_TREE):
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"async generator {name!r} not found")
+
+
+def _first_matching_if(fn, predicate):
+    for sub in ast.walk(fn):
+        if isinstance(sub, ast.If) and predicate(sub.test):
+            return sub
+    return None
+
+
+def _first_matching_except(fn, predicate):
+    for sub in ast.walk(fn):
+        if (
+            isinstance(sub, ast.ExceptHandler)
+            and sub.type is not None
+            and predicate(sub.type)
+        ):
+            return sub
+    return None
+
+
+def test_audio_input_stream_cancel_branch_resets_backend_state():
+    fn = _find_async_gen_in_tree("audio_input_stream")
+    branch = _first_matching_if(
+        fn,
+        lambda t: (
+            isinstance(t, ast.Call)
+            and isinstance(t.func, ast.Attribute)
+            and t.func.attr == "is_set"
+            and isinstance(t.func.value, ast.Name)
+            and t.func.value.id == "cancel_event"
+        ),
+    )
+    assert branch is not None
+    body_src = "\n".join(ast.unparse(s) for s in branch.body)
+    assert "backend.reset_generation_state()" in body_src, (
+        "audio_input_stream cancel_event.is_set() branch must call "
+        "backend.reset_generation_state() before breaking -- matches "
+        "stream_chunks, prevents KV-cache drift on the next request."
+    )
+
+
+def test_audio_input_stream_disconnect_branch_resets_backend_state():
+    fn = _find_async_gen_in_tree("audio_input_stream")
+    branch = _first_matching_if(
+        fn,
+        lambda t: (
+            isinstance(t, ast.Await)
+            and isinstance(t.value, ast.Call)
+            and isinstance(t.value.func, ast.Attribute)
+            and t.value.func.attr == "is_disconnected"
+        ),
+    )
+    assert branch is not None
+    body_src = "\n".join(ast.unparse(s) for s in branch.body)
+    assert "backend.reset_generation_state()" in body_src, (
+        "audio_input_stream is_disconnected() branch must call "
+        "backend.reset_generation_state() before returning."
+    )
+
+
+def test_audio_input_stream_cancelled_error_handler_resets_backend_state():
+    fn = _find_async_gen_in_tree("audio_input_stream")
+    handler = _first_matching_except(
+        fn,
+        lambda t: (
+            isinstance(t, ast.Attribute)
+            and t.attr == "CancelledError"
+            and isinstance(t.value, ast.Name)
+            and t.value.id == "asyncio"
+        ),
+    )
+    assert handler is not None
+    body_src = "\n".join(ast.unparse(s) for s in handler.body)
+    assert "backend.reset_generation_state()" in body_src, (
+        "audio_input_stream except asyncio.CancelledError must call "
+        "backend.reset_generation_state() before re-raising."
+    )
+
+
+def test_audio_input_stream_exception_handler_resets_backend_state():
+    fn = _find_async_gen_in_tree("audio_input_stream")
+    handler = _first_matching_except(
+        fn, lambda t: isinstance(t, ast.Name) and t.id == "Exception"
+    )
+    assert handler is not None
+    body_src = "\n".join(ast.unparse(s) for s in handler.body)
+    assert "backend.reset_generation_state()" in body_src, (
+        "audio_input_stream except Exception must call "
+        "backend.reset_generation_state() before emitting the error chunk."
+    )
