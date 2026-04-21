@@ -52,7 +52,7 @@ _MAX_REPROMPTS = 3
 # 262144 for Qwen3.5), producing many-minute zombie decodes when cancel
 # fails. t_max_predict_ms is a wall-clock backstop applied unconditionally.
 _DEFAULT_MAX_TOKENS = 4096
-_DEFAULT_T_MAX_PREDICT_MS = 600_000  # 10 min
+_DEFAULT_T_MAX_PREDICT_MS = 1_800_000  # 30 min
 _REPROMPT_MAX_CHARS = 2000
 
 # ── Pre-compiled patterns for GGUF shard detection ───────────

@@ -176,7 +176,7 @@ class _TrackedCancel:
             now = time.monotonic()
             _prune_pending(now)
             for k in self.keys:
-                if k and _PENDING_CANCELS.pop(k, None) is not None:
+                if _PENDING_CANCELS.pop(k, None) is not None:
                     should_cancel = True
         if should_cancel:
             self.event.set()
@@ -1218,9 +1218,11 @@ async def openai_chat_completions(
                         _DONE = object()
                         while True:
                             if cancel_event.is_set():
+                                backend.reset_generation_state()
                                 break
                             if await request.is_disconnected():
                                 cancel_event.set()
+                                backend.reset_generation_state()
                                 return
                             chunk_text = await asyncio.to_thread(next, gen, _DONE)
                             if chunk_text is _DONE:
@@ -1251,8 +1253,10 @@ async def openai_chat_completions(
                         yield "data: [DONE]\n\n"
                     except asyncio.CancelledError:
                         cancel_event.set()
+                        backend.reset_generation_state()
                         raise
                     except Exception as e:
+                        backend.reset_generation_state()
                         logger.error(
                             f"Error during audio input streaming: {e}", exc_info = True
                         )
@@ -3000,8 +3004,12 @@ def _build_passthrough_payload(
     }
     if stream:
         body["stream_options"] = {"include_usage": True}
-    body["max_tokens"] = max_tokens if max_tokens is not None else _DEFAULT_MAX_TOKENS
-    body["t_max_predict_ms"] = _DEFAULT_T_MAX_PREDICT_MS
+        body["t_max_predict_ms"] = _DEFAULT_T_MAX_PREDICT_MS
+    effective_max_tokens = max_tokens
+    if effective_max_tokens is None and stream:
+        effective_max_tokens = _DEFAULT_MAX_TOKENS
+    if effective_max_tokens is not None:
+        body["max_tokens"] = effective_max_tokens
     if stop:
         body["stop"] = stop
     if min_p is not None:
