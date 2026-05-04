@@ -163,13 +163,16 @@ class ExportOrchestrator:
 
     def _spawn_subprocess(self, config: dict) -> None:
         """Spawn a new export subprocess."""
+        from utils.native_path_leases import run_without_native_path_secret
+
         from .worker import run_export_process
 
         self._cmd_queue = _CTX.Queue()
         self._resp_queue = _CTX.Queue()
 
         self._proc = _CTX.Process(
-            target = run_export_process,
+            target = run_without_native_path_secret,
+            args = (run_export_process,),
             kwargs = {
                 "cmd_queue": self._cmd_queue,
                 "resp_queue": self._resp_queue,
