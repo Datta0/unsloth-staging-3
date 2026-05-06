@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { primeNativeNotificationPermission } from "@/lib/native-notifications";
 import { useCallback } from "react";
+import { toast } from "sonner";
 import { checkDatasetFormat } from "../api/datasets-api";
 import { getTrainingRun } from "../api/history-api";
 import { buildTrainingStartPayload } from "../api/mappers";
-import { startTraining, stopTraining, resetTraining } from "../api/train-api";
+import { resetTraining, startTraining, stopTraining } from "../api/train-api";
+import { isRawTextDatasetFormat } from "../lib/training-methods";
 import { syncTrainingRuntimeFromBackend } from "../lib/sync-runtime";
 import { validateTrainingConfig } from "../lib/validation";
 import { useDatasetPreviewDialogStore } from "../stores/dataset-preview-dialog-store";
@@ -13,7 +16,6 @@ import { useTrainingConfigStore } from "../stores/training-config-store";
 import { useTrainingRuntimeStore } from "../stores/training-runtime-store";
 import type { TrainingStartRequest } from "../types/api";
 import type { TrainingConfigState } from "../types/config";
-import { toast } from "sonner";
 
 /** Chatml → format-specific role remap (only for formats that differ from chatml). */
 const ROLE_REMAP: Record<string, Record<string, string>> = {
@@ -50,6 +52,8 @@ export function useTrainingActions() {
       return false;
     }
 
+    primeNativeNotificationPermission().catch(() => undefined);
+
     runtimeStore.setStartResources(
       config.selectedModel ?? null,
       getHfDatasetName(config),
@@ -85,7 +89,10 @@ export function useTrainingActions() {
           });
         }
 
-        const needsReview = check.requires_manual_mapping || check.detected_format === "custom_heuristic";
+        const isRawFormat = isRawTextDatasetFormat(config.datasetFormat);
+        const needsReview =
+          !isRawFormat &&
+          (check.requires_manual_mapping || check.detected_format === "custom_heuristic");
         if (needsReview && !hasManualMapping(config, isVlm, isAudio)) {
           // Pre-fill from suggested_mapping or VLM detected columns
           const hint: Record<string, string> = {};
@@ -173,6 +180,8 @@ export function useTrainingActions() {
       if (!detail.run.can_resume || !outputDir) {
         throw new Error("Only stopped runs with a saved checkpoint can be resumed.");
       }
+
+      primeNativeNotificationPermission().catch(() => undefined);
 
       const config = useTrainingConfigStore.getState();
       const savedConfig = detail.config as Partial<TrainingStartRequest>;
