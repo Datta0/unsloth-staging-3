@@ -72,9 +72,8 @@ class LoggingMiddleware:
                 status_code = message["status"]
             await send(message)
 
-        inner_send = send if excluded else send_wrapper
         try:
-            await self.app(scope, receive, inner_send)
+            await self.app(scope, receive, send_wrapper)
         except Exception as exc:
             logger.error(
                 "request_failed",
