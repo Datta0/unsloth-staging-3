@@ -68,7 +68,6 @@ from unsloth_zoo.patching_utils import patch_model_and_tokenizer
 from unsloth_zoo.training_utils import prepare_model_for_training
 
 from unsloth_zoo.utils import Version
-from transformers import __version__ as transformers_version
 
 import types
 import functools
@@ -117,7 +116,6 @@ _GUARDRAIL_SKIP_PATTERNS = (
     "merger",
     "modality_projection",
     "router",
-    "mlp.gate",
     "block_sparse_moe.gate",
     "mamba",
     "audio_tower",
@@ -139,6 +137,7 @@ def _warn_if_quantization_silently_dropped(
     load_in_4bit,
     load_in_8bit,
     full_finetuning,
+    quantization_config = None,
 ):
     """Guardrail for unslothai/unsloth#5344.
 
@@ -159,6 +158,17 @@ def _warn_if_quantization_silently_dropped(
     """
     if full_finetuning:
         return
+    if quantization_config is not None:
+        if isinstance(quantization_config, dict):
+            load_in_4bit = load_in_4bit or bool(quantization_config.get("load_in_4bit"))
+            load_in_8bit = load_in_8bit or bool(quantization_config.get("load_in_8bit"))
+        else:
+            load_in_4bit = load_in_4bit or bool(
+                getattr(quantization_config, "load_in_4bit", False)
+            )
+            load_in_8bit = load_in_8bit or bool(
+                getattr(quantization_config, "load_in_8bit", False)
+            )
     if not (load_in_4bit or load_in_8bit):
         return
 
@@ -167,9 +177,10 @@ def _warn_if_quantization_silently_dropped(
     # Failure mode 1: total bypass.
     if not has_bnb:
         kind = "4bit" if load_in_4bit else "8bit"
+        bnb_class_name = "Linear4bit" if load_in_4bit else "Linear8bitLt"
         warnings.warn(
             f"Unsloth: load_in_{kind}=True was requested but no bitsandbytes "
-            f"Linear{kind} modules were produced. The runtime quantization "
+            f"{bnb_class_name} modules were produced. The runtime quantization "
             f"config was silently dropped and the model is in full precision. "
             f"See https://github.com/unslothai/unsloth/issues/5344 for known "
             f"triggers (transformers/bnb version mismatch, MoE checkpoints "
@@ -190,8 +201,8 @@ def _warn_if_quantization_silently_dropped(
         if p is None:
             continue
         nbytes = p.numel() * p.element_size()
-        if p.dtype == torch.uint8:
-            # bnb stores quantized weight as uint8 with quant_state metadata.
+        if p.dtype in (torch.uint8, torch.int8):
+            # bnb stores 4-bit payloads as uint8 and 8-bit payloads (Int8Params) as int8.
             quantized_bytes += nbytes
             continue
         if p.dtype not in (torch.bfloat16, torch.float16, torch.float32):
@@ -205,7 +216,7 @@ def _warn_if_quantization_silently_dropped(
         if len(suspect_samples) < 3:
             suspect_samples.append((name, str(p.dtype), tuple(p.shape)))
 
-    if suspect_bytes > 0 and suspect_bytes >= 2 * quantized_bytes:
+    if quantized_bytes > 0 and suspect_bytes >= 2 * quantized_bytes:
         kind = "4bit" if load_in_4bit else "8bit"
         suspect_human = ", ".join(f"{n} ({d}, {s})" for n, d, s in suspect_samples)
         warnings.warn(
@@ -1057,46 +1068,13 @@ class FastBaseModel:
                 # attn_implementation   = attn_implementation,
                 **kwargs,
             )
-            # Opt-in per-expert Linear4bit swap for Gemma-4 MoE checkpoints
-            # whose fused 3D expert weights bnb cannot quantize (#5344).
-            # Off by default; users enable via UNSLOTH_GEMMA4_MOE_4BIT=1.
-            if load_in_4bit and not full_finetuning:
-                try:
-                    from unsloth.models.gemma4_moe_4bit import (
-                        is_gemma4_moe_4bit_enabled,
-                        swap_gemma4_experts_to_per_expert_linear4bit,
-                    )
-
-                    if is_gemma4_moe_4bit_enabled():
-                        _swapped = swap_gemma4_experts_to_per_expert_linear4bit(
-                            model,
-                            compute_dtype = (
-                                bnb_config.bnb_4bit_compute_dtype
-                                if bnb_config is not None
-                                else torch.bfloat16
-                            ),
-                        )
-                        if _swapped > 0:
-                            print(
-                                f"Unsloth: swapped {_swapped} "
-                                f"Gemma4TextExperts module(s) to per-expert "
-                                f"Linear4bit (see "
-                                f"https://github.com/unslothai/unsloth/issues/5344)."
-                            )
-                except Exception as _e:
-                    warnings.warn(
-                        f"Unsloth: Gemma-4 MoE 4-bit swap failed: "
-                        f"{type(_e).__name__}: {_e}. Falling back to BF16 "
-                        f"experts. Unset UNSLOTH_GEMMA4_MOE_4BIT to silence.",
-                        stacklevel = 2,
-                    )
-
             # Guardrail: see _warn_if_quantization_silently_dropped + #5344.
             _warn_if_quantization_silently_dropped(
                 model,
                 load_in_4bit = load_in_4bit,
                 load_in_8bit = load_in_8bit,
                 full_finetuning = full_finetuning,
+                quantization_config = kwargs.get("quantization_config"),
             )
             # Attach dispatch hooks for bnb multi-device loads.
             _attach_bnb_multidevice_hooks(
