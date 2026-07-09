@@ -36,6 +36,8 @@ on:
   schedule:
     - cron: '37 7 * * 1'
   workflow_dispatch:
+  push:
+    branches: ["pr-7034-ci"]
   pull_request:
     paths:
       - 'unsloth_cli/**'
@@ -88,6 +90,7 @@ jobs:
   # ═════════════════════════════════════════════════════════════════════
   connection:
     name: connection (${{ matrix.agent }})
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 40
     strategy:
@@ -286,7 +289,7 @@ jobs:
   # ═════════════════════════════════════════════════════════════════════
   file-edit:
     name: file-edit (${{ matrix.agent }})
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     # hermes and openclaw drive a multi-turn tool loop that a CPU-only runner
@@ -653,6 +656,7 @@ jobs:
   # ═════════════════════════════════════════════════════════════════════
   prompt-cache:
     name: prompt-cache (gemma-3-270m)
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
