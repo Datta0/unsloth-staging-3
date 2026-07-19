@@ -165,7 +165,6 @@ def test_record_result_keeps_clean_result_intact():
 
 def _sse(delta: dict) -> str:
     import json
-
     return "data: " + json.dumps({"choices": [{"index": 0, "delta": delta}]}) + "\n"
 
 
@@ -220,11 +219,20 @@ def test_final_pass_content_is_sanitized_without_auto_heal(monkeypatch):
 
     @contextlib.contextmanager
     def fake_stream_with_retry(
-        _client, _url, _payload, _cancel_event, headers=None, first_token_deadline=None
+        _client,
+        _url,
+        _payload,
+        _cancel_event,
+        headers = None,
+        first_token_deadline = None,
     ):
         yield type("FakeResponse", (), {"status_code": 200, "chunks": streams.pop(0)})()
 
-    def fake_iter_text_cancellable(response, _cancel_event, first_token_deadline=None):
+    def fake_iter_text_cancellable(
+        response,
+        _cancel_event,
+        first_token_deadline = None,
+    ):
         yield from response.chunks
 
     monkeypatch.setattr(backend, "_stream_with_retry", fake_stream_with_retry)
@@ -236,17 +244,15 @@ def test_final_pass_content_is_sanitized_without_auto_heal(monkeypatch):
 
     events = list(
         backend.generate_chat_completion_with_tools(
-            messages=[{"role": "user", "content": "render then answer"}],
-            tools=[{"type": "function", "function": {"name": "render_html"}}],
-            max_tool_iterations=1,
-            auto_heal_tool_calls=False,
+            messages = [{"role": "user", "content": "render then answer"}],
+            tools = [{"type": "function", "function": {"name": "render_html"}}],
+            max_tool_iterations = 1,
+            auto_heal_tool_calls = False,
         )
     )
 
     final_content = [
-        e
-        for e in events
-        if e.get("type") == "content" and "Final" in e.get("text", "")
+        e for e in events if e.get("type") == "content" and "Final" in e.get("text", "")
     ]
     assert final_content, "final-pass content event missing"
     text = final_content[-1]["text"]
