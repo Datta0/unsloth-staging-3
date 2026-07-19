@@ -60,17 +60,30 @@ def test_reporter_garbage_is_cleaned():
     "text,expected",
     [
         ("Here is the answer.</tool_call>", "Here is the answer."),
-        ("Done.</function>", "Done."),
         ("x<tool_call|>", "x"),
-        ("answer</function>\n</tool_call>", "answer"),  # run of orphan closes
-        ("value</parameter>", "value"),  # truncated outer close
+        ("answer</function>\n</tool_call>", "answer"),  # nested leak run ending in </tool_call>
         ("Here is the answer.</tool_call>\n", "Here is the answer."),  # trailing newline
-        ("Done.</function>  ", "Done."),  # trailing spaces
         ("8��� </tool_call>\n", "8"),  # reporter's garbage + trailing newline
     ],
 )
 def test_trailing_orphan_closes_are_stripped_at_final(text, expected):
     assert strip_tool_markup(text, final = True) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Done.</function>",  # lone close, no </tool_call> sentinel
+        "value</parameter>",
+        "The XML closing tag is </function>",  # a code/XML answer ending on a literal
+        "In XML the outer tag closes with </parameter>",
+    ],
+)
+def test_trailing_literal_close_without_tool_call_survives(text):
+    # A trailing </function> / </parameter> with no </tool_call> sentinel is far more
+    # likely a literal in a code/XML answer than a drained-opener leak, so it survives;
+    # a genuine tool-call leak carries </tool_call> and is stripped (covered above).
+    assert strip_tool_markup(text, final = True) == text
 
 
 # ── the conservative contract must survive ──────────────────────────

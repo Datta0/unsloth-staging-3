@@ -138,10 +138,16 @@ _TOOL_ALL_PATS = _TOOL_CLOSED_PATS + [
     ),
     # Gemma wrapper-less ``call:NAME{...}`` is handled by ``_strip_gemma_wrapperless_calls`` (enabled-name gate).
     # Trailing run of orphan closes whose opener was drained or U+FFFD-mangled upstream,
-    # leaving the intact close to leak. Anchored at end-of-string with a trailing \s* so a
-    # common trailing newline does not defeat the strip, while a mid-prose literal close
-    # survives; runs after the balanced arms so only a genuine orphan reaches it.
-    re.compile(r"(?:\s*(?:</(?:tool_call|function|parameter|param)>|<tool_call\|>))+\s*\Z"),
+    # leaving the intact close to leak. Only strip when the run carries the tool_call
+    # sentinel (</tool_call> or <tool_call|>): a lone trailing </function> / </parameter>
+    # is far more likely a literal in a code/XML answer than a leak, so it survives.
+    # Anchored at end with a trailing \s* so a common newline does not defeat the strip;
+    # runs after the balanced arms so only a genuine orphan reaches it.
+    re.compile(
+        r"(?:\s*(?:</(?:tool_call|function|parameter|param)>|<tool_call\|>))*"
+        r"\s*(?:</tool_call>|<tool_call\|>)"
+        r"(?:\s*(?:</(?:tool_call|function|parameter|param)>|<tool_call\|>))*\s*\Z"
+    ),
 ]
 
 
