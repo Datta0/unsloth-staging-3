@@ -137,18 +137,35 @@ _TOOL_ALL_PATS = _TOOL_CLOSED_PATS + [
         re.DOTALL,
     ),
     # Gemma wrapper-less ``call:NAME{...}`` is handled by ``_strip_gemma_wrapperless_calls`` (enabled-name gate).
-    # Trailing run of orphan closes whose opener was drained or U+FFFD-mangled upstream,
-    # leaving the intact close to leak. Only strip when the run carries the tool_call
-    # sentinel (</tool_call> or <tool_call|>): a lone trailing </function> / </parameter>
-    # is far more likely a literal in a code/XML answer than a leak, so it survives.
-    # Anchored at end with a trailing \s* so a common newline does not defeat the strip;
-    # runs after the balanced arms so only a genuine orphan reaches it.
-    re.compile(
-        r"(?:\s*(?:</(?:tool_call|function|parameter|param)>|<tool_call\|>))*"
-        r"\s*(?:</tool_call>|<tool_call\|>)"
-        r"(?:\s*(?:</(?:tool_call|function|parameter|param)>|<tool_call\|>))*\s*\Z"
-    ),
+    # A trailing run of orphan closes is stripped by _strip_trailing_orphan_close_run (a
+    # linear scan, not a regex, to avoid pathological backtracking on a long malformed run).
 ]
+
+_ORPHAN_CLOSE_TOKENS = ("</tool_call>", "</parameter>", "</function>", "</param>", "<tool_call|>")
+_ORPHAN_SENTINELS = ("</tool_call>", "<tool_call|>")
+
+
+def _strip_trailing_orphan_close_run(text: str) -> str:
+    """Strip a trailing whitespace-separated run of tool close tags at end of text, but
+    only when the run carries a </tool_call> or <tool_call|> sentinel (a drained or
+    U+FFFD-mangled opener leaves the intact close to leak); a lone trailing </function>
+    or </parameter> is kept as likely code/XML data. Linear, so no regex backtracking."""
+    i = len(text)
+    while i > 0 and text[i - 1].isspace():
+        i -= 1
+    run_start = i
+    has_sentinel = False
+    while True:
+        matched = next((t for t in _ORPHAN_CLOSE_TOKENS if text.endswith(t, 0, i)), None)
+        if matched is None:
+            break
+        if matched in _ORPHAN_SENTINELS:
+            has_sentinel = True
+        i -= len(matched)
+        run_start = i
+        while i > 0 and text[i - 1].isspace():
+            i -= 1
+    return text[:run_start] if has_sentinel else text
 
 
 TOOL_ERROR_PREFIXES = (
@@ -676,6 +693,9 @@ def strip_tool_markup(
         for pat in pats:
             seg = pat.sub("", seg)
         if seg_final:
+            # Trailing run of orphan closes whose opener was drained or U+FFFD-mangled upstream;
+            # a linear scan (not a regex) so a long malformed run cannot trigger backtracking.
+            seg = _strip_trailing_orphan_close_run(seg)
             # Drop a trailing partial bare rehearsal (``name[ARGS]`` with a truncated or absent
             # body) the balanced scan cannot close; gated so prose ``foo[ARGS] ...`` survives.
             seg = _tool_healing.apply_tool_strip_patterns(

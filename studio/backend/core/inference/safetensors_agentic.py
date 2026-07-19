@@ -41,6 +41,7 @@ from core.inference.tool_call_parser import (
     is_short_intent_without_action,
     parse_tool_calls_from_text,
     reprompt_to_act_message,
+    sanitize_control_chars,
     strip_leading_bare_json_call,
     strip_llama3_leading_sentinels,
     strip_tool_markup,
@@ -660,6 +661,12 @@ def run_safetensors_tool_loop(
 
             if not isinstance(cumulative, str):
                 continue  # defensive: pipeline yields only strings
+
+            # Scrub U+FFFD / control chars from the running accumulation before diffing so
+            # an MTP byte-fallback token never leaks into the streamed delta (safetensors
+            # path has no llama-server display strip). prev_cumulative below stays in the
+            # sanitized space, so the delta computation remains consistent.
+            cumulative = sanitize_control_chars(cumulative)
 
             delta = cumulative[len(prev_cumulative) :]
             prev_cumulative = cumulative

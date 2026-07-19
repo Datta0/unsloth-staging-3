@@ -1900,6 +1900,23 @@ def test_plain_word_matching_no_tool_still_streams():
     assert "weather is nice today." in contents, contents
 
 
+def test_content_stream_scrubs_mtp_byte_fallback_garbage():
+    # An MTP GGUF byte-fallback token (U+FFFD) mid-stream must be scrubbed before it
+    # reaches a content event: the safetensors path has no llama-server display strip,
+    # so the loop sanitizes each cumulative snapshot before diffing (#7084 / PR #7243).
+    loop, _exec = _make_loop(
+        turns = [["Final answer: 42", "���", " done."]],
+        max_tool_iterations = 1,
+    )
+    events = _collect_events(loop)
+    contents = [e["text"] for e in events if e["type"] == "content"]
+    assert contents, "no content events emitted"
+    all_text = "".join(contents)
+    assert "�" not in all_text
+    # Clean text on both sides of the dropped garbage survives.
+    assert "Final answer: 42" in all_text and "done." in all_text
+
+
 def test_rehearsal_name_after_prose_in_streaming_is_not_streamed():
     # After prose has streamed (STREAMING state), a split rehearsal name must still be held.
     loop, exec_fn = _make_loop(

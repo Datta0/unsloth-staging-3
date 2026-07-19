@@ -86,6 +86,28 @@ def test_trailing_literal_close_without_tool_call_survives(text):
     assert strip_tool_markup(text, final = True) == text
 
 
+def test_long_trailing_orphan_run_is_fully_stripped():
+    # A pathological run of orphan closes (opener drained upstream) is stripped whole
+    # by the linear scan; the sentinel </tool_call> in the run gates the removal.
+    payload = "answer" + (" </tool_call>" * 500)
+    assert strip_tool_markup(payload, final = True) == "answer"
+
+
+def test_trailing_orphan_strip_is_linear_not_redos():
+    # The trailing-run strip must be a linear scan, not a backtracking regex: a long
+    # run of closes ending in a near-miss token used to force catastrophic backtracking
+    # (~4s at 500 repeats). The linear helper returns in well under a second, and the
+    # near-miss tail (not a real close tag) leaves the text untouched.
+    import time
+
+    payload = (" </tool_call>" * 2000) + " </tool_calX>"
+    start = time.perf_counter()
+    out = strip_tool_markup(payload, final = True)
+    elapsed = time.perf_counter() - start
+    assert elapsed < 1.0, f"strip took {elapsed:.3f}s (possible ReDoS regression)"
+    assert out.endswith("</tool_calX>")
+
+
 # ── the conservative contract must survive ──────────────────────────
 
 
