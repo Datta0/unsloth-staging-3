@@ -329,17 +329,13 @@ class TestMTPStreamingOrphanCloseLeak:
             seg = pat.sub("", seg)
         if orphan_strip:
             seg = _strip_trailing_orphan_close_run(seg)
-        seg = apply_tool_strip_patterns(
-            seg, [_REHEARSAL_TAIL_STRIP_RE], enabled_tool_names = None
-        )
+        seg = apply_tool_strip_patterns(seg, [_REHEARSAL_TAIL_STRIP_RE], enabled_tool_names = None)
         return seg
 
     def test_orphan_close_leaks_pre_fix_and_is_scrubbed_post_fix(self):
         # Pre-fix (no orphan strip) the streaming final segment leaks the close; the fix
         # scrubs it and matches the shared parser-final output.
-        assert self._seg_final("answer</tool_call>", orphan_strip = False) == (
-            "answer</tool_call>"
-        )
+        assert self._seg_final("answer</tool_call>", orphan_strip = False) == ("answer</tool_call>")
         assert self._seg_final("answer</tool_call>", orphan_strip = True) == "answer"
         assert strip_tool_markup("answer</tool_call>", final = True) == "answer"
 
@@ -370,9 +366,7 @@ class TestMTPStreamingOrphanCloseLeak:
         # A real closed call is fully removed, and the extra scrub does not corrupt it.
         call = '<tool_call>{"name":"web_search","arguments":{"query":"x"}}</tool_call>'
         assert self._seg_final(call, orphan_strip = True) == ""
-        assert self._seg_final(call, orphan_strip = True) == self._seg_final(
-            call, orphan_strip = False
-        )
+        assert self._seg_final(call, orphan_strip = True) == self._seg_final(call, orphan_strip = False)
 
     def test_streaming_seg_matches_shared_parser_final(self):
         for text in (
@@ -381,9 +375,7 @@ class TestMTPStreamingOrphanCloseLeak:
             "hello world",
             '<tool_call>{"name":"web_search","arguments":{"query":"x"}}</tool_call>',
         ):
-            assert self._seg_final(text, orphan_strip = True) == strip_tool_markup(
-                text, final = True
-            )
+            assert self._seg_final(text, orphan_strip = True) == strip_tool_markup(text, final = True)
 
     def test_real_streaming_closure_wires_in_the_scrub(self):
         # Pin the fix into the actual code: the GGUF streaming stripper's final-segment
