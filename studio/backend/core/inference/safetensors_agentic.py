@@ -662,10 +662,8 @@ def run_safetensors_tool_loop(
             if not isinstance(cumulative, str):
                 continue  # defensive: pipeline yields only strings
 
-            # Scrub U+FFFD / control chars from the running accumulation before diffing so
-            # an MTP byte-fallback token never leaks into the streamed delta (safetensors
-            # path has no llama-server display strip). prev_cumulative below stays in the
-            # sanitized space, so the delta computation remains consistent.
+            # Scrub the accumulation before diffing so an MTP byte-fallback token never leaks
+            # into the delta (no llama-server display strip here); keeps prev_cumulative aligned.
             cumulative = sanitize_control_chars(cumulative)
 
             delta = cumulative[len(prev_cumulative) :]

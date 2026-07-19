@@ -9230,7 +9230,7 @@ class LlamaCppBackend:
                                 # Reasoning/thinking tokens: llama-server
                                 # sends these as "reasoning_content"; wrap
                                 # in <think> tags for the frontend parser.
-                                # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
+                                # Scrub: reasoning bypasses strip_tool_markup.
                                 reasoning = _sanitize_control_chars(
                                     delta.get("reasoning_content", "")
                                 )
@@ -9242,7 +9242,7 @@ class LlamaCppBackend:
                                     cumulative += reasoning
                                     yield cumulative
 
-                                # Plain path yields content verbatim (no strip_tool_markup), so scrub here.
+                                # Plain path yields content verbatim (no strip_tool_markup).
                                 token = _sanitize_control_chars(delta.get("content", ""))
                                 if token:
                                     has_content_tokens = True
@@ -9843,7 +9843,7 @@ class LlamaCppBackend:
                                 # only), and the route resets prev_text on
                                 # tool_start, so the <think> block stays a
                                 # monotonic prefix like the no-tool path.
-                                # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
+                                # Scrub: reasoning bypasses strip_tool_markup.
                                 reasoning = _sanitize_control_chars(
                                     delta.get("reasoning_content", "")
                                 )
@@ -9863,8 +9863,7 @@ class LlamaCppBackend:
                                             }
 
                                 # ── Content tokens ──
-                                # Scrub U+FFFD / control chars: the streaming strip
-                                # runs only under Auto-Heal, so content bytes leak otherwise.
+                                # Scrub: the streaming strip runs only under Auto-Heal.
                                 token = _sanitize_control_chars(delta.get("content", ""))
                                 if token:
                                     # First answer token ends reasoning.
@@ -10738,7 +10737,7 @@ class LlamaCppBackend:
                                 if _fr:
                                     _metadata_finish_reason = _fr
 
-                                # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
+                                # Scrub: reasoning bypasses strip_tool_markup.
                                 reasoning = _sanitize_control_chars(
                                     delta.get("reasoning_content", "")
                                 )
@@ -10752,10 +10751,9 @@ class LlamaCppBackend:
                                     cumulative += reasoning
                                     yield {"type": "content", "text": cumulative}
 
-                                # Scrub U+FFFD / control chars: the display strip
-                                # below is a no-op when auto_heal_tool_calls is
-                                # off, so this final pass would otherwise leak MTP
-                                # byte-fallback garbage the other channels scrub.
+                                # Scrub: the display strip below is a no-op when
+                                # auto_heal_tool_calls is off, so this final pass would
+                                # otherwise leak byte-fallback garbage.
                                 token = _sanitize_control_chars(delta.get("content", ""))
                                 if token:
                                     if (

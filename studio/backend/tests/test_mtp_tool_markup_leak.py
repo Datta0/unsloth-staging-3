@@ -3,19 +3,16 @@
 
 """Regression tests for the MTP GGUF tool-call garbage bug (issue #7084).
 
-On an MTP GGUF model (e.g. Qwen3.6-27B-MTP), speculative decoding on a quantized
-target (ggml-org/llama.cpp#25618) intermittently emits byte-fallback garbage that
-llama-server forwards as U+FFFD plus an orphaned ``</tool_call>`` close whose
-opener was drained or ``�``-mangled. The parser-side display strip
-(``strip_tool_markup``, used for live GGUF streaming display) had no arm for a bare
-orphan close, so the reporter saw ``8��� </binary data> </tool_call>`` in chat.
-These tests pin the two boundary defenses:
+On an MTP GGUF model, speculative decoding on a quantized target
+(ggml-org/llama.cpp#25618) emits byte-fallback garbage that llama-server forwards as
+U+FFFD plus an orphaned ``</tool_call>`` whose opener was drained/``�``-mangled;
+``strip_tool_markup`` had no arm for a bare orphan close, so the reporter saw
+``8��� </binary data> </tool_call>`` in chat. Pins the boundary defenses:
 
-  1. ``strip_tool_markup`` scrubs U+FFFD / control chars and removes a trailing run
-     of orphan closes, while keeping well-formed stripping and mid-prose literals.
-  2. ``sanitize_control_chars`` drops the garbage but keeps ``\t \n \r`` / ESC.
-  3. ``ToolLoopController.record_result`` scrubs the same garbage from a tool
-     result before it reaches the model or the tool card.
+  1. ``strip_tool_markup`` scrubs U+FFFD and removes a trailing orphan-close run,
+     while keeping well-formed stripping and mid-prose literals.
+  2. ``sanitize_control_chars`` drops garbage but keeps ``\t \n \r`` / ESC.
+  3. ``ToolLoopController.record_result`` scrubs a tool result before the model/card.
 """
 
 import pytest
@@ -46,13 +43,11 @@ def test_sanitize_noop_on_clean_text():
 
 
 def test_reporter_garbage_is_cleaned():
-    # The exact string from issue #7084 screenshot 2. Before the fix this passed
-    # through unchanged (both the `�` and the orphan `</tool_call>` leaked).
+    # Exact string from issue #7084; before the fix both `�` and the orphan `</tool_call>` leaked.
     out = strip_tool_markup("8��� </binary data> </tool_call>", final = True)
     assert "�" not in out
     assert "</tool_call>" not in out
-    # `</binary data>` is the model's own hallucinated text, not a Studio token, so
-    # it is intentionally left as-is (Studio never invents/strips arbitrary prose).
+    # `</binary data>` is model-hallucinated prose, not a Studio token, so it is left as-is.
     assert out == "8 </binary data>"
 
 
@@ -80,24 +75,21 @@ def test_trailing_orphan_closes_are_stripped_at_final(text, expected):
     ],
 )
 def test_trailing_literal_close_without_tool_call_survives(text):
-    # A trailing </function> / </parameter> with no </tool_call> sentinel is far more
-    # likely a literal in a code/XML answer than a drained-opener leak, so it survives;
-    # a genuine tool-call leak carries </tool_call> and is stripped (covered above).
+    # A trailing </function> / </parameter> with no </tool_call> sentinel reads as a
+    # code/XML literal, not a leak, so it survives (a real leak carries </tool_call>).
     assert strip_tool_markup(text, final = True) == text
 
 
 def test_long_trailing_orphan_run_is_fully_stripped():
-    # A pathological run of orphan closes (opener drained upstream) is stripped whole
-    # by the linear scan; the sentinel </tool_call> in the run gates the removal.
+    # A pathological orphan-close run is stripped whole; the </tool_call> sentinel gates removal.
     payload = "answer" + (" </tool_call>" * 500)
     assert strip_tool_markup(payload, final = True) == "answer"
 
 
 def test_trailing_orphan_strip_is_linear_not_redos():
-    # The trailing-run strip must be a linear scan, not a backtracking regex: a long
-    # run of closes ending in a near-miss token used to force catastrophic backtracking
-    # (~4s at 500 repeats). The linear helper returns in well under a second, and the
-    # near-miss tail (not a real close tag) leaves the text untouched.
+    # Linear scan, not a backtracking regex: a long close run ending in a near-miss token
+    # used to backtrack catastrophically (~4s). The helper returns well under a second and
+    # leaves the near-miss tail untouched.
     import time
 
     payload = (" </tool_call>" * 2000) + " </tool_calX>"
@@ -112,8 +104,8 @@ def test_trailing_orphan_strip_is_linear_not_redos():
 
 
 def test_streamed_tool_output_is_sanitized():
-    # A live tool chunk carrying U+FFFD must be scrubbed before it reaches the UI,
-    # since record_result only cleans the final result and the UI keeps the stream.
+    # A live chunk's U+FFFD must be scrubbed before the UI: record_result only cleans
+    # the final result and the UI keeps the stream.
     from core.inference.tool_stream_exec import stream_tool_execution
 
     def invoke(on_output):
@@ -140,8 +132,7 @@ def test_wellformed_call_still_stripped():
 
 
 def test_literal_close_in_mid_prose_survives():
-    # A literal </function> mentioned AFTER a real call (not at EOS) is prose, not a
-    # leak, and must survive (mirrors the parser's existing conservative behavior).
+    # A literal </function> after a real call (not at EOS) is prose, not a leak, and survives.
     text = (
         "<function=web_search><parameter=query>cats</parameter></function>"
         " Done. The tag </function> closes a call."
@@ -155,8 +146,8 @@ def test_mid_prose_parameter_tag_survives():
 
 
 def test_streaming_pass_does_not_strip_trailing_orphan():
-    # final=False keeps in-progress markup buffered (the trailing-orphan run arm is
-    # end-of-turn only), but still scrubs U+FFFD from live display.
+    # final=False keeps in-progress markup buffered (orphan-run arm is end-of-turn only)
+    # but still scrubs U+FFFD.
     assert strip_tool_markup("Here is the answer.</tool_call>", final = False) == (
         "Here is the answer.</tool_call>"
     )
@@ -208,12 +199,9 @@ def _done() -> str:
 
 
 def test_final_pass_content_is_sanitized_without_auto_heal(monkeypatch):
-    """The tool-cap final answer pass must scrub U+FFFD / control chars itself.
-
-    With ``auto_heal_tool_calls=False`` the display strip is a no-op, so on an
-    MTP GGUF model the final chat response would otherwise leak the byte-fallback
-    garbage every other content channel already scrubs (#7084 / PR #7243).
-    """
+    """The tool-cap final answer pass must scrub U+FFFD itself: with
+    ``auto_heal_tool_calls=False`` the display strip is a no-op, so an MTP GGUF final
+    response would otherwise leak byte-fallback garbage (#7084 / PR #7243)."""
     import contextlib
     import json as _json
 

@@ -248,9 +248,8 @@ def stream_tool_execution(
                 stream_capped = True
             streamed_chars += len(chunk)
             if chunk:
-                # Scrub live output too: record_result cleans only the final
-                # result, and the UI keeps the live stream when it differs, so
-                # unscrubbed U+FFFD here would stay on the finished tool card.
+                # Scrub live output too: record_result cleans only the final result,
+                # and the UI keeps the live stream, so U+FFFD here would stay on the card.
                 yield {
                     "type": "tool_output",
                     "tool_name": tool_name,

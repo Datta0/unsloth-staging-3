@@ -407,8 +407,8 @@ class ToolLoopController:
     def record_result(self, decision: ToolCallDecision, result: Any) -> ToolCallCompletion:
         """Record a real tool execution and return model/frontend payload helpers."""
         result_text = result if isinstance(result, str) else str(result)
-        # Scrub U+FFFD / control chars a fetch or subprocess can leave in a text result,
-        # so they neither show in the tool card nor poison the model's next MTP prompt.
+        # Scrub garbage a fetch/subprocess can leave, so it neither shows on the tool card
+        # nor poisons the model's next prompt.
         result_text = sanitize_control_chars(result_text)
         failed = is_tool_error(result_text)
         self._history.append(

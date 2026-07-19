@@ -1901,9 +1901,9 @@ def test_plain_word_matching_no_tool_still_streams():
 
 
 def test_content_stream_scrubs_mtp_byte_fallback_garbage():
-    # An MTP GGUF byte-fallback token (U+FFFD) mid-stream must be scrubbed before it
-    # reaches a content event: the safetensors path has no llama-server display strip,
-    # so the loop sanitizes each cumulative snapshot before diffing (#7084 / PR #7243).
+    # An MTP byte-fallback U+FFFD mid-stream must be scrubbed before a content event:
+    # no llama-server display strip here, so the loop sanitizes each snapshot before
+    # diffing (#7084 / PR #7243).
     loop, _exec = _make_loop(
         turns = [["Final answer: 42", "���", " done."]],
         max_tool_iterations = 1,
