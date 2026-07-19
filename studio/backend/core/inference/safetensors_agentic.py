@@ -33,6 +33,7 @@ from core.inference.tool_call_parser import (
     _strip_glm_calls,
     _strip_mistral_closed_calls,
     _strip_mistral_reasoning,
+    _strip_trailing_orphan_close_run,
     BUDGET_EXHAUSTED_NUDGE,
     MAX_ACT_REPROMPTS,
     RAG_MAX_SEARCHES_PER_TURN,
@@ -279,6 +280,10 @@ def strip_tool_markup_streaming(
         for pat in pats:
             seg = pat.sub("", seg)
         if is_last:
+            # Trailing orphan closes whose opener was drained or U+FFFD-mangled upstream
+            # (MTP byte-fallback); mirror the parser's final order (orphan-strip then
+            # rehearsal-tail) so the safetensors stream matches strip_tool_markup(final=True).
+            seg = _strip_trailing_orphan_close_run(seg)
             seg = apply_tool_strip_patterns(
                 seg, [_REHEARSAL_TAIL_STRIP_RE], enabled_tool_names = enabled_tool_names
             )

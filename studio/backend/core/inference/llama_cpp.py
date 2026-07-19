@@ -9831,14 +9831,23 @@ class LlamaCppBackend:
                                                         "type": "tool_args",
                                                         "tool_call_id": current_id,
                                                         "tool_name": current_name,
-                                                        "text": _args_backlog,
+                                                        # Display only: scrub U+FFFD/control chars
+                                                        # so byte-fallback garbage in a large call's
+                                                        # args never renders; accumulator keeps bytes.
+                                                        "text": _sanitize_control_chars(
+                                                            _args_backlog
+                                                        ),
                                                     }
                                             elif func.get("arguments"):
                                                 yield {
                                                     "type": "tool_args",
                                                     "tool_call_id": current_id,
                                                     "tool_name": current_name,
-                                                    "text": func["arguments"],
+                                                    # Display only: scrub before render; accumulator
+                                                    # keeps original bytes for execution.
+                                                    "text": _sanitize_control_chars(
+                                                        func["arguments"]
+                                                    ),
                                                 }
                                     continue
 
@@ -9923,7 +9932,11 @@ class LlamaCppBackend:
                                                         "type": "tool_args",
                                                         "tool_call_id": _text_args_id,
                                                         "tool_name": _sniffed,
-                                                        "text": _call_text,
+                                                        # Display only (content_accum is already
+                                                        # scrubbed above); mirror the structured path.
+                                                        "text": _sanitize_control_chars(
+                                                            _call_text
+                                                        ),
                                                     }
                                                     _text_args_streamed_upto = len(content_accum)
                                             elif len(content_accum) > _text_args_streamed_upto:
@@ -9931,9 +9944,11 @@ class LlamaCppBackend:
                                                     "type": "tool_args",
                                                     "tool_call_id": _text_args_id,
                                                     "tool_name": _text_args_name,
-                                                    "text": content_accum[
-                                                        _text_args_streamed_upto:
-                                                    ],
+                                                    # Display only (content_accum already scrubbed);
+                                                    # mirror the structured path for symmetry.
+                                                    "text": _sanitize_control_chars(
+                                                        content_accum[_text_args_streamed_upto:]
+                                                    ),
                                                 }
                                                 _text_args_streamed_upto = len(content_accum)
 

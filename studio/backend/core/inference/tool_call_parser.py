@@ -322,6 +322,24 @@ _KIMI_ARG_BEGIN = "<|tool_call_argument_begin|>"
 _KIMI_CALL_END = "<|tool_call_end|>"
 _KIMI_ID_RE = re.compile(r"^(?:functions\.)?([\w\.\-]+)(?::(\d+))?$")
 
+# Kimi and DeepSeek end-of-turn closers are back-to-back special tokens (a contiguous
+# end-of-text run the linear scanner handles); a drained/U+FFFD-mangled opener leaves them
+# to leak as a trailing orphan. They are unambiguous special tokens (never legit prose), so
+# they match the ``<tool_call|>``-style sentinel safety profile. Extended here (not at the
+# tuple defs above) because these consts are defined later in the module.
+_ORPHAN_CLOSE_TOKENS = _ORPHAN_CLOSE_TOKENS + (
+    _KIMI_CALL_END,
+    _KIMI_SECTION_END,
+    _DEEPSEEK_CALL_END,
+    _DEEPSEEK_END,
+)
+_ORPHAN_SENTINELS = _ORPHAN_SENTINELS + (
+    _KIMI_CALL_END,
+    _KIMI_SECTION_END,
+    _DEEPSEEK_CALL_END,
+    _DEEPSEEK_END,
+)
+
 # Gemma 4: ``<|tool_call>call:NAME{...}<tool_call|>``, ``<|"|>`` wraps strings.
 _GEMMA_TC_RE = re.compile(r"<\|tool_call>\s*call\s*:\s*([\w\.\-]+)\s*\{")
 _GEMMA_STR_BEGIN = '<|"|>'

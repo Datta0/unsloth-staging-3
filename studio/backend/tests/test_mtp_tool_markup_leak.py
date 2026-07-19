@@ -389,3 +389,110 @@ class TestMTPStreamingOrphanCloseLeak:
             "GGUF _strip_tool_markup_streaming must scrub trailing orphan closes like "
             "strip_tool_markup(final=True)"
         )
+
+
+# ── Kimi + DeepSeek end-of-turn closers belong to the orphan-close set ──
+#
+# The bug (Codex 3611159411): ``_ORPHAN_CLOSE_TOKENS`` / ``_ORPHAN_SENTINELS`` only listed
+# the Qwen/Gemma/function-XML closers, so a Kimi ``<|tool_call_end|><|tool_calls_section_end|>``
+# or the DeepSeek ``<｜tool▁call▁end｜><｜tool▁calls▁end｜>`` run whose opener was drained /
+# U+FFFD-mangled leaked verbatim. These are back-to-back special tokens (a contiguous
+# end-of-text run the linear scanner handles) and are never legit prose, so they join the
+# sentinel set like ``<tool_call|>``.
+
+
+class TestKimiDeepSeekOrphanCloses:
+    def _tokens(self):
+        from core.inference.tool_call_parser import (
+            _DEEPSEEK_CALL_END,
+            _DEEPSEEK_END,
+            _KIMI_CALL_END,
+            _KIMI_SECTION_END,
+        )
+
+        return _KIMI_CALL_END, _KIMI_SECTION_END, _DEEPSEEK_CALL_END, _DEEPSEEK_END
+
+    def test_tokens_registered_in_orphan_sets(self):
+        from core.inference.tool_call_parser import (
+            _ORPHAN_CLOSE_TOKENS,
+            _ORPHAN_SENTINELS,
+        )
+
+        for tok in self._tokens():
+            assert tok in _ORPHAN_CLOSE_TOKENS
+            assert tok in _ORPHAN_SENTINELS
+
+    def test_kimi_trailing_closers_stripped_at_final(self):
+        kimi_end, kimi_section_end, *_ = self._tokens()
+        text = "answer " + kimi_end + kimi_section_end
+        assert strip_tool_markup(text, final = True) == "answer"
+
+    def test_deepseek_trailing_closers_stripped_at_final(self):
+        _, _, ds_call_end, ds_end = self._tokens()
+        text = "answer " + ds_call_end + ds_end
+        assert strip_tool_markup(text, final = True) == "answer"
+
+    def test_streaming_stripper_scrubs_kimi_and_deepseek(self):
+        # The shared ``_strip_trailing_orphan_close_run`` is what both stream paths (GGUF _seg
+        # and safetensors _seg) call, so exercising it pins the streaming behavior too.
+        from core.inference.tool_call_parser import _strip_trailing_orphan_close_run
+
+        kimi_end, kimi_section_end, ds_call_end, ds_end = self._tokens()
+        assert (
+            _strip_trailing_orphan_close_run("answer " + kimi_end + kimi_section_end)
+            == "answer "
+        )
+        assert (
+            _strip_trailing_orphan_close_run("answer " + ds_call_end + ds_end)
+            == "answer "
+        )
+        # And through the safetensors streaming stripper (which threads the same helper).
+        from core.inference.safetensors_agentic import strip_tool_markup_streaming
+
+        assert (
+            strip_tool_markup_streaming("answer" + kimi_end + kimi_section_end) == "answer"
+        )
+        assert strip_tool_markup_streaming("answer" + ds_call_end + ds_end) == "answer"
+
+    def test_single_trailing_closer_also_stripped(self):
+        # Each is a sentinel on its own, so even a lone trailing closer is scrubbed.
+        kimi_end, kimi_section_end, ds_call_end, ds_end = self._tokens()
+        for tok in (kimi_end, kimi_section_end, ds_call_end, ds_end):
+            assert strip_tool_markup("answer " + tok, final = True) == "answer"
+
+    def test_literal_token_in_mid_prose_survives(self):
+        # Only TRAILING orphans are stripped: a token embedded in prose (with real text after)
+        # is not a trailing run, so it is kept and a plain answer is never over-stripped.
+        kimi_end, *_ = self._tokens()
+        text = "the token " + kimi_end + " appears mid sentence"
+        assert strip_tool_markup(text, final = True) == text
+
+    def test_genuine_kimi_tool_call_still_parsed(self):
+        # A well-formed Kimi call still parses (the orphan-close addition does not disturb the
+        # structured parse path).
+        from core.inference.tool_call_parser import parse_tool_calls_from_text
+
+        (
+            kimi_end,
+            kimi_section_end,
+            *_,
+        ) = self._tokens()
+        from core.inference.tool_call_parser import (
+            _KIMI_ARG_BEGIN,
+            _KIMI_CALL_BEGIN,
+            _KIMI_SECTION_BEGIN,
+        )
+
+        call = (
+            _KIMI_SECTION_BEGIN
+            + _KIMI_CALL_BEGIN
+            + "functions.web_search:0"
+            + _KIMI_ARG_BEGIN
+            + '{"query":"x"}'
+            + kimi_end
+            + kimi_section_end
+        )
+        result = parse_tool_calls_from_text(call)
+        assert len(result) == 1
+        assert result[0]["function"]["name"] == "web_search"
+        assert "x" in result[0]["function"]["arguments"]

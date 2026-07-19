@@ -4913,6 +4913,38 @@ def test_streaming_strip_still_removes_complete_call_before_think_block():
     assert "go" in out and "done" in out
 
 
+def test_streaming_strip_scrubs_trailing_orphan_close_run():
+    # Regression (Fix A / Codex 3611159414): the safetensors streaming stripper must scrub a
+    # trailing orphan close whose opener was drained / U+FFFD-mangled upstream, mirroring the
+    # GGUF stream path and strip_tool_markup(final=True). The MTP byte-fallback U+FFFD is
+    # scrubbed at the call site (safetensors_agentic run loop) via sanitize_control_chars, so
+    # the display strip sees the already-scrubbed ``answer</tool_call>`` and must drop the close.
+    from core.inference.tool_call_parser import sanitize_control_chars
+
+    raw = "answer�</tool_call>"
+    scrubbed = sanitize_control_chars(raw)  # what the run loop feeds the display strip
+    assert scrubbed == "answer</tool_call>"
+    assert strip_tool_markup_streaming(scrubbed) == "answer"
+    # The final parser path scrubs internally and agrees.
+    assert strip_tool_markup(raw, final = True) == "answer"
+    # A genuine complete call is still fully stripped (no under-strip regression).
+    assert (
+        strip_tool_markup_streaming('<tool_call>{"name":"x","arguments":{}}</tool_call>')
+        == ""
+    )
+    # A lone </function> without a sentinel is kept (likely code/XML), not over-stripped.
+    assert strip_tool_markup_streaming("see </function> here") == "see </function> here"
+
+
+def test_safetensors_seg_mirrors_gguf_orphan_close_scrub():
+    # Source-assert (Fix A): the safetensors ``_seg`` must call the orphan-close scrubber so it
+    # stays byte-for-byte aligned with the GGUF ``_seg``.
+    import inspect
+
+    src = inspect.getsource(strip_tool_markup_streaming)
+    assert "_strip_trailing_orphan_close_run" in src
+
+
 def test_prose_args_marker_before_real_call_does_not_drain_the_prose():
     # F5: an inactive ``foo[ARGS]`` in prose is not a call boundary; the prose streams in
     # full and the later real call still executes.

@@ -3133,6 +3133,72 @@ def test_structured_tool_args_stream_to_provisional_card(monkeypatch):
     assert json.loads(tc["function"]["arguments"]) == {"code": code}
 
 
+def test_structured_tool_args_display_is_control_char_scrubbed(monkeypatch):
+    """Regression (Fix C / Codex 3611159416): a U+FFFD / control char inside a large
+    structured tool call's arguments must be scrubbed from the streamed tool_args DISPLAY
+    text (the live "code being written" card), while the EXECUTED / model-view arguments keep
+    the original bytes verbatim."""
+    import json as _json
+
+    from core.inference.tool_call_parser import sanitize_control_chars
+
+    # Raw U+FFFD (byte-fallback garbage) embedded in the argument value; ensure_ascii=False so
+    # the character rides through as-is (not a \\uFFFD escape).
+    code = "print('x')�\n" + ("# pad\n" * 80)
+    args_json = _json.dumps({"code": code}, ensure_ascii = False)
+    assert "�" in args_json
+    call_id = "call_scrub_args"
+    split = _PROVISIONAL_ARGS_MIN_CHARS + 16
+    frag1, frag2 = args_json[:split], args_json[split:]
+
+    def _tc_delta(fragment: str, with_header: bool) -> str:
+        entry: dict = {"index": 0, "function": {"arguments": fragment}}
+        if with_header:
+            entry.update({"id": call_id, "type": "function"})
+            entry["function"]["name"] = "python"
+        return _sse({"tool_calls": [entry]})
+
+    first_stream = [
+        _tc_delta(frag1, with_header = True),
+        _tc_delta(frag2, with_header = False),
+        _done(),
+    ]
+    second_stream = [_sse({"content": "Done."}), _done()]
+    payloads: list[dict] = []
+    backend = _make_backend(monkeypatch, [first_stream, second_stream], payloads)
+
+    executed: list[tuple[str, dict]] = []
+
+    def fake_execute_tool(name, arguments, **_kwargs):
+        executed.append((name, arguments))
+        return "ok"
+
+    monkeypatch.setattr("core.inference.tools.execute_tool", fake_execute_tool)
+
+    events = list(
+        backend.generate_chat_completion_with_tools(
+            messages = [{"role": "user", "content": "run it"}],
+            tools = _python_tool_schema(),
+            max_tool_iterations = 1,
+        )
+    )
+
+    args_events = [e for e in events if e.get("type") == "tool_args"]
+    assert args_events, "no tool_args events were streamed"
+    streamed = "".join(e["text"] for e in args_events)
+    # DISPLAY: garbage scrubbed, and the display text equals the sanitized args.
+    assert "�" not in streamed
+    assert streamed == sanitize_control_chars(args_json)
+
+    # EXECUTION: the accumulator kept the original bytes; the executed call carries U+FFFD.
+    assert executed == [("python", {"code": code})]
+    assert "�" in executed[0][1]["code"]
+    # The model-view (assistant tool_calls) also retains the original argument bytes.
+    assistant_messages = [m for m in payloads[1]["messages"] if m.get("role") == "assistant"]
+    tc = assistant_messages[-1]["tool_calls"][0]
+    assert _json.loads(tc["function"]["arguments"]) == {"code": code}
+
+
 def test_text_tool_call_streams_args_and_reconciles_card(monkeypatch):
     """A TEXT (XML) tool call must stream its raw call text as tool_args under the
     id the stream-end parser assigns ("call_0"), so the provisional card and the
