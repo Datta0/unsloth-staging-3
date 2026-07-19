@@ -52,6 +52,7 @@ from core.inference.tool_call_parser import (
     _strip_gemma_wrapperless_calls,
     _strip_glm_calls,
     _strip_mistral_closed_calls,
+    _strip_trailing_orphan_close_run,
     TOOL_XML_SIGNALS as _SHARED_TOOL_XML_SIGNALS,
     RAG_MAX_SEARCHES_PER_TURN,
     RAG_SEARCH_CAP_NUDGE,
@@ -9453,6 +9454,10 @@ class LlamaCppBackend:
                 for pat in pats:
                     seg = pat.sub("", seg)
                 if is_last:
+                    # Trailing orphan closes whose opener was drained or U+FFFD-mangled upstream
+                    # (MTP byte-fallback); mirror the parser's final order (orphan-strip then
+                    # rehearsal-tail) so the GGUF stream matches strip_tool_markup(final=True).
+                    seg = _strip_trailing_orphan_close_run(seg)
                     seg = apply_tool_strip_patterns(
                         seg, [_REHEARSAL_TAIL_STRIP_RE], enabled_tool_names = _enabled_names_gate
                     )

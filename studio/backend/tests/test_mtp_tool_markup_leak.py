@@ -283,3 +283,117 @@ def test_final_pass_content_is_sanitized_without_auto_heal(monkeypatch):
     assert "\x00" not in text
     # Clean text survives byte-for-byte (only the garbage is dropped).
     assert "answer" in text and "here." in text
+
+
+# ── the GGUF streaming _seg must scrub the orphan close, not only the parser ──
+#
+# The bug (Codex 3610967410): the llama.cpp GGUF streaming path has its own duplicate
+# stripper ``_strip_tool_markup_streaming._seg`` that mirrors the parser's ``seg_final``
+# block (Gemma / function-XML / GLM scans + _TOOL_ALL_PATS then _REHEARSAL_TAIL_STRIP_RE)
+# but never called ``_strip_trailing_orphan_close_run``. So a GGUF-streamed plain answer
+# whose ``<tool_call>`` opener was drained / U+FFFD-mangled (MTP byte-fallback) streamed its
+# trailing orphan ``</tool_call>`` into the bubble, while the safetensors path scrubbed it
+# via ``strip_tool_markup(final=True)``. ``_seg`` runs both mid-stream and at end-of-stream,
+# so the fix must live in ``_seg`` (not only the end-of-stream call site).
+
+
+class TestMTPStreamingOrphanCloseLeak:
+    """Regression for the GGUF streaming ``_seg`` orphan-close leak (Codex 3610967410)."""
+
+    @staticmethod
+    def _seg_final(seg: str, *, orphan_strip: bool) -> str:
+        """Faithful reconstruction of the GGUF streaming ``_seg`` on the last segment
+        (``is_last=True``), name-agnostic, built from the same shared helpers the closure
+        imports. ``orphan_strip=False`` reproduces the pre-fix pipeline; ``orphan_strip=True``
+        inserts the fix in the parser's order (orphan-strip then rehearsal-tail)."""
+        from core.inference.tool_call_parser import (
+            _TOOL_ALL_PATS,
+            _strip_function_xml_calls,
+            _strip_gemma_wrapperless_calls,
+            _strip_glm_calls,
+            _strip_mistral_closed_calls,
+            _strip_trailing_orphan_close_run,
+        )
+        from core.tool_healing import (
+            _REHEARSAL_TAIL_STRIP_RE,
+            _strip_bracket_tag_calls,
+            apply_tool_strip_patterns,
+        )
+
+        seg = _strip_mistral_closed_calls(seg)
+        seg = _strip_bracket_tag_calls(seg, enabled_tool_names = None)
+        seg = _strip_gemma_wrapperless_calls(seg, None)
+        seg = _strip_function_xml_calls(seg, final = True)
+        seg = _strip_glm_calls(seg, final = True)
+        for pat in _TOOL_ALL_PATS:
+            seg = pat.sub("", seg)
+        if orphan_strip:
+            seg = _strip_trailing_orphan_close_run(seg)
+        seg = apply_tool_strip_patterns(
+            seg, [_REHEARSAL_TAIL_STRIP_RE], enabled_tool_names = None
+        )
+        return seg
+
+    def test_orphan_close_leaks_pre_fix_and_is_scrubbed_post_fix(self):
+        # Pre-fix (no orphan strip) the streaming final segment leaks the close; the fix
+        # scrubs it and matches the shared parser-final output.
+        assert self._seg_final("answer</tool_call>", orphan_strip = False) == (
+            "answer</tool_call>"
+        )
+        assert self._seg_final("answer</tool_call>", orphan_strip = True) == "answer"
+        assert strip_tool_markup("answer</tool_call>", final = True) == "answer"
+
+    def test_reporter_byte_fallback_case(self):
+        # MTP byte-fallback: token ingestion in the GGUF loop sanitizes control chars before
+        # cumulative_display reaches _seg, so the stripper sees a bare orphan close.
+        cleaned = sanitize_control_chars("answer���</tool_call>")
+        assert cleaned == "answer</tool_call>"
+        assert self._seg_final(cleaned, orphan_strip = False) == "answer</tool_call>"
+        assert self._seg_final(cleaned, orphan_strip = True) == "answer"
+        # The intervening-whitespace variant: the close (and the run's whitespace) is scrubbed;
+        # the streaming _seg leaves a cosmetic trailing space (no final trim), but the leaking
+        # </tool_call> token is gone.
+        spaced = sanitize_control_chars("answer��� </tool_call>")
+        assert spaced == "answer </tool_call>"
+        assert "</tool_call>" not in self._seg_final(spaced, orphan_strip = True)
+
+    def test_no_over_strip_on_plain_message(self):
+        # A legitimate message with no orphan-close sentinel is untouched, and the scrub is
+        # a no-op relative to the pre-fix pipeline.
+        for text in ("hello world, no markup here", "The XML closing tag is </function>"):
+            assert self._seg_final(text, orphan_strip = True) == text
+            assert self._seg_final(text, orphan_strip = True) == self._seg_final(
+                text, orphan_strip = False
+            )
+
+    def test_genuine_tool_call_not_double_stripped(self):
+        # A real closed call is fully removed, and the extra scrub does not corrupt it.
+        call = '<tool_call>{"name":"web_search","arguments":{"query":"x"}}</tool_call>'
+        assert self._seg_final(call, orphan_strip = True) == ""
+        assert self._seg_final(call, orphan_strip = True) == self._seg_final(
+            call, orphan_strip = False
+        )
+
+    def test_streaming_seg_matches_shared_parser_final(self):
+        for text in (
+            "answer</tool_call>",
+            "answer</tool_call> </tool_call>",
+            "hello world",
+            '<tool_call>{"name":"web_search","arguments":{"query":"x"}}</tool_call>',
+        ):
+            assert self._seg_final(text, orphan_strip = True) == strip_tool_markup(
+                text, final = True
+            )
+
+    def test_real_streaming_closure_wires_in_the_scrub(self):
+        # Pin the fix into the actual code: the GGUF streaming stripper's final-segment
+        # block must call _strip_trailing_orphan_close_run (not only the shared final path).
+        import inspect
+
+        from core.inference.llama_cpp import LlamaCppBackend
+
+        src = inspect.getsource(LlamaCppBackend.generate_chat_completion_with_tools)
+        assert "_strip_trailing_orphan_close_run(seg)" in src, (
+            "GGUF _strip_tool_markup_streaming must scrub trailing orphan closes like "
+            "strip_tool_markup(final=True)"
+        )
