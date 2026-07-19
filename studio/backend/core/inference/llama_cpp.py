@@ -10752,7 +10752,11 @@ class LlamaCppBackend:
                                     cumulative += reasoning
                                     yield {"type": "content", "text": cumulative}
 
-                                token = delta.get("content", "")
+                                # Scrub U+FFFD / control chars: the display strip
+                                # below is a no-op when auto_heal_tool_calls is
+                                # off, so this final pass would otherwise leak MTP
+                                # byte-fallback garbage the other channels scrub.
+                                token = _sanitize_control_chars(delta.get("content", ""))
                                 if token:
                                     if (
                                         _final_reasoning_started_at is not None

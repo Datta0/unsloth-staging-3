@@ -158,3 +158,99 @@ def test_record_result_keeps_clean_result_intact():
     clean = "Title: Florida ACA 2026\nSilver premium: $1,900/mo"
     completion = ctrl.record_result(_decision(), clean)
     assert completion.result == clean
+
+
+# ── final synthetic-answer pass content sanitization ───────────────
+
+
+def _sse(delta: dict) -> str:
+    import json
+
+    return "data: " + json.dumps({"choices": [{"index": 0, "delta": delta}]}) + "\n"
+
+
+def _done() -> str:
+    return "data: [DONE]\n"
+
+
+def test_final_pass_content_is_sanitized_without_auto_heal(monkeypatch):
+    """The tool-cap final answer pass must scrub U+FFFD / control chars itself.
+
+    With ``auto_heal_tool_calls=False`` the display strip is a no-op, so on an
+    MTP GGUF model the final chat response would otherwise leak the byte-fallback
+    garbage every other content channel already scrubs (#7084 / PR #7243).
+    """
+    import contextlib
+    import json as _json
+
+    from core.inference.llama_cpp import LlamaCppBackend
+
+    backend = LlamaCppBackend.__new__(LlamaCppBackend)
+    backend._process = object()
+    backend._healthy = True
+    backend._port = 48847
+    backend._api_key = None
+    backend._effective_context_length = 4096
+    backend._supports_reasoning = False
+    backend._reasoning_always_on = False
+    backend._reasoning_style = "enable_thinking"
+    backend._supports_preserve_thinking = False
+
+    tool_stream = [
+        _sse(
+            {
+                "tool_calls": [
+                    {
+                        "index": 0,
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "render_html",
+                            "arguments": _json.dumps({"code": "<html>ok</html>"}),
+                        },
+                    }
+                ]
+            }
+        ),
+        _done(),
+    ]
+    # A content token carrying MTP byte-fallback garbage in the final pass.
+    final_stream = [_sse({"content": "Final � answer\x00 here."}), _done()]
+    streams = [tool_stream, final_stream]
+
+    @contextlib.contextmanager
+    def fake_stream_with_retry(
+        _client, _url, _payload, _cancel_event, headers=None, first_token_deadline=None
+    ):
+        yield type("FakeResponse", (), {"status_code": 200, "chunks": streams.pop(0)})()
+
+    def fake_iter_text_cancellable(response, _cancel_event, first_token_deadline=None):
+        yield from response.chunks
+
+    monkeypatch.setattr(backend, "_stream_with_retry", fake_stream_with_retry)
+    monkeypatch.setattr(backend, "_iter_text_cancellable", fake_iter_text_cancellable)
+    monkeypatch.setattr(
+        "core.inference.tools.execute_tool",
+        lambda name, arguments, **_kwargs: "Rendered HTML canvas: Done.",
+    )
+
+    events = list(
+        backend.generate_chat_completion_with_tools(
+            messages=[{"role": "user", "content": "render then answer"}],
+            tools=[{"type": "function", "function": {"name": "render_html"}}],
+            max_tool_iterations=1,
+            auto_heal_tool_calls=False,
+        )
+    )
+
+    final_content = [
+        e
+        for e in events
+        if e.get("type") == "content" and "Final" in e.get("text", "")
+    ]
+    assert final_content, "final-pass content event missing"
+    text = final_content[-1]["text"]
+    assert "�" not in text
+    assert "\x00" not in text
+    # Clean text survives byte-for-byte (only the garbage is dropped).
+    assert "answer" in text and "here." in text
