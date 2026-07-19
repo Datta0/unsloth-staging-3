@@ -17,7 +17,11 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Mapping, Sequence
 from urllib.parse import urlparse
 
-from core.inference.tool_call_parser import TOOL_ERROR_NUDGE, TOOL_ERROR_PREFIXES
+from core.inference.tool_call_parser import (
+    TOOL_ERROR_NUDGE,
+    TOOL_ERROR_PREFIXES,
+    sanitize_control_chars,
+)
 
 
 _CANONICAL_HEAL_ARG = {
@@ -403,6 +407,9 @@ class ToolLoopController:
     def record_result(self, decision: ToolCallDecision, result: Any) -> ToolCallCompletion:
         """Record a real tool execution and return model/frontend payload helpers."""
         result_text = result if isinstance(result, str) else str(result)
+        # Scrub U+FFFD / control chars a fetch or subprocess can leave in a text result,
+        # so they neither show in the tool card nor poison the model's next MTP prompt.
+        result_text = sanitize_control_chars(result_text)
         failed = is_tool_error(result_text)
         self._history.append(
             _ToolCallRecord(

@@ -56,6 +56,7 @@ from core.inference.tool_call_parser import (
     RAG_MAX_SEARCHES_PER_TURN,
     RAG_SEARCH_CAP_NUDGE,
     parse_tool_calls_from_text as _shared_parse_tool_calls_from_text,
+    sanitize_control_chars as _sanitize_control_chars,
     strip_leading_bare_json_call,
     strip_llama3_leading_sentinels,
     strip_tool_markup as _shared_strip_tool_markup,
@@ -9229,7 +9230,8 @@ class LlamaCppBackend:
                                 # Reasoning/thinking tokens: llama-server
                                 # sends these as "reasoning_content"; wrap
                                 # in <think> tags for the frontend parser.
-                                reasoning = delta.get("reasoning_content", "")
+                                # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
+                                reasoning = _sanitize_control_chars(delta.get("reasoning_content", ""))
                                 if reasoning:
                                     reasoning_text += reasoning
                                     if not in_thinking:
@@ -9238,7 +9240,8 @@ class LlamaCppBackend:
                                     cumulative += reasoning
                                     yield cumulative
 
-                                token = delta.get("content", "")
+                                # Plain path yields content verbatim (no strip_tool_markup), so scrub here.
+                                token = _sanitize_control_chars(delta.get("content", ""))
                                 if token:
                                     has_content_tokens = True
                                     if in_thinking:
@@ -9838,7 +9841,8 @@ class LlamaCppBackend:
                                 # only), and the route resets prev_text on
                                 # tool_start, so the <think> block stays a
                                 # monotonic prefix like the no-tool path.
-                                reasoning = delta.get("reasoning_content", "")
+                                # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
+                                reasoning = _sanitize_control_chars(delta.get("reasoning_content", ""))
                                 if reasoning:
                                     if _reasoning_started_at is None:
                                         _reasoning_started_at = time.monotonic()
@@ -10728,7 +10732,8 @@ class LlamaCppBackend:
                                 if _fr:
                                     _metadata_finish_reason = _fr
 
-                                reasoning = delta.get("reasoning_content", "")
+                                # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
+                                reasoning = _sanitize_control_chars(delta.get("reasoning_content", ""))
                                 if reasoning:
                                     if _final_reasoning_started_at is None:
                                         _final_reasoning_started_at = time.monotonic()
