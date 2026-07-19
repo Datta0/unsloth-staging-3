@@ -4928,10 +4928,7 @@ def test_streaming_strip_scrubs_trailing_orphan_close_run():
     # The final parser path scrubs internally and agrees.
     assert strip_tool_markup(raw, final = True) == "answer"
     # A genuine complete call is still fully stripped (no under-strip regression).
-    assert (
-        strip_tool_markup_streaming('<tool_call>{"name":"x","arguments":{}}</tool_call>')
-        == ""
-    )
+    assert strip_tool_markup_streaming('<tool_call>{"name":"x","arguments":{}}</tool_call>') == ""
     # A lone </function> without a sentinel is kept (likely code/XML), not over-stripped.
     assert strip_tool_markup_streaming("see </function> here") == "see </function> here"
 
@@ -4940,7 +4937,6 @@ def test_safetensors_seg_mirrors_gguf_orphan_close_scrub():
     # Source-assert (Fix A): the safetensors ``_seg`` must call the orphan-close scrubber so it
     # stays byte-for-byte aligned with the GGUF ``_seg``.
     import inspect
-
     src = inspect.getsource(strip_tool_markup_streaming)
     assert "_strip_trailing_orphan_close_run" in src
 

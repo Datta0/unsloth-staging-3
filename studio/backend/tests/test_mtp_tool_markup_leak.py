@@ -409,7 +409,6 @@ class TestKimiDeepSeekOrphanCloses:
             _KIMI_CALL_END,
             _KIMI_SECTION_END,
         )
-
         return _KIMI_CALL_END, _KIMI_SECTION_END, _DEEPSEEK_CALL_END, _DEEPSEEK_END
 
     def test_tokens_registered_in_orphan_sets(self):
@@ -417,7 +416,6 @@ class TestKimiDeepSeekOrphanCloses:
             _ORPHAN_CLOSE_TOKENS,
             _ORPHAN_SENTINELS,
         )
-
         for tok in self._tokens():
             assert tok in _ORPHAN_CLOSE_TOKENS
             assert tok in _ORPHAN_SENTINELS
@@ -439,19 +437,13 @@ class TestKimiDeepSeekOrphanCloses:
 
         kimi_end, kimi_section_end, ds_call_end, ds_end = self._tokens()
         assert (
-            _strip_trailing_orphan_close_run("answer " + kimi_end + kimi_section_end)
-            == "answer "
+            _strip_trailing_orphan_close_run("answer " + kimi_end + kimi_section_end) == "answer "
         )
-        assert (
-            _strip_trailing_orphan_close_run("answer " + ds_call_end + ds_end)
-            == "answer "
-        )
+        assert _strip_trailing_orphan_close_run("answer " + ds_call_end + ds_end) == "answer "
         # And through the safetensors streaming stripper (which threads the same helper).
         from core.inference.safetensors_agentic import strip_tool_markup_streaming
 
-        assert (
-            strip_tool_markup_streaming("answer" + kimi_end + kimi_section_end) == "answer"
-        )
+        assert strip_tool_markup_streaming("answer" + kimi_end + kimi_section_end) == "answer"
         assert strip_tool_markup_streaming("answer" + ds_call_end + ds_end) == "answer"
 
     def test_single_trailing_closer_also_stripped(self):

@@ -9934,9 +9934,7 @@ class LlamaCppBackend:
                                                         "tool_name": _sniffed,
                                                         # Display only (content_accum is already
                                                         # scrubbed above); mirror the structured path.
-                                                        "text": _sanitize_control_chars(
-                                                            _call_text
-                                                        ),
+                                                        "text": _sanitize_control_chars(_call_text),
                                                     }
                                                     _text_args_streamed_upto = len(content_accum)
                                             elif len(content_accum) > _text_args_streamed_upto:
