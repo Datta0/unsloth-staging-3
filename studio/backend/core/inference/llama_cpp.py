@@ -9231,7 +9231,9 @@ class LlamaCppBackend:
                                 # sends these as "reasoning_content"; wrap
                                 # in <think> tags for the frontend parser.
                                 # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
-                                reasoning = _sanitize_control_chars(delta.get("reasoning_content", ""))
+                                reasoning = _sanitize_control_chars(
+                                    delta.get("reasoning_content", "")
+                                )
                                 if reasoning:
                                     reasoning_text += reasoning
                                     if not in_thinking:
@@ -9842,7 +9844,9 @@ class LlamaCppBackend:
                                 # tool_start, so the <think> block stays a
                                 # monotonic prefix like the no-tool path.
                                 # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
-                                reasoning = _sanitize_control_chars(delta.get("reasoning_content", ""))
+                                reasoning = _sanitize_control_chars(
+                                    delta.get("reasoning_content", "")
+                                )
                                 if reasoning:
                                     if _reasoning_started_at is None:
                                         _reasoning_started_at = time.monotonic()
@@ -10733,7 +10737,9 @@ class LlamaCppBackend:
                                     _metadata_finish_reason = _fr
 
                                 # Scrub U+FFFD / control chars: reasoning bypasses strip_tool_markup.
-                                reasoning = _sanitize_control_chars(delta.get("reasoning_content", ""))
+                                reasoning = _sanitize_control_chars(
+                                    delta.get("reasoning_content", "")
+                                )
                                 if reasoning:
                                     if _final_reasoning_started_at is None:
                                         _final_reasoning_started_at = time.monotonic()

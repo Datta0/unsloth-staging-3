@@ -37,9 +37,7 @@ from core import tool_healing as _tool_healing
 # result: C0 (keeping tab, newline, return, ESC), C1, and U+FFFD. A GGUF byte-fallback
 # token decoding to invalid UTF-8 surfaces as U+FFFD, common on MTP/speculative
 # quantized targets (ggml-org/llama.cpp#25618). Same class as tools._BINARY_CHAR_RE.
-_DISPLAY_CONTROL_CHAR_RE = re.compile(
-    "[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f-\x9f�]"
-)
+_DISPLAY_CONTROL_CHAR_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f-\x9f�]")
 
 
 def sanitize_control_chars(text: str) -> str:
