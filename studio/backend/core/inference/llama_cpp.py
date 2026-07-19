@@ -9863,7 +9863,9 @@ class LlamaCppBackend:
                                             }
 
                                 # ── Content tokens ──
-                                token = delta.get("content", "")
+                                # Scrub U+FFFD / control chars: the streaming strip
+                                # runs only under Auto-Heal, so content bytes leak otherwise.
+                                token = _sanitize_control_chars(delta.get("content", ""))
                                 if token:
                                     # First answer token ends reasoning.
                                     if (

@@ -27,6 +27,7 @@ import threading
 import time
 from typing import Any, Callable, Generator
 
+from core.inference.tool_call_parser import sanitize_control_chars as _sanitize_control_chars
 from loggers import get_logger
 
 logger = get_logger(__name__)
@@ -247,11 +248,14 @@ def stream_tool_execution(
                 stream_capped = True
             streamed_chars += len(chunk)
             if chunk:
+                # Scrub live output too: record_result cleans only the final
+                # result, and the UI keeps the live stream when it differs, so
+                # unscrubbed U+FFFD here would stay on the finished tool card.
                 yield {
                     "type": "tool_output",
                     "tool_name": tool_name,
                     "tool_call_id": tool_call_id,
-                    "text": chunk,
+                    "text": _sanitize_control_chars(chunk),
                 }
     except BaseException:
         # The loop only raises when the consumer closes us early: an SSE

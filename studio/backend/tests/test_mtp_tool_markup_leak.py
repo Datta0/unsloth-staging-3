@@ -64,6 +64,9 @@ def test_reporter_garbage_is_cleaned():
         ("x<tool_call|>", "x"),
         ("answer</function>\n</tool_call>", "answer"),  # run of orphan closes
         ("value</parameter>", "value"),  # truncated outer close
+        ("Here is the answer.</tool_call>\n", "Here is the answer."),  # trailing newline
+        ("Done.</function>  ", "Done."),  # trailing spaces
+        ("8��� </tool_call>\n", "8"),  # reporter's garbage + trailing newline
     ],
 )
 def test_trailing_orphan_closes_are_stripped_at_final(text, expected):
@@ -71,6 +74,24 @@ def test_trailing_orphan_closes_are_stripped_at_final(text, expected):
 
 
 # ── the conservative contract must survive ──────────────────────────
+
+
+def test_streamed_tool_output_is_sanitized():
+    # A live tool chunk carrying U+FFFD must be scrubbed before it reaches the UI,
+    # since record_result only cleans the final result and the UI keeps the stream.
+    from core.inference.tool_stream_exec import stream_tool_execution
+
+    def invoke(on_output):
+        on_output("ok\t█� chunk")
+        return "ok chunk"
+
+    texts = [
+        ev["text"]
+        for ev in stream_tool_execution(invoke, tool_name = "python")
+        if ev.get("type") == "tool_output"
+    ]
+    assert texts and all("�" not in t for t in texts)
+    assert "\t" in "".join(texts)  # legitimate whitespace preserved
 
 
 def test_wellformed_call_still_stripped():
