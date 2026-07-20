@@ -287,14 +287,11 @@ def test_final_pass_content_is_sanitized_without_auto_heal(monkeypatch):
 
 # ── the GGUF streaming _seg must scrub the orphan close, not only the parser ──
 #
-# The bug (Codex 3610967410): the llama.cpp GGUF streaming path has its own duplicate
-# stripper ``_strip_tool_markup_streaming._seg`` that mirrors the parser's ``seg_final``
-# block (Gemma / function-XML / GLM scans + _TOOL_ALL_PATS then _REHEARSAL_TAIL_STRIP_RE)
-# but never called ``_strip_trailing_orphan_close_run``. So a GGUF-streamed plain answer
-# whose ``<tool_call>`` opener was drained / U+FFFD-mangled (MTP byte-fallback) streamed its
-# trailing orphan ``</tool_call>`` into the bubble, while the safetensors path scrubbed it
-# via ``strip_tool_markup(final=True)``. ``_seg`` runs both mid-stream and at end-of-stream,
-# so the fix must live in ``_seg`` (not only the end-of-stream call site).
+# The bug (Codex 3610967410): the GGUF streaming stripper ``_strip_tool_markup_streaming._seg``
+# mirrors the parser's ``seg_final`` block but never called ``_strip_trailing_orphan_close_run``,
+# so a GGUF-streamed answer whose ``<tool_call>`` opener was drained/U+FFFD-mangled leaked its
+# trailing orphan ``</tool_call>`` (the safetensors path scrubbed it via strip_tool_markup(final=True)).
+# ``_seg`` runs both mid-stream and at end-of-stream, so the fix must live in ``_seg``.
 
 
 class TestMTPStreamingOrphanCloseLeak:
@@ -395,10 +392,8 @@ class TestMTPStreamingOrphanCloseLeak:
 #
 # The bug (Codex 3611159411): ``_ORPHAN_CLOSE_TOKENS`` / ``_ORPHAN_SENTINELS`` only listed
 # the Qwen/Gemma/function-XML closers, so a Kimi ``<|tool_call_end|><|tool_calls_section_end|>``
-# or the DeepSeek ``<｜tool▁call▁end｜><｜tool▁calls▁end｜>`` run whose opener was drained /
-# U+FFFD-mangled leaked verbatim. These are back-to-back special tokens (a contiguous
-# end-of-text run the linear scanner handles) and are never legit prose, so they join the
-# sentinel set like ``<tool_call|>``.
+# or DeepSeek ``<｜tool▁call▁end｜><｜tool▁calls▁end｜>`` run whose opener was drained/U+FFFD-mangled
+# leaked verbatim. Back-to-back special tokens, never legit prose, so they join the sentinel set.
 
 
 class TestKimiDeepSeekOrphanCloses:

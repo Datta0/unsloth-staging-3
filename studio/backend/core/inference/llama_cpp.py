@@ -9454,9 +9454,8 @@ class LlamaCppBackend:
                 for pat in pats:
                     seg = pat.sub("", seg)
                 if is_last:
-                    # Trailing orphan closes whose opener was drained or U+FFFD-mangled upstream
-                    # (MTP byte-fallback); mirror the parser's final order (orphan-strip then
-                    # rehearsal-tail) so the GGUF stream matches strip_tool_markup(final=True).
+                    # Trailing orphan closes (drained/U+FFFD-mangled opener); orphan-strip before
+                    # rehearsal-tail to match strip_tool_markup(final=True).
                     seg = _strip_trailing_orphan_close_run(seg)
                     seg = apply_tool_strip_patterns(
                         seg, [_REHEARSAL_TAIL_STRIP_RE], enabled_tool_names = _enabled_names_gate
@@ -9831,9 +9830,8 @@ class LlamaCppBackend:
                                                         "type": "tool_args",
                                                         "tool_call_id": current_id,
                                                         "tool_name": current_name,
-                                                        # Display only: scrub U+FFFD/control chars
-                                                        # so byte-fallback garbage in a large call's
-                                                        # args never renders; accumulator keeps bytes.
+                                                        # Display only: scrub byte-fallback garbage
+                                                        # from rendered args; accumulator keeps bytes.
                                                         "text": _sanitize_control_chars(
                                                             _args_backlog
                                                         ),
@@ -10769,9 +10767,8 @@ class LlamaCppBackend:
                                     cumulative += reasoning
                                     yield {"type": "content", "text": cumulative}
 
-                                # Scrub: the display strip below is a no-op when
-                                # auto_heal_tool_calls is off, so this final pass would
-                                # otherwise leak byte-fallback garbage.
+                                # Scrub: display strip below is a no-op without auto_heal_tool_calls,
+                                # so this final pass would otherwise leak byte-fallback garbage.
                                 token = _sanitize_control_chars(delta.get("content", ""))
                                 if token:
                                     if (

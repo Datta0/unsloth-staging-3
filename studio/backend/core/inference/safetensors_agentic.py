@@ -280,9 +280,8 @@ def strip_tool_markup_streaming(
         for pat in pats:
             seg = pat.sub("", seg)
         if is_last:
-            # Trailing orphan closes whose opener was drained or U+FFFD-mangled upstream
-            # (MTP byte-fallback); mirror the parser's final order (orphan-strip then
-            # rehearsal-tail) so the safetensors stream matches strip_tool_markup(final=True).
+            # Trailing orphan closes (drained/U+FFFD-mangled opener); orphan-strip before
+            # rehearsal-tail to match strip_tool_markup(final=True).
             seg = _strip_trailing_orphan_close_run(seg)
             seg = apply_tool_strip_patterns(
                 seg, [_REHEARSAL_TAIL_STRIP_RE], enabled_tool_names = enabled_tool_names
@@ -667,8 +666,8 @@ def run_safetensors_tool_loop(
             if not isinstance(cumulative, str):
                 continue  # defensive: pipeline yields only strings
 
-            # Scrub the accumulation before diffing so an MTP byte-fallback token never leaks
-            # into the delta (no llama-server display strip here); keeps prev_cumulative aligned.
+            # Scrub before diffing so byte-fallback garbage never leaks into the delta (no
+            # llama-server display strip here); keeps prev_cumulative aligned.
             cumulative = sanitize_control_chars(cumulative)
 
             delta = cumulative[len(prev_cumulative) :]

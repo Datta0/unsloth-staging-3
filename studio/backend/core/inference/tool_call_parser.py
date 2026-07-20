@@ -33,9 +33,9 @@ from typing import Any, Optional
 from core import tool_healing as _tool_healing
 
 
-# C0 (keeping tab/newline/return/ESC), C1, and U+FFFD: never valid in visible chat
-# or a tool result. GGUF byte-fallback on MTP/speculative quantized targets surfaces
-# as U+FFFD (ggml-org/llama.cpp#25618). Same class as tools._BINARY_CHAR_RE.
+# C0 (keep tab/newline/return/ESC), C1, and U+FFFD: never valid in chat/tool output. MTP/
+# speculative GGUF byte-fallback surfaces as U+FFFD (ggml-org/llama.cpp#25618). Same class as
+# tools._BINARY_CHAR_RE.
 _DISPLAY_CONTROL_CHAR_RE = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f-\x9f�]")
 
 
@@ -322,11 +322,10 @@ _KIMI_ARG_BEGIN = "<|tool_call_argument_begin|>"
 _KIMI_CALL_END = "<|tool_call_end|>"
 _KIMI_ID_RE = re.compile(r"^(?:functions\.)?([\w\.\-]+)(?::(\d+))?$")
 
-# Kimi and DeepSeek end-of-turn closers are back-to-back special tokens (a contiguous
-# end-of-text run the linear scanner handles); a drained/U+FFFD-mangled opener leaves them
-# to leak as a trailing orphan. They are unambiguous special tokens (never legit prose), so
-# they match the ``<tool_call|>``-style sentinel safety profile. Extended here (not at the
-# tuple defs above) because these consts are defined later in the module.
+# Kimi and DeepSeek end-of-turn closers are back-to-back special tokens; a drained/U+FFFD-
+# mangled opener leaves them to leak as a trailing orphan. Never legit prose, so they join the
+# ``<tool_call|>``-style sentinel set. Extended here (not the tuple defs above) since these
+# consts are defined later.
 _ORPHAN_CLOSE_TOKENS = _ORPHAN_CLOSE_TOKENS + (
     _KIMI_CALL_END,
     _KIMI_SECTION_END,
