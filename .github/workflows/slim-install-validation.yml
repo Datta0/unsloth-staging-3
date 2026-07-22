@@ -79,6 +79,21 @@ jobs:
               echo "FAIL: whisper installer exited nonzero"
               return 1
             fi
+            # DIAGNOSTIC shim (finding repro, not the fix): the slim wiring globs
+            # ("libggml*", "ggml*.dll") skip non-ggml runtime libraries that
+            # llama's ggml depends on, e.g. libomp140.aarch64.dll on
+            # windows-arm64, so whisper-server exits with STATUS_DLL_NOT_FOUND.
+            # Mirror any OpenMP runtime from the llama bin dir to confirm the
+            # root cause; the real fix belongs in install_whisper_prebuilt.py.
+            LB="$UNSLOTH_STUDIO_HOME/llama.cpp/build/bin"
+            WB="$UNSLOTH_STUDIO_HOME/whisper.cpp/build/bin"
+            case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) LB="$LB/Release"; WB="$WB/Release" ;; esac
+            for f in "$LB"/libomp*.dll "$LB"/vcomp*.dll "$LB"/libomp*.so* "$LB"/libomp*.dylib; do
+              if [ -f "$f" ] && [ ! -e "$WB/$(basename "$f")" ]; then
+                cp "$f" "$WB/"
+                echo "DIAGNOSTIC: wired $(basename "$f") from llama bin dir"
+              fi
+            done
             echo "== fetch model and audio =="
             CLIPS="$RUNNER_TEMP/clips"
             mkdir -p "$CLIPS"
