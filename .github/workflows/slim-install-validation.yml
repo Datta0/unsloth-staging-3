@@ -89,13 +89,16 @@ jobs:
               https://raw.githubusercontent.com/ggerganov/whisper.cpp/master/samples/jfk.wav || {
               echo "FAIL: jfk.wav download failed"; return 1; }
             NASA=""
-            if curl -sL --retry 2 --max-time 120 -o "$CLIPS/small_step.mp3" \
-                 "https://www.nasa.gov/wp-content/uploads/2015/01/590331main_ringtone_smallStep.mp3" \
-               && command -v ffmpeg >/dev/null 2>&1 \
-               && ffmpeg -y -v error -i "$CLIPS/small_step.mp3" -ar 16000 -ac 1 "$CLIPS/small_step.wav"; then
-              NASA="$CLIPS/small_step.wav"
+            if ! curl -sL -A "Mozilla/5.0 (X11; Linux x86_64)" --retry 2 --max-time 120 \
+                 -o "$CLIPS/small_step.mp3" \
+                 "https://www.nasa.gov/wp-content/uploads/2015/01/590331main_ringtone_smallStep.mp3"; then
+              echo "SKIP: NASA clip download failed; jfk.wav remains the required assertion"
+            elif ! command -v ffmpeg >/dev/null 2>&1; then
+              echo "SKIP: no ffmpeg on this runner; jfk.wav remains the required assertion"
+            elif ! ffmpeg -y -v error -i "$CLIPS/small_step.mp3" -ar 16000 -ac 1 "$CLIPS/small_step.wav"; then
+              echo "SKIP: NASA clip did not decode ($(file -b "$CLIPS/small_step.mp3" 2>/dev/null || echo unknown)); jfk.wav remains the required assertion"
             else
-              echo "SKIP: NASA clip unavailable or no ffmpeg; jfk.wav remains the required assertion"
+              NASA="$CLIPS/small_step.wav"
             fi
             echo "== transcription checks =="
             ARGS=( .github/staging/slim_check.py

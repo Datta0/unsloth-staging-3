@@ -158,11 +158,14 @@ def main() -> int:
                 print(f"SKIP: clip not present: {audio}")
                 continue
             text = post_inference(base, audio)
-            print(f"TRANSCRIPT [{audio.name}]: {text[:160]!r}")
-            if not text:
+            # whisper-server may break segments with newlines mid-sentence;
+            # normalise all whitespace before the phrase check.
+            norm = re.sub(r"\s+", " ", text).strip()
+            print(f"TRANSCRIPT [{audio.name}]: {norm[:160]!r}")
+            if not norm:
                 print(f"FAIL: empty transcript for {audio.name}")
                 rc = 1
-            elif phrase and phrase.lower() not in text.lower():
+            elif phrase and re.sub(r"\s+", " ", phrase).lower() not in norm.lower():
                 print(f"FAIL: transcript for {audio.name} missing phrase {phrase!r}")
                 rc = 1
             else:
