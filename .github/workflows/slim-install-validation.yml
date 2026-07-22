@@ -1,0 +1,118 @@
+name: slim-install-validation
+on:
+  push:
+    branches:
+      - pr-7294-slim-ci
+    paths:
+      - '.github/workflows/slim-install-validation.yml'
+      - '.github/staging/slim_check.py'
+  workflow_dispatch:
+concurrency:
+  group: slim-validate-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  validate:
+    name: ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - ubuntu-latest
+          - ubuntu-24.04
+          - ubuntu-22.04
+          - ubuntu-26.04
+          - ubuntu-slim
+          - ubuntu-24.04-arm
+          - ubuntu-22.04-arm
+          - ubuntu-26.04-arm
+          - windows-latest
+          - windows-2025
+          - windows-2025-vs2026
+          - windows-2022
+          - windows-11-arm
+          - windows-11-vs2026-arm
+          - macos-latest
+          - macos-14
+          - macos-15
+          - macos-26
+          - macos-15-intel
+          - macos-26-intel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate slim whisper plus llama prebuilt install
+        run: |
+          set -u
+          mkdir -p "$RUNNER_TEMP/slimlog"
+          LOG="$RUNNER_TEMP/slimlog/job.log"
+          main() {
+            echo "runner: ${{ matrix.runner }}  uname: $(uname -a)"
+            PY=python3
+            command -v python3 >/dev/null 2>&1 || PY=python
+            if ! command -v "$PY" >/dev/null 2>&1; then
+              echo "SKIP: no python interpreter on this runner"
+              return 0
+            fi
+            "$PY" --version
+            export UNSLOTH_STUDIO_HOME="$RUNNER_TEMP/studio_home"
+            mkdir -p "$UNSLOTH_STUDIO_HOME"
+            echo "== llama resolver probe =="
+            RES=$("$PY" studio/install_llama_prebuilt.py --resolve-prebuilt --output-format json 2>&1) || true
+            echo "resolver: $RES"
+            case "$RES" in
+              *'"prebuilt_available": true'*) : ;;
+              *) echo "SKIP: no llama prebuilt asset for this host (resolver output above)"; return 0 ;;
+            esac
+            echo "== llama install =="
+            if ! "$PY" studio/install_llama_prebuilt.py --install-dir "$UNSLOTH_STUDIO_HOME/llama.cpp"; then
+              echo "FAIL: llama installer exited nonzero"
+              return 1
+            fi
+            echo "== whisper install =="
+            if ! "$PY" studio/install_whisper_prebuilt.py --install-dir "$UNSLOTH_STUDIO_HOME/whisper.cpp" --backend auto; then
+              echo "FAIL: whisper installer exited nonzero"
+              return 1
+            fi
+            echo "== fetch model and audio =="
+            CLIPS="$RUNNER_TEMP/clips"
+            mkdir -p "$CLIPS"
+            curl -sL --retry 3 --max-time 300 -o "$CLIPS/ggml-tiny.en.bin" \
+              https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin || {
+              echo "FAIL: model download failed"; return 1; }
+            curl -sL --retry 3 --max-time 120 -o "$CLIPS/jfk.wav" \
+              https://raw.githubusercontent.com/ggerganov/whisper.cpp/master/samples/jfk.wav || {
+              echo "FAIL: jfk.wav download failed"; return 1; }
+            NASA=""
+            if curl -sL --retry 2 --max-time 120 -o "$CLIPS/small_step.mp3" \
+                 "https://www.nasa.gov/wp-content/uploads/2015/01/590331main_ringtone_smallStep.mp3" \
+               && command -v ffmpeg >/dev/null 2>&1 \
+               && ffmpeg -y -v error -i "$CLIPS/small_step.mp3" -ar 16000 -ac 1 "$CLIPS/small_step.wav"; then
+              NASA="$CLIPS/small_step.wav"
+            else
+              echo "SKIP: NASA clip unavailable or no ffmpeg; jfk.wav remains the required assertion"
+            fi
+            echo "== transcription checks =="
+            ARGS=( .github/staging/slim_check.py
+                   --home "$UNSLOTH_STUDIO_HOME"
+                   --model "$CLIPS/ggml-tiny.en.bin"
+                   --clip "$CLIPS/jfk.wav::ask not what your country can do for you" )
+            if [ -n "$NASA" ]; then
+              ARGS+=( --clip "$NASA::one small step" )
+            fi
+            "$PY" "${ARGS[@]}"
+          }
+          main 2>&1 | tee "$LOG"
+          exit "${PIPESTATUS[0]}"
+      - name: Upload log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: slim-log-${{ matrix.runner }}
+          path: ${{ runner.temp }}/slimlog/
+          if-no-files-found: ignore
