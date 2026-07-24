@@ -455,3 +455,33 @@ def test_legacy_migration_is_idempotent_and_non_destructive():
     # Layer 3: non-overwriting merge skips an existing (or default) key, so even a
     # forced re-run cannot duplicate or clobber a user's config.
     assert "if (isDefaultConfig(migrated) || Object.hasOwn(map, key)) {" in src
+
+
+def test_autoload_fetches_custom_folder_inventory():
+    """Auto-load must consult /api/models/local so custom-folder, LM Studio,
+    and models-dir GGUFs are visible before falling back to HF-cache scans."""
+    src = _read("features/chat/api/chat-adapter.ts")
+    auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
+    assert "listLocalModels()" in auto_load
+    assert "tryAutoLoadLocalModels(" in auto_load
+
+
+def test_autoload_never_downloads_default_qwen():
+    """Background auto-load must not fetch Hub weights without an explicit user
+  action (fixes #7374's unsolicited Qwen download)."""
+    src = _read("features/chat/api/chat-adapter.ts")
+    auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
+    assert "Downloading a small model" not in auto_load
+    assert "Qwen3.5-4B-MTP-GGUF" not in auto_load
+    assert "Never downloads from Hugging Face without an explicit user action." in src
+
+
+def test_autoload_local_model_helpers_cover_custom_sources():
+    """The extracted helpers must recognize custom-folder locals and match by
+    id, path, or model_id so remembered loads survive path renames."""
+    src = _read("features/chat/utils/auto-load-local-models.ts")
+    assert 'model.source === "custom"' in src
+    assert 'model.source === "models_dir"' in src
+    assert 'model.source === "lmstudio"' in src
+    assert "model.path.toLowerCase() === normalized" in src
+    assert "model.model_id?.trim().toLowerCase()" in src
