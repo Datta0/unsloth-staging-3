@@ -485,3 +485,12 @@ def test_autoload_local_model_helpers_cover_custom_sources():
     assert 'model.source === "lmstudio"' in src
     assert "model.path.toLowerCase() === normalized" in src
     assert "model.model_id?.trim().toLowerCase()" in src
+
+
+def test_autoload_remembers_direct_gguf_files():
+    """Standalone .gguf auto-loads must persist for the next session even when
+    there is no quant variant (Codex P2 on #7375)."""
+    src = _read("features/chat/utils/last-local-model-load.ts")
+    assert 'from "./auto-load-local-models"' in src
+    assert "isDirectGgufPath(parsed.id)" in src
+    assert "isDirectGgufPath(id)" in src

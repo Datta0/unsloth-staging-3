@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { isDirectGgufPath } from "./auto-load-local-models";
+
 export type LastLocalModelKind = "gguf" | "model";
 
 export type LastLocalModelLoad = {
@@ -41,7 +43,8 @@ export function readLastLocalModelLoad(): LastLocalModelLoad | null {
     }
     if (
       parsed.kind === "gguf" &&
-      (typeof parsed.ggufVariant !== "string" || !parsed.ggufVariant.trim())
+      (typeof parsed.ggufVariant !== "string" || !parsed.ggufVariant.trim()) &&
+      !isDirectGgufPath(parsed.id)
     ) {
       return null;
     }
@@ -67,7 +70,7 @@ export function recordLastLocalModelLoad(input: {
     return;
   }
   const ggufVariant = input.ggufVariant?.trim() || null;
-  if (input.kind === "gguf" && !ggufVariant) {
+  if (input.kind === "gguf" && !ggufVariant && !isDirectGgufPath(id)) {
     return;
   }
   try {
