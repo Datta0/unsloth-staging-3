@@ -468,7 +468,7 @@ def test_autoload_fetches_custom_folder_inventory():
 
 def test_autoload_never_downloads_default_qwen():
     """Background auto-load must not fetch Hub weights without an explicit user
-  action (fixes #7374's unsolicited Qwen download)."""
+    action (fixes #7374's unsolicited Qwen download)."""
     src = _read("features/chat/api/chat-adapter.ts")
     auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
     assert "Downloading a small model" not in auto_load
