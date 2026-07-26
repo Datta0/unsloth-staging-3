@@ -256,3 +256,120 @@ def test_background_auto_load_keeps_the_existing_validate_gates():
         "blockedByTrustRemoteCode": False,
         "hadNonTrustFailure": True,
     }
+
+
+def test_companion_filtering_is_scoped_to_gguf_entries():
+    """``isGgufCompanionPath`` reads GGUF filenames, so it may only judge GGUF
+    rows. The backend predicates it mirrors (``hub/utils/gguf.py``
+    ``is_mtp_drafter_path`` and ``core/inference/llama_cpp.py``
+    ``_is_companion_gguf_path``) both return False before anything else when the
+    path does not end in ``.gguf``, so a safetensors checkpoint that merely sits
+    in a folder named ``mtp-...``/``MTP``/``...mmproj...`` is a real model and
+    must stay auto-loadable. Every actual companion still carries a GGUF signal
+    (a ``.gguf`` path or ``model_format: "gguf"``), so none of them slip back in.
+    """
+    out = _run(
+        "const nonGguf = [\n"
+        "  { path: '/models/mtp-qwen3-next-80b-a3b', model_format: 'safetensors' },\n"
+        "  { path: '/models/mmproj-training-run', model_format: 'safetensors' },\n"
+        "  { path: '/models/MTP', model_format: 'safetensors' },\n"
+        "  { path: '/models/DeepSeek-V4/mtp/stage2', model_format: 'safetensors' },\n"
+        "];\n"
+        "const companions = [\n"
+        "  { path: '/m/a-GGUF/mmproj-F16.gguf', model_format: 'gguf' },\n"
+        "  { path: '/m/mtp-qwen3-next-Q8_0.gguf', model_format: 'gguf' },\n"
+        "  { path: '/m/Gemma-4-26B-A4B-GGUF/MTP', model_format: 'gguf' },\n"
+        "  { path: '/m/gemma-Q4_K_M-00002-of-00002.gguf', model_format: 'gguf' },\n"
+        "  { path: 'D:\\\\AI Models\\\\Gemma-GGUF\\\\mmproj-F32.gguf', model_format: 'gguf' },\n"
+        "];\n"
+        "console.log(JSON.stringify({\n"
+        "  nonGguf: nonGguf.map((o) => helpers.isAutoLoadLocalModel(M(o))),\n"
+        "  companions: companions.map((o) => helpers.isAutoLoadLocalModel(M(o))),\n"
+        "  partialStillSkipped: helpers.isAutoLoadLocalModel(\n"
+        "    M({ path: '/models/mtp-qwen3-next-80b-a3b', model_format: 'safetensors', partial: true })),\n"
+        "}));\n"
+    )
+    assert out == {
+        "nonGguf": [True] * 4,
+        "companions": [False] * 5,
+        "partialStillSkipped": False,
+    }
+
+
+def _run_local_gguf_variants(*, failing_quant: str, preferred: str | None = None):
+    """Run the REAL ``tryAutoLoadLocalGgufModel`` over one custom folder holding
+    two downloaded quants, where loading *failing_quant* rejects. Reports which
+    quants were attempted, whether a model ended up loaded, the skip keys that
+    were recorded, and what a second visit to the same folder retries."""
+    src = ADAPTER.read_text()
+    start = src.index("  async function tryAutoLoadLocalGgufModel(")
+    end = src.index("  async function tryAutoLoadRememberedLocalModel(", start)
+    key_start = src.index("function autoLoadCandidateKey(")
+    key_end = src.index("\n}\n", key_start) + 3
+    return _run(
+        "type LastLocalModelKind = 'gguf' | 'model';\n"
+        "type LocalModelInfo = any;\n"
+        f"{src[key_start:key_end]}\n"
+        "const isDirectGgufPath = helpers.isDirectGgufPath;\n"
+        "let hadNonTrustFailure = false;\n"
+        "const skippedAutoLoadCandidates = new Set<string>();\n"
+        "const attempted: string[] = [];\n"
+        "function hasBigEndianGgufMarker(_p: string) { return false; }\n"
+        "function isAutoLoadableGgufVariant(_v: any) { return true; }\n"
+        "async function listGgufVariants(_id: string) {\n"
+        "  return { variants: [\n"
+        "    { quant: 'Q4_K_M', downloaded: true, size_bytes: 4000 },\n"
+        "    { quant: 'Q2_K', downloaded: true, size_bytes: 1000 },\n"
+        "  ] };\n"
+        "}\n"
+        f"const FAILING = {json.dumps(failing_quant)};\n"
+        "async function loadAutoLoadCandidate(candidate: any): Promise<boolean> {\n"
+        "  attempted.push(String(candidate.ggufVariant));\n"
+        "  if (candidate.ggufVariant === FAILING) {\n"
+        "    throw new Error('llama_model_load: error loading model');\n"
+        "  }\n"
+        "  return true;\n"
+        "}\n"
+        f"{src[start:end]}\n"
+        "const model = M({ path: '/custom/MyRepo-GGUF', model_format: 'gguf' });\n"
+        f"const preferred = {json.dumps(preferred)};\n"
+        "const loaded = await tryAutoLoadLocalGgufModel(model, preferred);\n"
+        "const firstPass = [...attempted];\n"
+        "const skippedKeys = [...skippedAutoLoadCandidates];\n"
+        "attempted.length = 0;\n"
+        "await tryAutoLoadLocalGgufModel(model);\n"
+        "console.log(JSON.stringify({\n"
+        "  loaded, firstPass, skippedKeys, secondPass: [...attempted], hadNonTrustFailure,\n"
+        "}));\n"
+    )
+
+
+def test_a_failed_local_gguf_variant_does_not_abort_the_rest_of_the_folder():
+    """One corrupt quant must not strand the loadable ones beside it: the queue
+    is smallest-first, so a bad Q2_K would otherwise unwind past the whole
+    ``variantQueue`` loop and auto-load would report no model even though the
+    Q4_K_M in the same folder loads. Same guarantee the per-candidate catch in
+    ``tryAutoLoadLocalModels`` already gives across folders."""
+    out = _run_local_gguf_variants(failing_quant = "Q2_K")
+    assert out["loaded"] is True
+    assert out["firstPass"] == ["Q2_K", "Q4_K_M"]
+    assert out["hadNonTrustFailure"] is True
+
+
+def test_a_failed_local_gguf_variant_is_remembered_by_its_own_quant():
+    """The skip key must name the quant that actually failed, not the preferred
+    one: with no preferred variant the old key was ``gguf:<id>:``, which the
+    per-variant lookup never matches, so a later sweep retried the same broken
+    quant and burned another of the three auto-load attempts."""
+    out = _run_local_gguf_variants(failing_quant = "Q2_K")
+    assert out["skippedKeys"] == ["gguf:/custom/myrepo-gguf:q2_k"]
+    assert "Q2_K" not in out["secondPass"]
+
+
+def test_a_preferred_local_gguf_variant_still_leads_and_falls_back():
+    """The remembered-variant ordering is unchanged, and a failure of the
+    preferred quant still falls through to the remaining downloaded ones."""
+    out = _run_local_gguf_variants(failing_quant = "Q4_K_M", preferred = "Q4_K_M")
+    assert out["firstPass"] == ["Q4_K_M", "Q2_K"]
+    assert out["loaded"] is True
+    assert out["skippedKeys"] == ["gguf:/custom/myrepo-gguf:q4_k_m"]

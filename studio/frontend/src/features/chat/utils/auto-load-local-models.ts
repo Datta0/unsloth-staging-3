@@ -52,9 +52,15 @@ export function isGgufCompanionPath(path: string): boolean {
 }
 
 /** Local models outside the HF cache that auto-load should consider. Companions
- * and half-downloaded copies are never loadable, so they can't be auto-picked. */
+ * and half-downloaded copies are never loadable, so they can't be auto-picked.
+ * The companion rules only apply to GGUF rows, matching the backend predicates
+ * they mirror (which return False for any non-`.gguf` path): a safetensors
+ * checkpoint in a folder named `mtp-...` or `...mmproj...` is a real model. */
 export function isAutoLoadLocalModel(model: LocalModelInfo): boolean {
-  if (model.partial || isGgufCompanionPath(model.path)) {
+  if (model.partial) {
+    return false;
+  }
+  if (localModelIsGguf(model) && isGgufCompanionPath(model.path)) {
     return false;
   }
   return (

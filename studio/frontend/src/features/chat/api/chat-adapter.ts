@@ -1822,16 +1822,27 @@ async function autoLoadSmallestModel(): Promise<{
         ) {
           continue;
         }
-        if (
-          await loadAutoLoadCandidate({
-            id: model.id,
-            kind: "gguf",
-            ggufVariant: variant.quant,
-            maxSeqLength: 0,
-            successLabel: `Loaded ${label} (${variant.quant})`,
-          })
-        ) {
-          return true;
+        // Per-variant guard, like the per-candidate one in the sweep: a corrupt
+        // or unsupported quant must not abort the rest of the folder, and the
+        // skip key has to name the quant that actually failed so a later visit
+        // does not spend another attempt on it.
+        try {
+          if (
+            await loadAutoLoadCandidate({
+              id: model.id,
+              kind: "gguf",
+              ggufVariant: variant.quant,
+              maxSeqLength: 0,
+              successLabel: `Loaded ${label} (${variant.quant})`,
+            })
+          ) {
+            return true;
+          }
+        } catch {
+          hadNonTrustFailure = true;
+          skippedAutoLoadCandidates.add(
+            autoLoadCandidateKey("gguf", model.id, variant.quant),
+          );
         }
       }
     } catch {
