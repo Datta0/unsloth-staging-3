@@ -1080,11 +1080,15 @@ export function useChatModelRuntime() {
               }
             }
             await refresh({ signal: abortCtrl.signal });
+            // Custom-folder / LM Studio / models-dir picks are absolute paths,
+            // and auto-load can now restore them from the local inventory, so
+            // they are remembered like a cached repo id. Native file-picker
+            // picks stay excluded: their id is only valid for the lease that
+            // just expired, so nativePathToken (not the path shape) is the gate.
             if (
               !isLora &&
               !(loadResponse.is_lora ?? false) &&
               !nativePathToken &&
-              !isLocalModelPath(modelId) &&
               !isExternalModelId(modelId)
             ) {
               if (loadResponse.is_gguf || isGguf || ggufVariant) {

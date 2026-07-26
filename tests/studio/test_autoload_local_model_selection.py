@@ -564,3 +564,56 @@ def test_a_clean_sweep_blacklists_nothing():
     assert out["skippedKeys"] == []
     assert out["loaded"] is True
     assert out["hadNonTrustFailure"] is False
+
+
+def _run_manual_load_record_guard(cases: list[dict]):
+    """Evaluate the REAL manual-load recorder guard from use-chat-model-runtime
+    against the real ``isLocalModelPath`` / ``isExternalModelId`` predicates."""
+    src = RUNTIME.read_text()
+    start = src.index("            if (\n              !isLora &&")
+    open_paren = src.index("(", start)
+    condition = src[open_paren + 1:src.index("\n            ) {", open_paren)]
+    store_src = STORE.read_text()
+    ext_src = EXTERNAL.read_text()
+    return _run(
+        f"{_slice(ext_src, 'const EXTERNAL_MODEL_PREFIX =', chr(10))}\n"
+        f"{_slice(store_src, 'export function isLocalModelPath(', chr(10) + '}' + chr(10))}\n}}\n"
+        f"{_slice(ext_src, 'export function isExternalModelId(', chr(10) + '}' + chr(10))}\n}}\n"
+        "function shouldRecord(c: any): boolean {\n"
+        "  const isLora = c.isLora ?? false;\n"
+        "  const loadResponse = c.loadResponse ?? {};\n"
+        "  const nativePathToken = c.nativePathToken ?? undefined;\n"
+        "  const modelId = c.modelId;\n"
+        f"  return Boolean({condition});\n"
+        "}\n"
+        f"const cases = {json.dumps(cases)};\n"
+        "console.log(JSON.stringify(cases.map(shouldRecord)));\n"
+    )
+
+
+MANUAL_LOAD_CASES = [
+    # Inventory-backed local picks: auto-load restores these from the local
+    # sweep, so they have to be remembered like a cached repo id.
+    ({"modelId": "/scan/MyRepo-GGUF"}, True),
+    ({"modelId": "/scan/qwen3-4b-Q4_K_M.gguf"}, True),
+    ({"modelId": "D:\\AI Models\\MyRepo-GGUF"}, True),
+    ({"modelId": "/home/u/.lmstudio/models/org/MyModel"}, True),
+    # A native file-picker pick is valid only for the lease that just expired.
+    ({"modelId": "/tmp/dropped.gguf", "nativePathToken": "tok-123"}, False),
+    # Adapters would make the backend pull their base model from the Hub.
+    ({"modelId": "/scan/MyAdapter", "isLora": True}, False),
+    ({"modelId": "/scan/MyAdapter2", "loadResponse": {"is_lora": True}}, False),
+    # External providers are not local models at all.
+    ({"modelId": "external::openai::gpt-4o-mini"}, False),
+    # Unchanged: a cached hub repo is still remembered.
+    ({"modelId": "unsloth/gemma-3-4b-it"}, True),
+]
+
+
+def test_manual_local_picks_are_remembered_as_the_last_used_model():
+    """``tryAutoLoadRememberedLocalModel`` can only restore what the manual load
+    path records. Gating on the path shape meant a custom-folder pick was never
+    written, so the next start restored a stale cached repo instead."""
+    out = _run_manual_load_record_guard([case for case, _ in MANUAL_LOAD_CASES])
+
+    assert out == [expected for _, expected in MANUAL_LOAD_CASES]
