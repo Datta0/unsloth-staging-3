@@ -392,13 +392,19 @@ def _scan_hf_cache(cache_dir: Path, *, active_cache: bool = True) -> List[LocalM
         partial = partial or hf_cache_scan.is_gguf_repo_partial(model_id, repo_dir)
 
         load_id = model_id
+        snapshot = _resolve_hf_cache_realpath(repo_dir)
         if not active_cache:
-            load_id = _resolve_hf_cache_realpath(repo_dir) or str(repo_dir.resolve())
+            load_id = snapshot or str(repo_dir.resolve())
+        # Classify from the snapshot's own weights. A GGUF repo without a -GGUF
+        # suffix is common, and leaving this unset makes every consumer guess from
+        # the name; the snapshot is already resolved just above.
+        model_format = _dir_model_format(Path(snapshot)) if snapshot else None
         found.append(
             LocalModelInfo(
                 id = load_id,
                 model_id = model_id,
                 display_name = model_id.split("/")[-1],
+                model_format = model_format,
                 path = load_id if not active_cache else str(repo_dir),
                 source = "hf_cache",
                 active_cache = active_cache,
@@ -3016,11 +3022,48 @@ def _repo_gguf_last_modified(repo_info) -> float:
     return latest
 
 
+def _repo_gguf_load_id(repo_info, active_root: Optional[Path]) -> Optional[str]:
+    """Snapshot dir holding the newest primary GGUF, for a repo outside the active
+    hub cache that does not resolve by id. ``None`` when the id works or no
+    snapshot is recorded, since the repo dir itself is not loadable.
+    """
+    repo_path = getattr(repo_info, "repo_path", None)
+    if repo_path is None or active_root is None:
+        return None
+    try:
+        if repo_path.parent.resolve(strict = False) == active_root:
+            return None
+    except (OSError, RuntimeError, ValueError):
+        pass
+    # Order by snapshot directory mtime, matching hub.utils.gguf.iter_hf_cache_snapshots,
+    # which is what variant discovery reads. Blob mtimes would disagree with it whenever
+    # Hugging Face reuses an older blob in a newer snapshot, and the command would then
+    # name a snapshot that does not hold the quant the picker offered.
+    newest_snapshot, newest_mtime = None, -1.0
+    for revision in repo_info.revisions:
+        snapshot = getattr(revision, "snapshot_path", None)
+        if snapshot is None:
+            continue
+        if not any(_is_main_gguf_filename(f.file_name) for f in revision.files):
+            continue
+        try:
+            mtime = Path(snapshot).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        if mtime > newest_mtime:
+            newest_snapshot, newest_mtime = snapshot, mtime
+    return str(newest_snapshot) if newest_snapshot is not None else None
+
+
 @router.get("/cached-gguf")
 async def list_cached_gguf(current_subject: str = Depends(get_current_subject)):
     """List GGUF repos downloaded to HF cache, legacy Unsloth cache, and HF default cache."""
     try:
         cache_scans = _all_hf_cache_scans()
+        try:
+            active_root = _resolve_hf_cache_dir().resolve(strict = False)
+        except Exception:
+            active_root = None
 
         seen_lower: dict[str, dict] = {}
         for hf_cache in cache_scans:
@@ -3046,6 +3089,9 @@ async def list_cached_gguf(current_subject: str = Depends(get_current_subject)):
                             "cache_path": str(repo_info.repo_path),
                             "has_vision": _repo_has_mmproj(repo_info),
                         }
+                        load_id = _repo_gguf_load_id(repo_info, active_root)
+                        if load_id:
+                            row["load_id"] = load_id
                         # Keep the newest timestamp across duplicate caches;
                         # attach only when known so absent rows sort as oldest.
                         lm = max(last_modified, (existing or {}).get("last_modified", 0.0))

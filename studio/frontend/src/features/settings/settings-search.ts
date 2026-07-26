@@ -104,13 +104,14 @@ export const SETTINGS_SEARCH_INDEX: Record<SettingsTab, TranslationKey[]> = {
     "settings.apiKeys.accessTokens",
   ],
   agents: [
-    // Heading and intro carry the searched terms ("unsloth start", agent names); titles do not.
+    // Every key needs a rendered data-settings-label, or a hit has nothing to scroll to.
     "settings.agents.title",
     "settings.agents.description",
     "settings.agents.intro",
-    "settings.agents.quickstart.title",
-    "settings.agents.supportedAgents.title",
-    "settings.agents.models.title",
+    "settings.agents.agent",
+    "settings.agents.model",
+    "settings.agents.quantization",
+    "settings.agents.subagent.title",
     "settings.agents.options.title",
     "settings.agents.remote.title",
     "settings.agents.passthrough.title",
