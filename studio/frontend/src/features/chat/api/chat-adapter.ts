@@ -1532,6 +1532,14 @@ async function autoLoadSmallestModel(): Promise<{
       hadNonTrustFailure = true;
       return false;
     }
+    // A LoRA adapter is not a standalone model. A custom scan folder can hold
+    // one (the inventory lists any adapter_config.json dir), and loading it
+    // makes the backend resolve base_model_name_or_path and pull the base from
+    // the Hub -- the unsolicited download this path exists to avoid. Skip it
+    // like an unloadable candidate; explicit picks still load adapters.
+    if (validation.is_lora) {
+      return false;
+    }
     return true;
   }
 
@@ -2066,6 +2074,23 @@ async function autoLoadSmallestModel(): Promise<{
       }
     }
 
+    // Then the custom-folder / LM Studio / models_dir locals. A registered scan
+    // folder is a deliberate "these are my models" choice, while an HF cache
+    // entry is a byproduct of any past download, so the locals outrank the
+    // safetensors fallback -- the order this function documents.
+    if (await tryAutoLoadLocalModels(localModels)) {
+      return { loaded: true, blockedByTrustRemoteCode: false };
+    }
+
+    if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) {
+      toast.dismiss(toastId);
+      return {
+        loaded: false,
+        blockedByTrustRemoteCode:
+          blockedByTrustRemoteCode && !hadNonTrustFailure,
+      };
+    }
+
     // Fall back to safetensors models.
     if (modelRepos.length > 0) {
       const sorted = [...modelRepos].sort(
@@ -2098,19 +2123,6 @@ async function autoLoadSmallestModel(): Promise<{
           continue;
         }
       }
-    }
-
-    if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) {
-      toast.dismiss(toastId);
-      return {
-        loaded: false,
-        blockedByTrustRemoteCode:
-          blockedByTrustRemoteCode && !hadNonTrustFailure,
-      };
-    }
-
-    if (await tryAutoLoadLocalModels(localModels)) {
-      return { loaded: true, blockedByTrustRemoteCode: false };
     }
 
     toast.dismiss(toastId);

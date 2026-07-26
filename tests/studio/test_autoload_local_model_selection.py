@@ -170,9 +170,89 @@ def test_remembered_local_model_wins_over_the_cached_cascade():
     assert remembered < cascade < sweep
 
 
+def test_auto_load_follows_its_documented_tier_order():
+    """``autoLoadSmallestModel``'s own docstring promises: last-used, then
+    HF-cache GGUF, then custom-folder / LM Studio / models_dir locals, then
+    cached safetensors. A registered scan folder is a deliberate "these are my
+    models" choice while an HF cache entry is a byproduct of any past download,
+    so the local sweep must run ahead of the safetensors fallback, not after it.
+    """
+    src = ADAPTER.read_text()
+    assert "custom-folder / LM Studio / models-dir locals, then cached safetensors" in src
+    auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
+    remembered = auto_load.index("tryAutoLoadRememberedLocalModel(localModels")
+    cached_gguf = auto_load.index("// GGUF first: smallest-total-size repo")
+    local_sweep = auto_load.index("tryAutoLoadLocalModels(localModels)")
+    safetensors = auto_load.index("// Fall back to safetensors models.")
+    assert remembered < cached_gguf < local_sweep < safetensors
+
+
 def test_direct_gguf_autoload_keeps_the_big_endian_guard():
     """Standalone .gguf files bypass the variant list, so they need the same
     big-endian filename guard the cached-variant path applies."""
     src = ADAPTER.read_text()
     direct = src.split("if (isDirectGgufPath(model.path)) {", 1)[1][:600]
     assert "hasBigEndianGgufMarker(model.path)" in direct
+
+
+def _run_can_auto_load(validation: dict):
+    """Run the REAL canAutoLoad closure from chat-adapter.ts against a stubbed
+    /api/inference/validate response, and report its answer plus the two
+    outcome flags it owns."""
+    src = ADAPTER.read_text()
+    start = src.index("  async function canAutoLoad(")
+    end = src.index("  async function loadAutoLoadCandidate(", start)
+    return _run(
+        "let blockedByTrustRemoteCode = false;\n"
+        "let hadNonTrustFailure = false;\n"
+        "const hfToken = null;\n"
+        "const trustRemoteCode = false;\n"
+        f"const VALIDATION = {json.dumps(validation)};\n"
+        "async function validateModel(_payload) { return VALIDATION; }\n"
+        f"{src[start:end]}\n"
+        "const ok = await canAutoLoad({\n"
+        "  model_path: '/mnt/ssd/my-finetune-lora', max_seq_length: 4096, is_lora: false });\n"
+        "console.log(JSON.stringify({ ok, blockedByTrustRemoteCode, hadNonTrustFailure }));\n"
+    )
+
+
+def test_background_auto_load_refuses_lora_adapters():
+    """A custom scan folder can hold a LoRA adapter: the inventory lists any
+    ``adapter_config.json`` directory as a plain local row with no GGUF hint, so
+    the source filter admits it. Loading one makes the worker resolve
+    ``base_model_name_or_path`` and pull the base from the Hub, which is the
+    unsolicited download this path exists to remove. validate already reports
+    ``is_lora``, so the background gate must refuse before /load.
+
+    The refusal is a skip, not a failure: it must leave both outcome flags
+    alone so a later trust-blocked candidate still raises the consent dialog.
+    """
+    assert _run_can_auto_load({"is_lora": True}) == {
+        "ok": False,
+        "blockedByTrustRemoteCode": False,
+        "hadNonTrustFailure": False,
+    }
+
+
+def test_background_auto_load_keeps_the_existing_validate_gates():
+    """The LoRA skip must not disturb the consent/upgrade gates beside it."""
+    assert _run_can_auto_load({}) == {
+        "ok": True,
+        "blockedByTrustRemoteCode": False,
+        "hadNonTrustFailure": False,
+    }
+    assert _run_can_auto_load({"requires_trust_remote_code": True}) == {
+        "ok": False,
+        "blockedByTrustRemoteCode": True,
+        "hadNonTrustFailure": False,
+    }
+    assert _run_can_auto_load({"requires_security_review": True}) == {
+        "ok": False,
+        "blockedByTrustRemoteCode": True,
+        "hadNonTrustFailure": False,
+    }
+    assert _run_can_auto_load({"requires_transformers_upgrade": True}) == {
+        "ok": False,
+        "blockedByTrustRemoteCode": False,
+        "hadNonTrustFailure": True,
+    }
