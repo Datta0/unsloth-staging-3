@@ -32,7 +32,15 @@ def _source_path(relative_path: str) -> Path:
 
 HELPERS = _source_path("studio/frontend/src/features/chat/utils/auto-load-local-models.ts")
 ADAPTER = _source_path("studio/frontend/src/features/chat/api/chat-adapter.ts")
+RUNTIME = _source_path("studio/frontend/src/features/chat/hooks/use-chat-model-runtime.ts")
+STORE = _source_path("studio/frontend/src/features/chat/stores/chat-runtime-store.ts")
+EXTERNAL = _source_path("studio/frontend/src/features/chat/external-providers.ts")
 TEMP = WORKDIR / "temp" / "autoload_local_model_selection"
+
+
+def _slice(src: str, start_marker: str, end_marker: str) -> str:
+    start = src.index(start_marker)
+    return src[start:src.index(end_marker, start)]
 
 
 def _require_node():
@@ -420,3 +428,139 @@ def test_a_failed_remembered_local_model_is_not_retried_by_the_sweep(
     assert out["loaded"] is False
     assert out["hadNonTrustFailure"] is True
     assert out["skippedKeys"] == [expected_key]
+
+
+def _run_local_sweep(
+    models: list[dict],
+    *,
+    failing: list[str],
+    gguf_folder_fail: str | None = None,
+):
+    """Run the REAL ``tryAutoLoadLocalModels`` (driving the real
+    ``tryAutoLoadLocalGgufModel``) over *models*, failing every load whose id is
+    in *failing*. Reports what was attempted, the budget spent, and the skip
+    keys recorded."""
+    src = ADAPTER.read_text()
+    key = _slice(src, "function autoLoadCandidateKey(", "\n}\n") + "\n}\n"
+    gguf_fn = _slice(
+        src,
+        "  async function tryAutoLoadLocalGgufModel(",
+        "  async function tryAutoLoadRememberedLocalModel(",
+    )
+    sweep_fn = _slice(
+        src,
+        "  async function tryAutoLoadLocalModels(",
+        "  try {\n    const [ggufRepos",
+    )
+    return _run(
+        "type LastLocalModelKind = 'gguf' | 'model';\n"
+        "type LocalModelInfo = any;\n"
+        f"{key}\n"
+        "const MAX_AUTO_LOAD_ATTEMPTS = 3;\n"
+        "let loadAttempts = 0;\n"
+        "let hadNonTrustFailure = false;\n"
+        "const skippedAutoLoadCandidates = new Set<string>();\n"
+        "const attempted: string[] = [];\n"
+        "const isDirectGgufPath = helpers.isDirectGgufPath;\n"
+        "const localModelIsGguf = helpers.localModelIsGguf;\n"
+        "const isAutoLoadLocalModel = helpers.isAutoLoadLocalModel;\n"
+        "const sortLocalModelsForAutoLoad = helpers.sortLocalModelsForAutoLoad;\n"
+        "function hasBigEndianGgufMarker(_p: string) { return false; }\n"
+        "function isAutoLoadableGgufVariant(_v: any) { return true; }\n"
+        f"const FOLDER_FAIL = {json.dumps(gguf_folder_fail)};\n"
+        "async function listGgufVariants(_id: string) {\n"
+        "  return { variants: [{ quant: 'Q4_K_M', downloaded: true, size_bytes: 4000 }] };\n"
+        "}\n"
+        f"const FAILING = new Set({json.dumps(failing)});\n"
+        "async function loadAutoLoadCandidate(candidate: any): Promise<boolean> {\n"
+        "  if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) { return false; }\n"
+        "  attempted.push(\n"
+        "    `${candidate.kind}|${candidate.id}|${candidate.ggufVariant ?? ''}`,\n"
+        "  );\n"
+        "  loadAttempts += 1;\n"
+        "  if (FAILING.has(candidate.id) || candidate.id === FOLDER_FAIL) {\n"
+        "    throw new Error('llama_model_load: error loading model');\n"
+        "  }\n"
+        "  return true;\n"
+        "}\n"
+        f"{gguf_fn}\n"
+        f"{sweep_fn}\n"
+        f"const models = {json.dumps(models)}.map(M);\n"
+        "const loaded = await tryAutoLoadLocalModels(models);\n"
+        "console.log(JSON.stringify({\n"
+        "  loaded, attempted, loadAttempts, hadNonTrustFailure,\n"
+        "  skippedKeys: [...skippedAutoLoadCandidates],\n"
+        "}));\n"
+    )
+
+
+# ``collect_local_models`` keeps a custom-folder row beside the models-dir /
+# LM Studio row for the same path (the dedup key is (id, source) for custom),
+# so the sweep walks the identical entry twice.
+DUPLICATE_SAFETENSORS = [
+    {"path": "/scan/AModel", "source": "models_dir", "display_name": "AModel"},
+    {"path": "/scan/AModel", "source": "custom", "display_name": "AModel"},
+    {"path": "/scan/ZGood", "source": "custom", "display_name": "ZGood"},
+]
+
+DUPLICATE_DIRECT_GGUF = [
+    {"path": "/scan/broken-Q4_K_M.gguf", "source": "lmstudio", "display_name": "broken"},
+    {"path": "/scan/broken-Q4_K_M.gguf", "source": "custom", "display_name": "broken"},
+    {"path": "/scan/good-Q4_K_M.gguf", "source": "custom", "display_name": "good"},
+]
+
+
+def test_a_failed_local_checkpoint_is_not_retried_by_its_duplicate_row():
+    """The sweep's catch has to name the key the next visit checks. Without it
+    the overlapping custom-folder row reloads the identical broken model and
+    spends a second slot of the three-attempt budget."""
+    out = _run_local_sweep(DUPLICATE_SAFETENSORS, failing = ["/scan/AModel"])
+
+    assert out["attempted"] == ["model|/scan/AModel|", "model|/scan/ZGood|"]
+    assert out["skippedKeys"] == ["model:/scan/amodel:"]
+    assert out["loaded"] is True
+    assert out["loadAttempts"] == 2
+    assert out["hadNonTrustFailure"] is True
+
+
+def test_a_failed_standalone_gguf_is_not_retried_by_its_duplicate_row():
+    """The direct-``.gguf`` branch loads outside ``tryAutoLoadLocalGgufModel``'s
+    own try, so its throw lands in the sweep's catch and must be recorded under
+    the null-variant key that branch guards on."""
+    out = _run_local_sweep(
+        DUPLICATE_DIRECT_GGUF, failing = ["/scan/broken-Q4_K_M.gguf"]
+    )
+
+    assert out["attempted"] == [
+        "gguf|/scan/broken-Q4_K_M.gguf|",
+        "gguf|/scan/good-Q4_K_M.gguf|",
+    ]
+    assert out["skippedKeys"] == ["gguf:/scan/broken-q4_k_m.gguf:"]
+    assert out["loaded"] is True
+    assert out["loadAttempts"] == 2
+
+
+def test_a_failing_gguf_folder_still_records_only_the_quant_that_failed():
+    """The variant loop owns its own catches, so the sweep must not layer a
+    folder-wide key on top of the per-quant one and blacklist good siblings."""
+    out = _run_local_sweep(
+        [
+            {"path": "/scan/RepoA-GGUF", "source": "custom", "display_name": "RepoA-GGUF"},
+            {"path": "/scan/RepoB-GGUF", "source": "custom", "display_name": "RepoB-GGUF"},
+        ],
+        failing = [],
+        gguf_folder_fail = "/scan/RepoA-GGUF",
+    )
+
+    assert out["skippedKeys"] == ["gguf:/scan/repoa-gguf:q4_k_m"]
+    assert out["loaded"] is True
+
+
+def test_a_clean_sweep_blacklists_nothing():
+    """Nothing failed, so nothing may be recorded as skipped."""
+    out = _run_local_sweep(DUPLICATE_SAFETENSORS, failing = [])
+
+    assert out["attempted"] == ["model|/scan/AModel|"]
+    assert out["skippedKeys"] == []
+    assert out["loaded"] is True
+    assert out["hadNonTrustFailure"] is False

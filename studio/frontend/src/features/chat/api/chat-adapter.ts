@@ -1918,9 +1918,14 @@ async function autoLoadSmallestModel(): Promise<{
       if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) {
         break;
       }
+      // Hoisted so the catch can name the key this row would be looked up by;
+      // classifying inside the try keeps a malformed inventory row from
+      // unwinding the whole sweep.
+      let isGguf = false;
       // One unloadable entry must not abort the rest of the sweep.
       try {
-        if (localModelIsGguf(model)) {
+        isGguf = localModelIsGguf(model);
+        if (isGguf) {
           if (await tryAutoLoadLocalGgufModel(model)) {
             return true;
           }
@@ -1943,7 +1948,14 @@ async function autoLoadSmallestModel(): Promise<{
           return true;
         }
       } catch {
+        // collect_local_models keeps a custom-folder row beside the models-dir /
+        // LM Studio row for the same path, so record the key the next visit
+        // checks (`gguf:<id>:` for a standalone file, `model:<id>:` otherwise) or
+        // the identical broken entry burns another slot of the attempt budget.
         hadNonTrustFailure = true;
+        skippedAutoLoadCandidates.add(
+          autoLoadCandidateKey(isGguf ? "gguf" : "model", model.id, null),
+        );
       }
     }
     return false;
