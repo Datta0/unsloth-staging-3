@@ -1837,6 +1837,8 @@ def test_confirm_tool_calls_allow_executes_gguf_tool(monkeypatch):
             tools = [{"type": "function", "function": {"name": "python"}}],
             max_tool_iterations = 1,
             confirm_tool_calls = True,
+            # Unset defaults to "auto", which would not prompt this safe print(1).
+            permission_mode = "ask",
             session_id = "sess",
         )
     )
@@ -1869,6 +1871,8 @@ def test_confirm_tool_calls_close_after_prompt_cleans_gguf_slot(monkeypatch):
         tools = [{"type": "function", "function": {"name": "python"}}],
         max_tool_iterations = 1,
         confirm_tool_calls = True,
+        # Unset defaults to "auto", which would not prompt this safe print(1).
+        permission_mode = "ask",
         session_id = "sess",
     )
     try:
@@ -1902,6 +1906,9 @@ def test_confirm_tool_calls_skips_gguf_rag_autoinject(monkeypatch):
             tools = [{"type": "function", "function": {"name": "search_knowledge_base"}}],
             max_tool_iterations = 1,
             confirm_tool_calls = True,
+            # "ask" gates every call so autoinject waits; unset defaults to
+            # "auto", where this safe retrieval never gates.
+            permission_mode = "ask",
             session_id = "sess",
             rag_scope = {"thread_id": "t1"},
         )
@@ -1946,6 +1953,8 @@ def test_confirm_tool_calls_deny_skips_gguf_tool_and_retry_can_execute(monkeypat
             tools = [{"type": "function", "function": {"name": "python"}}],
             max_tool_iterations = 2,
             confirm_tool_calls = True,
+            # Unset defaults to "auto", which would not prompt this safe print(1).
+            permission_mode = "ask",
             session_id = "sess",
         )
     )
@@ -2368,7 +2377,7 @@ def test_ordinary_json_with_name_key_is_shown_not_treated_as_tool_call(monkeypat
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda n, a, **_k: (calls.append((n, a)) or "x"),
+        lambda n, a, **_k: calls.append((n, a)) or "x",
     )
 
     events = list(
@@ -2425,7 +2434,7 @@ def test_gguf_truncated_ordinary_json_with_name_key_is_shown_not_suppressed(monk
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda n, a, **_k: (calls.append((n, a)) or "x"),
+        lambda n, a, **_k: calls.append((n, a)) or "x",
     )
 
     events = list(
@@ -2452,7 +2461,7 @@ def test_gguf_truncated_disabled_name_json_is_preserved_when_tools_active(monkey
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda n, a, **_k: (calls.append((n, a)) or "x"),
+        lambda n, a, **_k: calls.append((n, a)) or "x",
     )
 
     events = list(
@@ -2509,7 +2518,7 @@ def test_gguf_oversized_disabled_name_json_is_preserved(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda n, a, **_k: (calls.append((n, a)) or "x"),
+        lambda n, a, **_k: calls.append((n, a)) or "x",
     )
 
     events = list(
@@ -2692,7 +2701,7 @@ def test_gguf_initial_buffer_flush_holds_split_rehearsal_name(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "result"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "result",
     )
 
     events = list(
@@ -2729,7 +2738,7 @@ def test_gguf_rehearsal_name_after_prose_in_streaming_is_not_leaked(monkeypatch)
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "result"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "result",
     )
 
     events = list(
@@ -2762,7 +2771,7 @@ def test_gguf_plain_answer_ending_with_tool_name_word_is_preserved(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "result"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "result",
     )
 
     events = list(
@@ -2797,7 +2806,7 @@ def test_gguf_long_tool_name_split_rehearsal_is_not_capped_and_executes(monkeypa
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda n, a, **_k: (calls.append((n, a)) or "result"),
+        lambda n, a, **_k: calls.append((n, a)) or "result",
     )
 
     events = list(
@@ -2831,7 +2840,7 @@ def test_gguf_streaming_keeps_bare_args_before_think_block(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "result"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "result",
     )
 
     events = list(
@@ -2863,7 +2872,7 @@ def test_gguf_inactive_name_args_in_prose_is_not_drained(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "result"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "result",
     )
 
     events = list(
@@ -2897,7 +2906,7 @@ def test_gguf_inactive_rehearsal_before_active_call_executes_and_keeps_prose(mon
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "result"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "result",
     )
 
     events = list(
@@ -2957,7 +2966,7 @@ def test_gguf_oversized_bare_json_not_leaked_and_executes(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "OK"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "OK",
     )
 
     events = list(
@@ -3021,7 +3030,7 @@ def test_gguf_textual_fallback_caps_distinct_tool_calls_per_turn(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "OK"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "OK",
     )
 
     list(
@@ -3048,7 +3057,7 @@ def test_gguf_textual_fallback_collapses_duplicate_tool_calls(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "OK"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "OK",
     )
 
     list(
@@ -3073,7 +3082,7 @@ def test_gguf_drain_truncated_enabled_name_json_preserved_when_auto_heal_disable
         calls: list[tuple[str, dict]] = []
         monkeypatch.setattr(
             "core.inference.tools.execute_tool",
-            lambda name, arguments, **_k: (calls.append((name, arguments)) or "result"),
+            lambda name, arguments, **_k: calls.append((name, arguments)) or "result",
         )
         events = list(
             backend.generate_chat_completion_with_tools(
@@ -3108,7 +3117,7 @@ def test_gguf_valid_tool_calls_respect_max_tool_iterations(monkeypatch):
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(
         "core.inference.tools.execute_tool",
-        lambda name, arguments, **_k: (calls.append((name, arguments)) or "result"),
+        lambda name, arguments, **_k: calls.append((name, arguments)) or "result",
     )
 
     list(
