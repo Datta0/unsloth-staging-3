@@ -32,9 +32,7 @@ def _source_path(relative_path: str) -> Path:
     return WORKDIR / "unsloth_repo" / relative_path
 
 
-HELPERS = _source_path(
-    "studio/frontend/src/features/chat/utils/auto-load-local-models.ts"
-)
+HELPERS = _source_path("studio/frontend/src/features/chat/utils/auto-load-local-models.ts")
 ADAPTER = _source_path("studio/frontend/src/features/chat/api/chat-adapter.ts")
 TEMP = WORKDIR / "temp" / "autoload_local_model_selection"
 
@@ -157,12 +155,7 @@ def test_gguf_classification_uses_the_entry_name_not_the_whole_path():
         "    path: '/mnt/ssd/suffixless', display_name: 'suffixless', model_format: 'gguf' })),\n"
         "}));\n"
     )
-    assert out == {
-        "parentOnly": False,
-        "ownName": True,
-        "repoId": True,
-        "formatHint": True,
-    }
+    assert out == {"parentOnly": False, "ownName": True, "repoId": True, "formatHint": True}
 
 
 def test_remembered_local_model_wins_over_the_cached_cascade():
