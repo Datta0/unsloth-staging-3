@@ -392,8 +392,15 @@ def _scan_hf_cache(cache_dir: Path, *, active_cache: bool = True) -> List[LocalM
         partial = partial or hf_cache_scan.is_gguf_repo_partial(model_id, repo_dir)
 
         load_id = model_id
+        model_format = None
         if not active_cache:
             load_id = _resolve_hf_cache_realpath(repo_dir) or str(repo_dir.resolve())
+            # An inactive-cache row is addressed by snapshot path, and a scan
+            # folder that is itself an HF cache surfaces these rows as "custom".
+            # A GGUF repo whose name lacks a -GGUF suffix then carries no format
+            # signal at all, so the UI would route it through the plain-checkpoint
+            # path. Hint it like the other scanners do.
+            model_format = _dir_model_format(Path(load_id))
         found.append(
             LocalModelInfo(
                 id = load_id,
@@ -403,6 +410,7 @@ def _scan_hf_cache(cache_dir: Path, *, active_cache: bool = True) -> List[LocalM
                 source = "hf_cache",
                 active_cache = active_cache,
                 partial = partial,
+                model_format = model_format,
                 updated_at = updated_at,
             ),
         )

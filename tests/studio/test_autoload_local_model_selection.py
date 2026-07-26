@@ -566,6 +566,34 @@ def test_a_clean_sweep_blacklists_nothing():
     assert out["hadNonTrustFailure"] is False
 
 
+# A scan folder that is itself an HF cache surfaces snapshot rows as "custom".
+# Their id/path is the snapshot dir and their display_name is the bare repo
+# name, so ``model_format`` is the only GGUF signal a suffixless repo has.
+HF_CACHE_SNAPSHOT = {
+    "path": "/scan/models--acme--tiny-model/snapshots/rev",
+    "display_name": "tiny-model",
+    "source": "custom",
+}
+
+
+def test_a_cached_snapshot_needs_the_backend_format_hint_to_load_as_gguf():
+    """Without the hint the sweep sends a GGUF snapshot down the checkpoint
+    path, where the backend picks the largest ``.gguf`` in the folder rather
+    than the smallest downloaded variant, and the run is recorded as
+    safetensors with a 4096-token limit."""
+    unhinted = _run_local_sweep([HF_CACHE_SNAPSHOT], failing = [])
+    hinted = _run_local_sweep(
+        [{**HF_CACHE_SNAPSHOT, "model_format": "gguf"}], failing = []
+    )
+
+    assert unhinted["attempted"] == [
+        "model|/scan/models--acme--tiny-model/snapshots/rev|"
+    ]
+    assert hinted["attempted"] == [
+        "gguf|/scan/models--acme--tiny-model/snapshots/rev|Q4_K_M"
+    ]
+
+
 def _run_manual_load_record_guard(cases: list[dict]):
     """Evaluate the REAL manual-load recorder guard from use-chat-model-runtime
     against the real ``isLocalModelPath`` / ``isExternalModelId`` predicates."""
