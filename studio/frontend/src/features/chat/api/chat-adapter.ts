@@ -1758,6 +1758,11 @@ async function autoLoadSmallestModel(): Promise<{
   ): Promise<boolean> {
     const label = model.model_id ?? model.display_name;
     if (isDirectGgufPath(model.path)) {
+      // Same big-endian guard the cached-variant path applies; a BE build can't
+      // run on a little-endian host.
+      if (hasBigEndianGgufMarker(model.path)) {
+        return false;
+      }
       if (
         skippedAutoLoadCandidates.has(
           autoLoadCandidateKey("gguf", model.id, null),
@@ -1829,9 +1834,56 @@ async function autoLoadSmallestModel(): Promise<{
     return false;
   }
 
+  // The remembered model can live in a custom folder / LM Studio dir, which the
+  // cached-repo lookups never see, so this runs before the smallest-first
+  // cascade -- otherwise any cached repo outranks the user's last pick.
+  async function tryAutoLoadRememberedLocalModel(
+    models: LocalModelInfo[],
+    preferred: {
+      id: string;
+      kind: LastLocalModelKind;
+      ggufVariant?: string | null;
+    },
+  ): Promise<boolean> {
+    const remembered = findLocalModel(
+      models.filter(isAutoLoadLocalModel),
+      preferred.id,
+    );
+    if (!remembered) {
+      return false;
+    }
+    const isGguf = localModelIsGguf(remembered);
+    if (preferred.kind === "gguf" ? !isGguf : isGguf) {
+      return false;
+    }
+    toast("Loading last used model…", {
+      id: toastId,
+      description: remembered.model_id ?? remembered.display_name,
+      duration: 5000,
+    });
+    try {
+      if (preferred.kind === "gguf") {
+        return await tryAutoLoadLocalGgufModel(
+          remembered,
+          preferred.ggufVariant,
+        );
+      }
+      return await loadAutoLoadCandidate({
+        id: remembered.id,
+        kind: "model",
+        ggufVariant: null,
+        maxSeqLength: store.params.maxSeqLength,
+        successLabel: `Loaded ${remembered.display_name}`,
+      });
+    } catch {
+      // Fall through to the cascade, like the cached remembered-repo branch.
+      hadNonTrustFailure = true;
+      return false;
+    }
+  }
+
   async function tryAutoLoadLocalModels(
     models: LocalModelInfo[],
-    preferred?: { id: string; kind: LastLocalModelKind; ggufVariant?: string | null },
   ): Promise<boolean> {
     const localModels = sortLocalModelsForAutoLoad(
       models.filter(isAutoLoadLocalModel),
@@ -1840,72 +1892,37 @@ async function autoLoadSmallestModel(): Promise<{
       return false;
     }
 
-    if (preferred) {
-      const remembered = findLocalModel(localModels, preferred.id);
-      if (remembered) {
-        if (preferred.kind === "gguf" && localModelIsGguf(remembered)) {
-          toast("Loading last used model…", {
-            id: toastId,
-            description: remembered.model_id ?? remembered.display_name,
-            duration: 5000,
-          });
-          if (
-            await tryAutoLoadLocalGgufModel(
-              remembered,
-              preferred.ggufVariant,
-            )
-          ) {
-            return true;
-          }
-        } else if (
-          preferred.kind === "model" &&
-          !localModelIsGguf(remembered)
-        ) {
-          toast("Loading last used model…", {
-            id: toastId,
-            description: remembered.model_id ?? remembered.display_name,
-            duration: 5000,
-          });
-          if (
-            await loadAutoLoadCandidate({
-              id: remembered.id,
-              kind: "model",
-              ggufVariant: null,
-              maxSeqLength: store.params.maxSeqLength,
-              successLabel: `Loaded ${remembered.display_name}`,
-            })
-          ) {
-            return true;
-          }
-        }
-      }
-    }
-
     for (const model of localModels) {
       if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) {
         break;
       }
-      if (localModelIsGguf(model)) {
-        if (await tryAutoLoadLocalGgufModel(model)) {
+      // Per-candidate guard like the cached loops: one unloadable entry must
+      // not abort the sweep before the rest of the folder is tried.
+      try {
+        if (localModelIsGguf(model)) {
+          if (await tryAutoLoadLocalGgufModel(model)) {
+            return true;
+          }
+          continue;
+        }
+        if (
+          skippedAutoLoadCandidates.has(autoLoadCandidateKey("model", model.id))
+        ) {
+          continue;
+        }
+        if (
+          await loadAutoLoadCandidate({
+            id: model.id,
+            kind: "model",
+            ggufVariant: null,
+            maxSeqLength: 4096,
+            successLabel: `Loaded ${model.display_name}`,
+          })
+        ) {
           return true;
         }
-        continue;
-      }
-      if (
-        skippedAutoLoadCandidates.has(autoLoadCandidateKey("model", model.id))
-      ) {
-        continue;
-      }
-      if (
-        await loadAutoLoadCandidate({
-          id: model.id,
-          kind: "model",
-          ggufVariant: null,
-          maxSeqLength: 4096,
-          successLabel: `Loaded ${model.display_name}`,
-        })
-      ) {
-        return true;
+      } catch {
+        hadNonTrustFailure = true;
       }
     }
     return false;
@@ -1989,6 +2006,15 @@ async function autoLoadSmallestModel(): Promise<{
             );
           }
         }
+      }
+      if (
+        await tryAutoLoadRememberedLocalModel(localModels, {
+          id: lastLoaded.id,
+          kind: lastLoaded.kind,
+          ggufVariant: lastLoaded.ggufVariant,
+        })
+      ) {
+        return { loaded: true, blockedByTrustRemoteCode: false };
       }
       toast("Loading a model…", {
         id: toastId,
@@ -2082,18 +2108,7 @@ async function autoLoadSmallestModel(): Promise<{
       };
     }
 
-    if (
-      await tryAutoLoadLocalModels(
-        localModels,
-        lastLoaded
-          ? {
-              id: lastLoaded.id,
-              kind: lastLoaded.kind,
-              ggufVariant: lastLoaded.ggufVariant,
-            }
-          : undefined,
-      )
-    ) {
+    if (await tryAutoLoadLocalModels(localModels)) {
       return { loaded: true, blockedByTrustRemoteCode: false };
     }
 
