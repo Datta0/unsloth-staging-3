@@ -7,11 +7,11 @@
 $ErrorActionPreference = 'Continue'
 
 function Invoke-Bounded {
-    param([string[]]$Args, [int]$TimeoutSec = 600)
+    param([string[]]$WslArgs, [int]$TimeoutSec = 600)
     $out = New-TemporaryFile
     $err = New-TemporaryFile
     try {
-        $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $Args -NoNewWindow -PassThru `
+        $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $WslArgs -NoNewWindow -PassThru `
             -RedirectStandardOutput $out.FullName -RedirectStandardError $err.FullName
         if (-not $p.WaitForExit($TimeoutSec * 1000)) {
             try { $p.Kill() } catch {}
@@ -32,9 +32,9 @@ function Invoke-Bounded {
 }
 
 function Show {
-    param([string]$Label, [string[]]$Args, [int]$TimeoutSec = 600)
-    Write-Host "--- wsl $($Args -join ' ') ---"
-    $r = Invoke-Bounded -Args $Args -TimeoutSec $TimeoutSec
+    param([string]$Label, [string[]]$WslArgs, [int]$TimeoutSec = 600)
+    Write-Host "--- wsl $($WslArgs -join ' ') ---"
+    $r = Invoke-Bounded -WslArgs $WslArgs -TimeoutSec $TimeoutSec
     Write-Host $r.Text
     Write-Host "exit=$($r.Code)"
     return $r
@@ -55,16 +55,16 @@ if (-not $wsl) {
     $vmp = Get-WindowsOptionalFeature -Online -FeatureName 'VirtualMachinePlatform' -ErrorAction SilentlyContinue
     if ($vmp) { Write-Host "VirtualMachinePlatform feature state: $($vmp.State)" }
 
-    Show -Label 'version' -Args @('--version') -TimeoutSec 120 | Out-Null
-    Show -Label 'status'  -Args @('--status')  -TimeoutSec 120 | Out-Null
-    Show -Label 'list'    -Args @('-l', '-v')  -TimeoutSec 120 | Out-Null
+    Show -Label 'version' -WslArgs @('--version') -TimeoutSec 120 | Out-Null
+    Show -Label 'status'  -WslArgs @('--status')  -TimeoutSec 120 | Out-Null
+    Show -Label 'list'    -WslArgs @('-l', '-v')  -TimeoutSec 120 | Out-Null
 
     # Bring up the optional component with no distro first: on windows-2025 the
     # feature is often absent even though wsl.exe exists.
-    Show -Label 'install-nodistro' -Args @('--install', '--no-distribution') -TimeoutSec 900 | Out-Null
-    Show -Label 'install-ubuntu'   -Args @('--install', '-d', 'Ubuntu-24.04', '--no-launch') -TimeoutSec 1200 | Out-Null
+    Show -Label 'install-nodistro' -WslArgs @('--install', '--no-distribution') -TimeoutSec 900 | Out-Null
+    Show -Label 'install-ubuntu'   -WslArgs @('--install', '-d', 'Ubuntu-24.04', '--no-launch') -TimeoutSec 1200 | Out-Null
 
-    $smoke = Show -Label 'smoke' -Args @('-d', 'Ubuntu-24.04', '--', 'uname', '-a') -TimeoutSec 300
+    $smoke = Show -Label 'smoke' -WslArgs @('-d', 'Ubuntu-24.04', '--', 'uname', '-a') -TimeoutSec 300
     if ($smoke.Code -eq 0 -and $smoke.Text -match 'Linux') {
         $usable = 'true'
         $verdict = "usable -- a real Ubuntu-24.04 distro answered uname"
