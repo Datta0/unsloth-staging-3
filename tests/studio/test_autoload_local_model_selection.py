@@ -40,7 +40,7 @@ TEMP = WORKDIR / "temp" / "autoload_local_model_selection"
 
 def _slice(src: str, start_marker: str, end_marker: str) -> str:
     start = src.index(start_marker)
-    return src[start:src.index(end_marker, start)]
+    return src[start : src.index(end_marker, start)]
 
 
 def _require_node():
@@ -527,14 +527,9 @@ def test_a_failed_standalone_gguf_is_not_retried_by_its_duplicate_row():
     """The direct-``.gguf`` branch loads outside ``tryAutoLoadLocalGgufModel``'s
     own try, so its throw lands in the sweep's catch and must be recorded under
     the null-variant key that branch guards on."""
-    out = _run_local_sweep(
-        DUPLICATE_DIRECT_GGUF, failing = ["/scan/broken-Q4_K_M.gguf"]
-    )
+    out = _run_local_sweep(DUPLICATE_DIRECT_GGUF, failing = ["/scan/broken-Q4_K_M.gguf"])
 
-    assert out["attempted"] == [
-        "gguf|/scan/broken-Q4_K_M.gguf|",
-        "gguf|/scan/good-Q4_K_M.gguf|",
-    ]
+    assert out["attempted"] == ["gguf|/scan/broken-Q4_K_M.gguf|", "gguf|/scan/good-Q4_K_M.gguf|"]
     assert out["skippedKeys"] == ["gguf:/scan/broken-q4_k_m.gguf:"]
     assert out["loaded"] is True
     assert out["loadAttempts"] == 2
@@ -582,16 +577,10 @@ def test_a_cached_snapshot_needs_the_backend_format_hint_to_load_as_gguf():
     than the smallest downloaded variant, and the run is recorded as
     safetensors with a 4096-token limit."""
     unhinted = _run_local_sweep([HF_CACHE_SNAPSHOT], failing = [])
-    hinted = _run_local_sweep(
-        [{**HF_CACHE_SNAPSHOT, "model_format": "gguf"}], failing = []
-    )
+    hinted = _run_local_sweep([{**HF_CACHE_SNAPSHOT, "model_format": "gguf"}], failing = [])
 
-    assert unhinted["attempted"] == [
-        "model|/scan/models--acme--tiny-model/snapshots/rev|"
-    ]
-    assert hinted["attempted"] == [
-        "gguf|/scan/models--acme--tiny-model/snapshots/rev|Q4_K_M"
-    ]
+    assert unhinted["attempted"] == ["model|/scan/models--acme--tiny-model/snapshots/rev|"]
+    assert hinted["attempted"] == ["gguf|/scan/models--acme--tiny-model/snapshots/rev|Q4_K_M"]
 
 
 def _run_manual_load_record_guard(cases: list[dict]):
@@ -600,7 +589,7 @@ def _run_manual_load_record_guard(cases: list[dict]):
     src = RUNTIME.read_text()
     start = src.index("            if (\n              !isLora &&")
     open_paren = src.index("(", start)
-    condition = src[open_paren + 1:src.index("\n            ) {", open_paren)]
+    condition = src[open_paren + 1 : src.index("\n            ) {", open_paren)]
     store_src = STORE.read_text()
     ext_src = EXTERNAL.read_text()
     return _run(
