@@ -1532,11 +1532,9 @@ async function autoLoadSmallestModel(): Promise<{
       hadNonTrustFailure = true;
       return false;
     }
-    // A LoRA adapter is not a standalone model. A custom scan folder can hold
-    // one (the inventory lists any adapter_config.json dir), and loading it
-    // makes the backend resolve base_model_name_or_path and pull the base from
-    // the Hub -- the unsolicited download this path exists to avoid. Skip it
-    // like an unloadable candidate; explicit picks still load adapters.
+    // Loading a LoRA makes the backend resolve base_model_name_or_path and pull
+    // the base from the Hub -- the unsolicited download this path exists to
+    // avoid. Skipped like an unloadable candidate; explicit picks still work.
     if (validation.is_lora) {
       return false;
     }
@@ -1767,8 +1765,7 @@ async function autoLoadSmallestModel(): Promise<{
   ): Promise<boolean> {
     const label = model.model_id ?? model.display_name;
     if (isDirectGgufPath(model.path)) {
-      // Same big-endian guard the cached-variant path applies; a BE build can't
-      // run on a little-endian host.
+      // A big-endian build can't run on a little-endian host.
       if (hasBigEndianGgufMarker(model.path)) {
         return false;
       }
@@ -1822,10 +1819,8 @@ async function autoLoadSmallestModel(): Promise<{
         ) {
           continue;
         }
-        // Per-variant guard, like the per-candidate one in the sweep: a corrupt
-        // or unsupported quant must not abort the rest of the folder, and the
-        // skip key has to name the quant that actually failed so a later visit
-        // does not spend another attempt on it.
+        // A bad quant must not abort the rest of the folder, and the skip key
+        // names the quant that failed so a later visit skips only that one.
         try {
           if (
             await loadAutoLoadCandidate({
@@ -1854,9 +1849,8 @@ async function autoLoadSmallestModel(): Promise<{
     return false;
   }
 
-  // The remembered model can live in a custom folder / LM Studio dir, which the
-  // cached-repo lookups never see, so this runs before the smallest-first
-  // cascade -- otherwise any cached repo outranks the user's last pick.
+  // The remembered model can live in a custom folder the cached-repo lookups
+  // never see, so this runs before the smallest-first cascade.
   async function tryAutoLoadRememberedLocalModel(
     models: LocalModelInfo[],
     preferred: {
@@ -1896,7 +1890,7 @@ async function autoLoadSmallestModel(): Promise<{
         successLabel: `Loaded ${remembered.display_name}`,
       });
     } catch {
-      // Fall through to the cascade, like the cached remembered-repo branch.
+      // Fall through to the cascade.
       hadNonTrustFailure = true;
       return false;
     }
@@ -1916,8 +1910,7 @@ async function autoLoadSmallestModel(): Promise<{
       if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) {
         break;
       }
-      // Per-candidate guard like the cached loops: one unloadable entry must
-      // not abort the sweep before the rest of the folder is tried.
+      // One unloadable entry must not abort the rest of the sweep.
       try {
         if (localModelIsGguf(model)) {
           if (await tryAutoLoadLocalGgufModel(model)) {
@@ -2085,10 +2078,8 @@ async function autoLoadSmallestModel(): Promise<{
       }
     }
 
-    // Then the custom-folder / LM Studio / models_dir locals. A registered scan
-    // folder is a deliberate "these are my models" choice, while an HF cache
-    // entry is a byproduct of any past download, so the locals outrank the
-    // safetensors fallback -- the order this function documents.
+    // A registered scan folder is a deliberate "these are my models" choice
+    // while an HF cache entry is a byproduct, so locals outrank safetensors.
     if (await tryAutoLoadLocalModels(localModels)) {
       return { loaded: true, blockedByTrustRemoteCode: false };
     }

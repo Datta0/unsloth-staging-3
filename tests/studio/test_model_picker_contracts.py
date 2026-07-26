@@ -581,8 +581,8 @@ def test_legacy_migration_is_idempotent_and_non_destructive():
 
 
 def test_autoload_fetches_custom_folder_inventory():
-    """Auto-load must consult /api/models/local so custom-folder, LM Studio,
-    and models-dir GGUFs are visible before falling back to HF-cache scans."""
+    """Auto-load must consult /api/models/local so custom-folder, LM Studio and
+    models-dir GGUFs are visible."""
     src = _read("features/chat/api/chat-adapter.ts")
     auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
     assert "listLocalModels()" in auto_load
@@ -591,7 +591,7 @@ def test_autoload_fetches_custom_folder_inventory():
 
 def test_autoload_never_downloads_default_qwen():
     """Background auto-load must not fetch Hub weights without an explicit user
-    action (fixes #7374's unsolicited Qwen download)."""
+    action (#7374's unsolicited Qwen download)."""
     src = _read("features/chat/api/chat-adapter.ts")
     auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
     assert "Downloading a small model" not in auto_load
@@ -600,8 +600,8 @@ def test_autoload_never_downloads_default_qwen():
 
 
 def test_autoload_local_model_helpers_cover_custom_sources():
-    """The extracted helpers must recognize custom-folder locals and match by
-    id, path, or model_id so remembered loads survive path renames."""
+    """Helpers must recognize custom-folder locals and match by id, path or
+    model_id so remembered loads survive path renames."""
     src = _read("features/chat/utils/auto-load-local-models.ts")
     assert 'model.source === "custom"' in src
     assert 'model.source === "models_dir"' in src
@@ -611,8 +611,8 @@ def test_autoload_local_model_helpers_cover_custom_sources():
 
 
 def test_autoload_remembers_direct_gguf_files():
-    """Standalone .gguf auto-loads must persist for the next session even when
-    there is no quant variant (Codex P2 on #7375)."""
+    """Standalone .gguf auto-loads must persist across sessions even with no
+    quant variant."""
     src = _read("features/chat/utils/last-local-model-load.ts")
     assert 'from "./auto-load-local-models"' in src
     assert "isDirectGgufPath(parsed.id)" in src

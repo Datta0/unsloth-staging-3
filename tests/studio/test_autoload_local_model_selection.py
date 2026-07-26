@@ -3,13 +3,11 @@
 
 """Behavioral guards for auto-load's local-model selection (#7374 / PR #7375).
 
-Auto-load now picks a model out of ``GET /api/models/local`` with no user
-confirmation, and that inventory also lists things that are not loadable as a
-main model: mmproj vision projectors, MTP drafters, tail shards of a split
-GGUF, and half-downloaded copies. llama.cpp rejects every one of them
-("missing tensor 'token_embd.weight'", "model must be loaded with the first
-split"), so a bad pick burns a load attempt and is then remembered as the last
-used model. These run the real helper through node, not a source grep.
+Auto-load picks from ``GET /api/models/local`` with no user confirmation, and
+that inventory also lists things llama.cpp cannot load as a main model: mmproj
+projectors, MTP drafters, tail shards of a split GGUF, and partial downloads.
+A bad pick burns a load attempt and is then remembered as the last used model.
+These run the real helper through node, not a source grep.
 """
 
 from __future__ import annotations
@@ -160,8 +158,7 @@ def test_gguf_classification_uses_the_entry_name_not_the_whole_path():
 
 def test_remembered_local_model_wins_over_the_cached_cascade():
     """The remembered model can be a custom-folder path the cached-repo lookups
-    never see, so it must be retried against the local inventory before the
-    smallest-cached-first sweep, not after it."""
+    never see, so it must be retried before the smallest-cached-first sweep."""
     src = ADAPTER.read_text()
     auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
     remembered = auto_load.index("tryAutoLoadRememberedLocalModel(localModels")
@@ -171,12 +168,10 @@ def test_remembered_local_model_wins_over_the_cached_cascade():
 
 
 def test_auto_load_follows_its_documented_tier_order():
-    """``autoLoadSmallestModel``'s own docstring promises: last-used, then
-    HF-cache GGUF, then custom-folder / LM Studio / models_dir locals, then
-    cached safetensors. A registered scan folder is a deliberate "these are my
-    models" choice while an HF cache entry is a byproduct of any past download,
-    so the local sweep must run ahead of the safetensors fallback, not after it.
-    """
+    """``autoLoadSmallestModel``'s docstring promises: last-used, HF-cache GGUF,
+    custom-folder / LM Studio / models_dir locals, then cached safetensors. A
+    registered scan folder is a deliberate choice while an HF cache entry is a
+    byproduct, so the local sweep runs ahead of the safetensors fallback."""
     src = ADAPTER.read_text()
     assert "custom-folder / LM Studio / models-dir locals, then cached safetensors" in src
     auto_load = src.split("async function autoLoadSmallestModel", 1)[1]
@@ -197,8 +192,7 @@ def test_direct_gguf_autoload_keeps_the_big_endian_guard():
 
 def _run_can_auto_load(validation: dict):
     """Run the REAL canAutoLoad closure from chat-adapter.ts against a stubbed
-    /api/inference/validate response, and report its answer plus the two
-    outcome flags it owns."""
+    /api/inference/validate response, plus the two outcome flags it owns."""
     src = ADAPTER.read_text()
     start = src.index("  async function canAutoLoad(")
     end = src.index("  async function loadAutoLoadCandidate(", start)
@@ -217,16 +211,11 @@ def _run_can_auto_load(validation: dict):
 
 
 def test_background_auto_load_refuses_lora_adapters():
-    """A custom scan folder can hold a LoRA adapter: the inventory lists any
-    ``adapter_config.json`` directory as a plain local row with no GGUF hint, so
-    the source filter admits it. Loading one makes the worker resolve
-    ``base_model_name_or_path`` and pull the base from the Hub, which is the
-    unsolicited download this path exists to remove. validate already reports
-    ``is_lora``, so the background gate must refuse before /load.
-
-    The refusal is a skip, not a failure: it must leave both outcome flags
-    alone so a later trust-blocked candidate still raises the consent dialog.
-    """
+    """A custom scan folder can hold a LoRA adapter, and loading one makes the
+    worker resolve ``base_model_name_or_path`` and pull the base from the Hub:
+    the unsolicited download this path exists to remove. The refusal is a skip,
+    not a failure, so both outcome flags must stay untouched (a later
+    trust-blocked candidate still raises the consent dialog)."""
     assert _run_can_auto_load({"is_lora": True}) == {
         "ok": False,
         "blockedByTrustRemoteCode": False,
@@ -260,14 +249,11 @@ def test_background_auto_load_keeps_the_existing_validate_gates():
 
 def test_companion_filtering_is_scoped_to_gguf_entries():
     """``isGgufCompanionPath`` reads GGUF filenames, so it may only judge GGUF
-    rows. The backend predicates it mirrors (``hub/utils/gguf.py``
-    ``is_mtp_drafter_path`` and ``core/inference/llama_cpp.py``
-    ``_is_companion_gguf_path``) both return False before anything else when the
-    path does not end in ``.gguf``, so a safetensors checkpoint that merely sits
-    in a folder named ``mtp-...``/``MTP``/``...mmproj...`` is a real model and
-    must stay auto-loadable. Every actual companion still carries a GGUF signal
-    (a ``.gguf`` path or ``model_format: "gguf"``), so none of them slip back in.
-    """
+    rows: the backend predicates it mirrors (``hub/utils/gguf.py``
+    ``is_mtp_drafter_path``, ``core/inference/llama_cpp.py``
+    ``_is_companion_gguf_path``) return False for any non-``.gguf`` path, so a
+    safetensors checkpoint in an ``mtp-...``/``MTP``/``mmproj`` folder is a real
+    model. Every actual companion still carries a GGUF signal."""
     out = _run(
         "const nonGguf = [\n"
         "  { path: '/models/mtp-qwen3-next-80b-a3b', model_format: 'safetensors' },\n"
@@ -297,10 +283,9 @@ def test_companion_filtering_is_scoped_to_gguf_entries():
 
 
 def _run_local_gguf_variants(*, failing_quant: str, preferred: str | None = None):
-    """Run the REAL ``tryAutoLoadLocalGgufModel`` over one custom folder holding
-    two downloaded quants, where loading *failing_quant* rejects. Reports which
-    quants were attempted, whether a model ended up loaded, the skip keys that
-    were recorded, and what a second visit to the same folder retries."""
+    """Run the REAL ``tryAutoLoadLocalGgufModel`` over one folder with two
+    downloaded quants where *failing_quant* rejects. Reports the attempts, the
+    load result, the skip keys recorded, and what a second visit retries."""
     src = ADAPTER.read_text()
     start = src.index("  async function tryAutoLoadLocalGgufModel(")
     end = src.index("  async function tryAutoLoadRememberedLocalModel(", start)
@@ -347,9 +332,7 @@ def _run_local_gguf_variants(*, failing_quant: str, preferred: str | None = None
 def test_a_failed_local_gguf_variant_does_not_abort_the_rest_of_the_folder():
     """One corrupt quant must not strand the loadable ones beside it: the queue
     is smallest-first, so a bad Q2_K would otherwise unwind past the whole
-    ``variantQueue`` loop and auto-load would report no model even though the
-    Q4_K_M in the same folder loads. Same guarantee the per-candidate catch in
-    ``tryAutoLoadLocalModels`` already gives across folders."""
+    ``variantQueue`` loop even though the Q4_K_M in the same folder loads."""
     out = _run_local_gguf_variants(failing_quant = "Q2_K")
     assert out["loaded"] is True
     assert out["firstPass"] == ["Q2_K", "Q4_K_M"]
@@ -357,10 +340,9 @@ def test_a_failed_local_gguf_variant_does_not_abort_the_rest_of_the_folder():
 
 
 def test_a_failed_local_gguf_variant_is_remembered_by_its_own_quant():
-    """The skip key must name the quant that actually failed, not the preferred
-    one: with no preferred variant the old key was ``gguf:<id>:``, which the
-    per-variant lookup never matches, so a later sweep retried the same broken
-    quant and burned another of the three auto-load attempts."""
+    """The skip key must name the quant that actually failed: with no preferred
+    variant the old key was ``gguf:<id>:``, which the per-variant lookup never
+    matches, so a later sweep retried the same broken quant."""
     out = _run_local_gguf_variants(failing_quant = "Q2_K")
     assert out["skippedKeys"] == ["gguf:/custom/myrepo-gguf:q2_k"]
     assert "Q2_K" not in out["secondPass"]
