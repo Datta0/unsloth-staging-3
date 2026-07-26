@@ -355,3 +355,68 @@ def test_a_preferred_local_gguf_variant_still_leads_and_falls_back():
     assert out["firstPass"] == ["Q4_K_M", "Q2_K"]
     assert out["loaded"] is True
     assert out["skippedKeys"] == ["gguf:/custom/myrepo-gguf:q4_k_m"]
+
+
+def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
+    """Run the REAL ``tryAutoLoadRememberedLocalModel`` against a remembered entry
+    whose load throws, then report the skip keys it recorded."""
+    src = ADAPTER.read_text()
+    start = src.index("  async function tryAutoLoadRememberedLocalModel(")
+    end = src.index("  async function tryAutoLoadLocalModels(", start)
+    key_start = src.index("function autoLoadCandidateKey(")
+    key_end = src.index("\n}\n", key_start) + 3
+    return _run(
+        "type LastLocalModelKind = 'gguf' | 'model';\n"
+        "type LocalModelInfo = any;\n"
+        f"{src[key_start:key_end]}\n"
+        "let hadNonTrustFailure = false;\n"
+        "const skippedAutoLoadCandidates = new Set<string>();\n"
+        "const toastId = 't';\n"
+        "const toast: any = () => {};\n"
+        "const store = { params: { maxSeqLength: 4096 } };\n"
+        "const findLocalModel = (models: any[], id: string) =>\n"
+        "  models.find((m) => m.id === id) ?? null;\n"
+        "const isAutoLoadLocalModel = () => true;\n"
+        "const localModelIsGguf = (m: any) => m.model_format === 'gguf';\n"
+        "async function tryAutoLoadLocalGgufModel(_m: any, _v?: any): Promise<boolean> {\n"
+        "  throw new Error('llama_model_load: error loading model');\n"
+        "}\n"
+        "async function loadAutoLoadCandidate(_c: any): Promise<boolean> {\n"
+        "  throw new Error('llama_model_load: error loading model');\n"
+        "}\n"
+        f"{src[start:end]}\n"
+        f"const kind = {json.dumps(kind)};\n"
+        f"const ggufVariant = {json.dumps(gguf_variant)};\n"
+        "const models = [{\n"
+        "  id: '/custom/MyModel', model_id: 'MyModel', display_name: 'MyModel',\n"
+        "  model_format: kind === 'gguf' ? 'gguf' : 'safetensors',\n"
+        "}];\n"
+        "const loaded = await tryAutoLoadRememberedLocalModel(models, {\n"
+        "  id: '/custom/MyModel', kind, ggufVariant,\n"
+        "});\n"
+        "console.log(JSON.stringify({\n"
+        "  loaded, skippedKeys: [...skippedAutoLoadCandidates], hadNonTrustFailure,\n"
+        "}));\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "kind,gguf_variant,expected_key",
+    [
+        # A standalone GGUF: the sweep's own check keys on a null variant.
+        ("gguf", None, "gguf:/custom/mymodel:"),
+        ("gguf", "Q4_K_M", "gguf:/custom/mymodel:q4_k_m"),
+        ("model", None, "model:/custom/mymodel:"),
+    ],
+)
+def test_a_failed_remembered_local_model_is_not_retried_by_the_sweep(
+    kind, gguf_variant, expected_key
+):
+    """The sweep walks the same inventory, so a remembered entry that threw would
+    consume a second slot of the three-attempt budget and could starve a valid
+    model later in the list."""
+    out = _run_remembered_local(kind = kind, gguf_variant = gguf_variant)
+
+    assert out["loaded"] is False
+    assert out["hadNonTrustFailure"] is True
+    assert out["skippedKeys"] == [expected_key]

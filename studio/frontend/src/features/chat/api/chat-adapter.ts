@@ -1890,8 +1890,16 @@ async function autoLoadSmallestModel(): Promise<{
         successLabel: `Loaded ${remembered.display_name}`,
       });
     } catch {
-      // Fall through to the cascade.
+      // Fall through to the cascade, but record the failure: the sweep walks the
+      // same inventory, and retrying this model would burn a second attempt.
       hadNonTrustFailure = true;
+      skippedAutoLoadCandidates.add(
+        autoLoadCandidateKey(
+          preferred.kind,
+          remembered.id,
+          preferred.kind === "gguf" ? preferred.ggufVariant ?? null : null,
+        ),
+      );
       return false;
     }
   }
