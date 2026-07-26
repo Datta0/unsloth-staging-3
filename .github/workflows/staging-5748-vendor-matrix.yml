@@ -180,5 +180,16 @@ jobs:
           # Excluded from staging-5748-xplat-installer.yml because its
           # pytest.importorskip("unsloth_zoo") only swallows ImportError. Here a
           # CPU torch stack is present, so it either runs or skips cleanly.
+          # The whole module skips at collection when unsloth_zoo is absent, and
+          # pytest exits 5 ("no tests collected") for that, which is not a
+          # failure here -- treat it as the documented skip it is.
+          set +e
           PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
             tests/studio/install/test_rocm_rdna_routing.py
+          rc=$?
+          set -e
+          if [ "$rc" -eq 5 ]; then
+              echo "RESULT SKIP unsloth_zoo not installed; the RDNA spoof module skipped at collection"
+              exit 0
+          fi
+          exit "$rc"
