@@ -147,9 +147,15 @@ def _build_index() -> dict[str, _LocalGgufEntry]:
     )
     from utils.paths import legacy_hf_cache_dir, hf_default_cache_dir, lmstudio_model_dirs
     from utils.hf_cache_settings import known_hf_hub_caches
+    from core.inference.model_ids import public_model_id
 
     index: dict[str, _LocalGgufEntry] = {}
     seen_hf: set[str] = set()
+
+    try:
+        active_root = str(Path(_resolve_hf_cache_dir()).resolve())
+    except Exception:
+        active_root = None
 
     def _scan_hf_once(directory) -> list:
         if directory is None:
@@ -162,7 +168,13 @@ def _build_index() -> dict[str, _LocalGgufEntry]:
             if rp in seen_hf:
                 return []
             seen_hf.add(rp)
-            return _scan_hf_cache(directory)
+            # Only the active cache loads by repo id. Say so, or an inactive repo is
+            # indexed under an id it cannot load by, and its snapshot basename (what
+            # /v1/models advertises once loaded by path) is never a key at all.
+            # No format classification here: nothing on this path reads model_format,
+            # and its recursive walk would duplicate the one _local_gguf_entry already
+            # does per snapshot, on the request path.
+            return _scan_hf_cache(directory, active_cache = rp == active_root, classify_format = False)
         except Exception as exc:  # a missing/malformed root must skip, never crash the index
             logger.debug("auto-switch: skipping HF cache dir %r: %s", directory, exc)
             return []
@@ -220,10 +232,39 @@ def _build_index() -> dict[str, _LocalGgufEntry]:
             continue
         # Index every alias (including the path) so a client can resolve by any of
         # them, even though only the non-path loader_id is advertised.
-        for key in (raw_id, getattr(info, "model_id", None), getattr(info, "display_name", None)):
+        for key in (
+            raw_id,
+            getattr(info, "model_id", None),
+            getattr(info, "display_name", None),
+            *_public_aliases(raw_id),
+        ):
             if key:
                 index.setdefault(key.strip().lower(), entry)
     return index
+
+
+def _public_aliases(raw_id: str) -> list[str]:
+    """Public ids that must resolve back to *raw_id*'s entry.
+
+    An inactive-cache repo carries its snapshot path as the id, and /v1/models
+    advertises only that directory's basename once loaded, so anything durable
+    pinned to it (a subagent config) holds one revision hash. Hugging Face writes a
+    NEW snapshot dir on every update, so indexing only the scanned one would strand
+    that pin and drop the request through to an unrelated model. Alias every
+    revision of the same repo instead.
+    """
+    from pathlib import Path
+
+    alias = public_model_id(raw_id)
+    aliases = [alias] if alias else []
+    snapshots = Path(raw_id).parent
+    if snapshots.name != "snapshots":
+        return aliases
+    try:
+        aliases.extend(p.name for p in snapshots.iterdir() if p.is_dir())
+    except OSError:
+        pass
+    return aliases
 
 
 def _index() -> dict[str, _LocalGgufEntry]:
