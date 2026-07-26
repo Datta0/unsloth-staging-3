@@ -127,7 +127,9 @@ jobs:
       - name: Install test deps
         # structlog: studio/backend/utils/paths/path_utils.py imports it at module
         # level, and tests/studio/install/test_managed_node_runtime.py reaches it.
-        run: python -m pip install --upgrade pip pytest structlog
+        # pyyaml: tests/studio/test_ci_shell_suite_coverage.py imports yaml to
+        # parse the workflow files it asserts against.
+        run: python -m pip install --upgrade pip pytest structlog pyyaml
       - name: Installer / routing unit tests
         run: |
           # tests/studio/install/conftest.py already puts studio/ on sys.path;

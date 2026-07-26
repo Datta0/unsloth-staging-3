@@ -93,18 +93,41 @@ MOCK
     echo "$_d"
 }
 
+# On Windows (git-bash / MSYS) a hand-built minimal PATH breaks bash itself: it
+# needs its own msys DLLs and the Windows system directories to start at all, and
+# `ln -s` is not a real symlink there. Hosted Windows runners ship no nvidia-smi,
+# rocminfo or amd-smi (the "Prove there is no real GPU" workflow step logs this),
+# so prepending the mock dir to the inherited PATH is equally hermetic there.
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) MINIMAL_PATH=0 ;;
+    *)                    MINIMAL_PATH=1 ;;
+esac
+
 TOOLS_DIR="$TMP_ROOT/tools"; mkdir -p "$TOOLS_DIR"
-for _cmd in uname grep sed head sh bash cat awk printf tr ls cut sort timeout; do
-    _real=$(command -v "$_cmd" 2>/dev/null || true)
-    [ -n "$_real" ] && ln -sf "$_real" "$TOOLS_DIR/$_cmd"
-done
+if [ "$MINIMAL_PATH" -eq 1 ]; then
+    for _cmd in uname grep sed head sh bash cat awk printf tr ls cut sort timeout; do
+        _real=$(command -v "$_cmd" 2>/dev/null || true)
+        [ -n "$_real" ] || continue
+        ln -sf "$_real" "$TOOLS_DIR/$_cmd" 2>/dev/null || cp -f "$_real" "$TOOLS_DIR/$_cmd" 2>/dev/null || true
+    done
+    BASE_PATH="$TOOLS_DIR"
+else
+    BASE_PATH="$PATH"
+fi
+
+# Vendor / pin variables that must never leak in from the host or the workflow.
+UNSET_VARS="UNSLOTH_TORCH_INDEX_URL UNSLOTH_TORCH_INDEX_FAMILY UNSLOTH_PYTORCH_MIRROR
+UNSLOTH_AMD_ROCM_MIRROR UNSLOTH_ROCM_GFX_ARCH UNSLOTH_TORCH_BACKEND
+CUDA_VISIBLE_DEVICES ROCR_VISIBLE_DEVICES HIP_VISIBLE_DEVICES"
 
 # run_route <mock-dir|none> [extra env assignments...]
 run_route() {
     _mock="$1"; shift
-    if [ "$_mock" = "none" ]; then _p="$TOOLS_DIR"; else _p="$_mock:$TOOLS_DIR"; fi
-    env -i PATH="$_p" HOME="$TMP_ROOT" "$@" \
-        bash -c ". '$FUNC_FILE'; get_torch_index_url" 2>/dev/null
+    if [ "$_mock" = "none" ]; then _p="$BASE_PATH"; else _p="$_mock:$BASE_PATH"; fi
+    # Word splitting is the point here: expand UNSET_VARS into `-u NAME` pairs.
+    # shellcheck disable=SC2086,SC2046
+    set -- $(for _v in $UNSET_VARS; do printf -- '-u\n%s\n' "$_v"; done) PATH="$_p" "$@"
+    env "$@" bash -c ". '$FUNC_FILE'; get_torch_index_url" 2>/dev/null
 }
 
 assert_eq() {

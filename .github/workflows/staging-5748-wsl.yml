@@ -125,10 +125,14 @@ jobs:
           # test_rocm_support.py; test_pr5940_followups.py covers the reroute's
           # bash -lc exports prefix; test_rocm_native_linux_lib_dirs.py asserts the
           # WSL host is excluded from the native-Linux lib-dir prepend.
+          # Narrowed with -k to the WSL node ids: the full test_rocm_support.py
+          # run lives in staging-5748-vendor-matrix.yml, so an unrelated failure
+          # there does not muddy this job's WSL verdict.
           PYTHONPATH="$PWD/studio" python -m pytest -q --tb=short \
             tests/studio/install/test_rocm_support.py \
             tests/studio/install/test_pr5940_followups.py \
-            tests/studio/install/test_rocm_native_linux_lib_dirs.py
+            tests/studio/install/test_rocm_native_linux_lib_dirs.py \
+            -k "Wsl or wsl or WSL"
       - name: WSL uninstall icon path (PowerShell)
         shell: pwsh
         run: pwsh -NoProfile -File tests/studio/test_uninstall_dual_install_icon.ps1

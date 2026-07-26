@@ -64,25 +64,11 @@ jobs:
           ls /proc/driver/nvidia/gpus 2>/dev/null || echo "/proc/driver/nvidia/gpus: <absent>"
           ls /dev/kfd 2>/dev/null || echo "/dev/kfd: <absent>"
       - name: Simulated vendor routing (NVIDIA / AMD-ROCm / CPU-only)
+        # The whole tests/sh directory already runs on all eight runner labels in
+        # staging-5748-xplat-installer.yml, so it is deliberately not repeated
+        # here: this job is the vendor harness and nothing else, which keeps its
+        # red/green meaning unambiguous.
         run: bash .github/staging-5748/vendor_probe.sh install.sh
-      - name: tests/sh vendor + CUDA routing suites
-        run: |
-          set -u
-          failed=""
-          for s in tests/sh/test_get_torch_index_url.sh \
-                   tests/sh/test_torch_flavor.sh \
-                   tests/sh/test_torch_constraint.sh \
-                   tests/sh/test_previous_torch_pin.sh \
-                   tests/sh/test_unsloth_torch_override.sh \
-                   tests/sh/test_resolve_cuda_archs.sh \
-                   tests/sh/test_select_cuda_jit_tools.sh \
-                   tests/sh/test_nvcc_meets_llama_minimum.sh \
-                   tests/sh/test_strixhalo_wsl_reroute.sh; do
-              echo "::group::$s"
-              if bash "$s"; then echo "RESULT PASS $s"; else echo "RESULT FAIL $s"; echo "::error file=$s::failed on ${{ matrix.os }}"; failed="$failed $s"; fi
-              echo "::endgroup::"
-          done
-          if [ -n "$failed" ]; then echo "FAILED ON ${{ matrix.os }}:$failed"; exit 1; fi
 
   install-ps1-routing:
     name: "install.ps1 vendor / ${{ matrix.os }}"
