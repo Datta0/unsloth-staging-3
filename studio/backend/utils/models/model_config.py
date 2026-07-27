@@ -1912,6 +1912,11 @@ def list_local_gguf_variants(directory: str) -> tuple[list[GgufVariantInfo], boo
 
     quant_totals: dict[str, int] = {}
     quant_first_file: dict[str, str] = {}
+    # Split quants, so an interrupted download is not offered as usable: llama.cpp
+    # is given shard 1 and fails on the missing siblings. Expected count per quant
+    # from the ``-NNNNN-of-MMMMM`` suffix, against the indices actually present.
+    shard_expected: dict[str, int] = {}
+    shard_seen: dict[str, set[int]] = {}
     has_vision = False
 
     # Recurse so variant-specific subdirs (e.g. ``BF16/...gguf`` used by
@@ -1937,6 +1942,17 @@ def list_local_gguf_variants(directory: str) -> tuple[list[GgufVariantInfo], boo
         quant_totals[quant] = quant_totals.get(quant, 0) + size
         if quant not in quant_first_file:
             quant_first_file[quant] = rel
+        shard = _GGUF_SPLIT_FILE_RE.match(f.name)
+        if shard:
+            shard_expected[quant] = int(shard.group("total"))
+            shard_seen.setdefault(quant, set()).add(int(shard.group("index")))
+
+    # An incomplete split is not a variant anyone can load, and its short byte
+    # total would otherwise make it look like the cheapest one to try.
+    for quant, expected in shard_expected.items():
+        if len(shard_seen.get(quant, set())) != expected:
+            quant_totals.pop(quant, None)
+            quant_first_file.pop(quant, None)
 
     variants = [
         GgufVariantInfo(

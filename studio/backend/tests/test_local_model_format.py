@@ -199,3 +199,38 @@ def test_scan_models_dir_reports_mixed_for_a_mixed_child(tmp_path):
     assert rows["my-finetune"] == "mixed"
     assert rows["my-finetune-q4"] == "gguf"
     assert rows["my-finetune-full"] is None
+
+
+def test_local_variants_drop_an_incomplete_split(tmp_path):
+    """An interrupted split download must not be offered as a usable variant:
+    its short byte total makes it look like the cheapest quant to try, while
+    llama.cpp is handed shard 1 and fails on the missing siblings."""
+    from utils.models.model_config import list_local_gguf_variants
+
+    d = tmp_path / "repo"
+    d.mkdir()
+    # Complete two-shard Q4_K_M.
+    _touch(d / "m-Q4_K_M-00001-of-00002.gguf")
+    _touch(d / "m-Q4_K_M-00002-of-00002.gguf")
+    # Interrupted three-shard Q8_0: only the first arrived.
+    _touch(d / "m-Q8_0-00001-of-00003.gguf")
+    # An unsplit quant is unaffected.
+    _touch(d / "m-Q2_K.gguf")
+
+    variants, _ = list_local_gguf_variants(str(d))
+
+    assert {v.quant for v in variants} == {"Q4_K_M", "Q2_K"}
+
+
+def test_local_variants_keep_a_complete_split(tmp_path):
+    from utils.models.model_config import list_local_gguf_variants
+
+    d = tmp_path / "repo"
+    d.mkdir()
+    for index in (1, 2, 3):
+        _touch(d / f"m-Q8_0-{index:05d}-of-00003.gguf")
+
+    variants, _ = list_local_gguf_variants(str(d))
+
+    assert [v.quant for v in variants] == ["Q8_0"]
+

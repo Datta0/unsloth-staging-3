@@ -140,6 +140,14 @@ export function findLocalModel(
     if (model.path.toLowerCase() === normalized) {
       return true;
     }
+    // The Hub-style alias, only for a cache snapshot. LM Studio rows carry a
+    // publisher/model-name model_id of the same shape (and Ollama rows an
+    // ollama/name:tag one) for an independent copy with its own files, so a
+    // remembered `org/model` must not resolve to one of those. Their own memory
+    // is the absolute path, matched above.
+    if (model.active_cache !== false) {
+      return false;
+    }
     const modelId = model.model_id?.trim().toLowerCase();
     return Boolean(modelId && modelId === normalized);
   });

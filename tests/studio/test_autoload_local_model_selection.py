@@ -1110,3 +1110,30 @@ def test_a_successful_cached_gguf_load_records_nothing():
     assert out["loaded"] is True
     assert out["skippedKeys"] == []
     assert out["hadNonTrustFailure"] is False
+
+
+def test_a_remembered_repo_id_only_matches_a_cache_snapshot():
+    """A remembered Hub id comes from a cached load. An LM Studio row carries a
+    publisher/model-name model_id of the same shape for an independent copy, so
+    only the registered cache snapshot may answer to it."""
+    out = _run(
+        "const cacheRow = M({ id: '/hub/models--Org--Foo/snapshots/rev0',\n"
+        "  path: '/hub/models--Org--Foo/snapshots/rev0', model_id: 'Org/Foo',\n"
+        "  active_cache: false });\n"
+        "const lmStudioRow = M({ id: '/lmstudio/Org/Foo', path: '/lmstudio/Org/Foo',\n"
+        "  model_id: 'Org/Foo', source: 'lmstudio' });\n"
+        "const find = (rows, id) => helpers.findLocalModel(rows, id)?.id ?? null;\n"
+        "console.log(JSON.stringify({\n"
+        "  cacheByRepoId: find([cacheRow], 'Org/Foo'),\n"
+        "  lmStudioByRepoId: find([lmStudioRow], 'Org/Foo'),\n"
+        "  lmStudioByPath: find([lmStudioRow], '/lmstudio/Org/Foo'),\n"
+        "  bothPrefersCache: find([lmStudioRow, cacheRow], 'Org/Foo'),\n"
+        "}));\n"
+    )
+    assert out == {
+        "cacheByRepoId": "/hub/models--Org--Foo/snapshots/rev0",
+        "lmStudioByRepoId": None,
+        "lmStudioByPath": "/lmstudio/Org/Foo",
+        "bothPrefersCache": "/hub/models--Org--Foo/snapshots/rev0",
+    }
+
