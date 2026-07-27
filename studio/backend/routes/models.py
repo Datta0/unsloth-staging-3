@@ -340,7 +340,12 @@ def _scan_models_dir(models_dir: Path, *, limit: int | None = None) -> List[Loca
         # A folder whose only weights are .gguf is GGUF-format even when it also
         # ships a config.json (common for HF GGUF repos); such folders often lack
         # a -GGUF suffix, so surface the format for the UI's GGUF classification.
-        model_format = "gguf" if has_main_gguf and not has_non_gguf_weights else None
+        # One holding both kinds is "mixed": not GGUF for the pickers, but not a
+        # plain checkpoint either, since a load resolves it to a GGUF.
+        if has_main_gguf:
+            model_format = "mixed" if has_non_gguf_weights else "gguf"
+        else:
+            model_format = None
         found.append(
             LocalModelInfo(
                 id = str(child),
@@ -449,6 +454,12 @@ def _dir_model_format(path: Path, recursive: bool = False) -> Optional[str]:
     live and ``/api/models/local`` is async: an unbounded ``rglob`` per repo would
     have to exhaust every non-GGUF snapshot before concluding there is no GGUF,
     blocking the event loop on a large cache.
+
+    A directory holding both kinds of weights returns ``"mixed"``. It is not GGUF
+    for the pickers, which compare against ``"gguf"``, but it is not a plain
+    checkpoint either: ``ModelConfig.from_identifier`` runs ``detect_gguf_model``
+    on any local path before anything else and serves the largest GGUF it finds,
+    so a caller that assumed safetensors would get an unannounced GGUF load.
     """
     try:
         found = path.glob("*.gguf")
@@ -457,7 +468,7 @@ def _dir_model_format(path: Path, recursive: bool = False) -> Optional[str]:
                 return None
             if not any(_is_main_gguf_filename(p.name) for p in path.glob("*/*.gguf")):
                 return None
-        return None if _has_non_gguf_weights(path) else "gguf"
+        return "mixed" if _has_non_gguf_weights(path) else "gguf"
     except OSError:
         return None
 

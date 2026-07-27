@@ -737,36 +737,71 @@ def test_manual_local_picks_are_remembered_as_the_last_used_model():
     assert out == [expected for _, expected in MANUAL_LOAD_CASES]
 
 
-def test_local_inventory_only_reports_gguf_or_no_format():
+def test_local_inventory_reports_only_its_own_format_vocabulary():
     """The companion scoping keys off a positive GGUF classification, which is
-    only sound because ``/api/models/local`` has no non-GGUF vocabulary. Pin
-    that: every ``model_format`` the route sets is the literal ``"gguf"`` or
-    comes from ``_dir_model_format``, which returns ``"gguf"`` or ``None``.
+    only sound because ``/api/models/local`` has no non-GGUF vocabulary beyond
+    the ambiguous ``"mixed"``. Pin what the route can emit: ``"gguf"``,
+    ``"mixed"``, ``None``, or a ``_dir_model_format`` call returning those.
 
     The richer set ("safetensors", "adapter", "unknown") is the hub inventory
     schema, which feeds the picker rather than auto-load. Reintroducing an
     allowlist of those names here silently matches nothing."""
     source = _source_path("studio/backend/routes/models.py").read_text()
     assignments = {
-        line.strip() for line in source.splitlines() if line.strip().startswith("model_format =")
+        line.strip()
+        for line in source.splitlines()
+        if line.strip().startswith("model_format =")
     }
     assert assignments, "no model_format assignments found; path moved?"
+    allowed = {
+        'model_format = "gguf"',
+        'model_format = "gguf",',
+        "model_format = None",
+        'model_format = "mixed" if has_non_gguf_weights else "gguf"',
+        "model_format = model_format,",
+        "model_format = (",
+    }
     for assignment in assignments:
-        value = assignment.split("=", 1)[1].strip().rstrip(",")
         assert (
-            value.startswith("_dir_model_format(")
-            or value.startswith("model_format")
-            or value == '"gguf"'
-            or value.startswith('"gguf" if ')
-            or value == "("  # multi-line _dir_model_format call
+            assignment in allowed
+            or assignment.startswith("model_format = _dir_model_format(")
         ), assignment
-    for dead in (
-        'model_format = "safetensors"',
-        'model_format = "adapter"',
-        'model_format = "checkpoint"',
-        'model_format = "unknown"',
-    ):
-        assert dead not in source
+    for dead in ('"safetensors"', '"adapter"', '"checkpoint"', '"unknown"'):
+        assert f"model_format = {dead}" not in source
+    # _dir_model_format itself returns only these.
+    body = _slice(source, "def _dir_model_format(", "\ndef ")
+    returns = {line.strip() for line in body.splitlines() if line.strip().startswith("return")}
+    assert returns == {
+        "return None",
+        'return "mixed" if _has_non_gguf_weights(path) else "gguf"',
+    }, returns
+
+
+def test_a_mixed_weight_directory_is_left_to_an_explicit_pick():
+    """Loading such a folder resolves to a GGUF either way, because
+    from_identifier runs detect_gguf_model on any local path first and it takes
+    the largest file, so the checkpoint path would load the biggest quant and
+    record the run as non-GGUF. Unattended auto-load skips it."""
+    out = _run(
+        "console.log(JSON.stringify({\n"
+        "  mixed: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/my-finetune', model_format: 'mixed' })),\n"
+        "  pureGguf: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/my-finetune-q4', model_format: 'gguf' })),\n"
+        "  pureCheckpoint: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/my-finetune-full' })),\n"
+        # A mixed row is not GGUF for classification either.
+        "  mixedIsNotGguf: helpers.localModelIsGguf(M({\n"
+        "    path: '/models/my-finetune', display_name: 'my-finetune',\n"
+        "    model_format: 'mixed' })),\n"
+        "}));\n"
+    )
+    assert out == {
+        "mixed": False,
+        "pureGguf": True,
+        "pureCheckpoint": True,
+        "mixedIsNotGguf": False,
+    }
 
 
 def test_a_companion_named_checkpoint_is_still_loadable():

@@ -116,12 +116,14 @@ def test_dir_model_format_gguf_with_config_is_still_gguf(tmp_path):
     assert models_route._dir_model_format(d) == "gguf"
 
 
-def test_dir_model_format_mixed_weights_is_not_gguf(tmp_path):
-    # Real safetensors weights present -> not a GGUF folder.
+def test_dir_model_format_mixed_weights_is_mixed(tmp_path):
+    # Real safetensors weights beside a GGUF: not a GGUF folder for the pickers,
+    # which compare against "gguf", but not a plain checkpoint either, since a
+    # load runs detect_gguf_model first and resolves it to the largest GGUF.
     d = tmp_path / "model"
     _touch(d / "model.safetensors")
     _touch(d / "model-Q4_K_M.gguf")
-    assert models_route._dir_model_format(d) is None
+    assert models_route._dir_model_format(d) == "mixed"
 
 
 def test_dir_model_format_no_gguf(tmp_path):
@@ -140,12 +142,12 @@ def test_dir_model_format_ignores_tokenizer_bin(tmp_path):
     assert models_route._dir_model_format(d) == "gguf"
 
 
-def test_dir_model_format_weight_bin_is_not_gguf(tmp_path):
-    # A real PyTorch weight .bin alongside a .gguf means mixed weights -> None.
+def test_dir_model_format_weight_bin_is_mixed(tmp_path):
+    # A real PyTorch weight .bin alongside a .gguf is the same mixed case.
     d = tmp_path / "model"
     _touch(d / "pytorch_model.bin")
     _touch(d / "model-Q4_K_M.gguf")
-    assert models_route._dir_model_format(d) is None
+    assert models_route._dir_model_format(d) == "mixed"
 
 
 def test_scan_models_dir_classifies_gguf_with_config(tmp_path):
@@ -177,3 +179,24 @@ def test_scan_models_dir_classifies_root_gguf_with_config(tmp_path):
 
     assert row.path == str(root)
     assert row.model_format == "gguf"
+
+
+def test_scan_models_dir_reports_mixed_for_a_mixed_child(tmp_path):
+    """The inline classification in _scan_models_dir must agree with
+    _dir_model_format, since both feed the same model_format field."""
+    child = tmp_path / "my-finetune"
+    _touch(child / "config.json")
+    _touch(child / "model.safetensors")
+    _touch(child / "my-finetune-Q4_K_M.gguf")
+    gguf_only = tmp_path / "my-finetune-q4"
+    _touch(gguf_only / "my-finetune-Q4_K_M.gguf")
+    plain = tmp_path / "my-finetune-full"
+    _touch(plain / "config.json")
+    _touch(plain / "model.safetensors")
+
+    rows = {row.display_name: row.model_format for row in models_route._scan_models_dir(tmp_path)}
+
+    assert rows["my-finetune"] == "mixed"
+    assert rows["my-finetune-q4"] == "gguf"
+    assert rows["my-finetune-full"] is None
+

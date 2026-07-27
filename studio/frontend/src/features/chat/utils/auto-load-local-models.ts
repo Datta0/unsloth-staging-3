@@ -78,6 +78,16 @@ export function isAutoLoadLocalModel(model: LocalModelInfo): boolean {
   if (model.partial) {
     return false;
   }
+  // A folder holding both safetensors and GGUF weights. Loading it resolves to a
+  // GGUF whichever kind is asked for, because ModelConfig.from_identifier runs
+  // detect_gguf_model on any local path first and that takes the largest file, so
+  // the checkpoint path would silently load the biggest quant and then record the
+  // run as non-GGUF with a 4096-token cap. Which one the user wants is genuinely
+  // ambiguous, and this sweep runs unattended, so it is left to an explicit pick
+  // where the variant is chosen deliberately. The picker still lists it.
+  if (model.model_format === "mixed") {
+    return false;
+  }
   if (localModelIsGguf(model) && isGgufCompanionPath(model.path)) {
     return false;
   }
