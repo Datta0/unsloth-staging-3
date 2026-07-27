@@ -930,9 +930,7 @@ def test_a_remembered_mlx_model_is_not_restored_off_a_mac():
     assert off_mac["skippedKeys"] == []
     assert off_mac["hadNonTrustFailure"] is False
 
-    on_mac = _run_remembered_local(
-        kind = "model", name = "Qwen3-4B-MLX", is_mac = True
-    )
+    on_mac = _run_remembered_local(kind = "model", name = "Qwen3-4B-MLX", is_mac = True)
     # Reached on a Mac, where the stubbed load throws and is recorded.
     assert on_mac["hadNonTrustFailure"] is True
 
@@ -977,4 +975,3 @@ def test_only_the_cached_copy_is_aliased_not_a_same_named_repo_elsewhere():
 
     assert out["attempted"] == ["gguf|/hubB/models--Org--Foo-GGUF/snapshots/rev0|Q4_K_M"]
     assert out["loaded"] is True
-
