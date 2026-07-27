@@ -233,4 +233,3 @@ def test_local_variants_keep_a_complete_split(tmp_path):
     variants, _ = list_local_gguf_variants(str(d))
 
     assert [v.quant for v in variants] == ["Q8_0"]
-

@@ -1136,4 +1136,3 @@ def test_a_remembered_repo_id_only_matches_a_cache_snapshot():
         "lmStudioByPath": "/lmstudio/Org/Foo",
         "bothPrefersCache": "/hub/models--Org--Foo/snapshots/rev0",
     }
-
