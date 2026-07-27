@@ -310,7 +310,7 @@ def _run_local_gguf_variants(*, failing_quant: str, preferred: str | None = None
         "const isDirectGgufPath = helpers.isDirectGgufPath;\n"
         "let hadNonTrustFailure = false;\n"
         "const skippedAutoLoadCandidates = new Set<string>();\n"
-        "const cachedRepoDirs: any[] = [];\n"
+        "const cachedRepoLoadDirs: any[] = [];\n"
         "const hostRunsMlx = false;\n"
         "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
         # The local tiers consult the skip set through these helpers, so the
@@ -395,7 +395,7 @@ def _run_remembered_local(
         f"{src[key_start:key_end]}\n"
         "let hadNonTrustFailure = false;\n"
         "const skippedAutoLoadCandidates = new Set<string>();\n"
-        "const cachedRepoDirs: any[] = [];\n"
+        "const cachedRepoLoadDirs: any[] = [];\n"
         f"const hostRunsMlx = {json.dumps(is_mac)};\n"
         "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
         # The local tiers consult the skip set through these helpers, so the
@@ -500,7 +500,7 @@ def _run_local_sweep(
         "const isAutoLoadLocalModel = helpers.isAutoLoadLocalModel;\n"
         "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
         f"const hostRunsMlx = {json.dumps(is_mac)};\n"
-        f"const cachedRepoDirs = {json.dumps(cached_repo_dirs or [])};\n"
+        f"const cachedRepoLoadDirs = {json.dumps(cached_repo_dirs or [])};\n"
         "const sortLocalModelsForAutoLoad = helpers.sortLocalModelsForAutoLoad;\n"
         "function hasBigEndianGgufMarker(_p: string) { return false; }\n"
         "function isAutoLoadableGgufVariant(_v: any) { return true; }\n"
@@ -602,9 +602,11 @@ def test_a_clean_sweep_blacklists_nothing():
 # tiers address it by repo id, collect_local_models keeps a custom row for the
 # same snapshot addressed by absolute path. Only cache-derived rows carry
 # model_id, so it is an exact alias between the two spellings.
-# What listCachedGguf reported: the repo dir this copy was read from.
+# What listCachedGguf reported: the snapshot path this copy loads from. A row
+# without a load_id resolves by repo id through the active cache and never
+# reaches this table.
 CACHED_REPO_DIRS = [
-    {"repoId": "Org/Foo-GGUF", "cachePath": "/hub/models--Org--Foo-GGUF"},
+    {"repoId": "Org/Foo-GGUF", "loadPath": "/hub/models--Org--Foo-GGUF"},
 ]
 
 REGISTERED_CACHE_ROWS = [
@@ -867,7 +869,7 @@ def test_an_lmstudio_copy_is_not_aliased_to_a_cached_repo():
         cached_repo_dirs = [
             {
                 "repoId": "unsloth/gemma-3-4b-it-GGUF",
-                "cachePath": "/hub/models--unsloth--gemma-3-4b-it-GGUF",
+                "loadPath": "/hub/models--unsloth--gemma-3-4b-it-GGUF",
             },
         ],
     )
@@ -1001,7 +1003,7 @@ def test_only_the_cached_copy_is_aliased_not_a_same_named_repo_elsewhere():
         failing = [],
         preskipped = ["gguf:org/foo-gguf:q4_k_m"],
         cached_repo_dirs = [
-            {"repoId": "Org/Foo-GGUF", "cachePath": "/hubA/models--Org--Foo-GGUF"},
+            {"repoId": "Org/Foo-GGUF", "loadPath": "/hubA/models--Org--Foo-GGUF"},
         ],
     )
 

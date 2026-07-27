@@ -346,6 +346,10 @@ def _scan_models_dir(models_dir: Path, *, limit: int | None = None) -> List[Loca
             model_format = "mixed" if has_non_gguf_weights else "gguf"
         else:
             model_format = None
+        # Admitted on its config alone, so there is nothing to serve: an
+        # interrupted copy, or a config-only folder. It stays listed, flagged the
+        # way an incomplete cache download is, so an unattended load does not
+        # spend an attempt resolving a config and then finding no weights.
         found.append(
             LocalModelInfo(
                 id = str(child),
@@ -353,6 +357,7 @@ def _scan_models_dir(models_dir: Path, *, limit: int | None = None) -> List[Loca
                 path = str(child),
                 source = "models_dir",
                 model_format = model_format,
+                partial = not (has_gguf or has_non_gguf_weights),
                 updated_at = updated_at,
             ),
         )
@@ -544,10 +549,11 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
             for model_dir in child.iterdir():
                 try:
                     if model_dir.is_dir():
+                        has_weights = any(model_dir.glob("*.gguf")) or any(
+                            model_dir.glob("*.safetensors")
+                        )
                         has_model = (
-                            any(model_dir.glob("*.gguf"))
-                            or (model_dir / "config.json").exists()
-                            or any(model_dir.glob("*.safetensors"))
+                            has_weights or (model_dir / "config.json").exists()
                         )
                         if not has_model:
                             continue
@@ -564,6 +570,9 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
                                 path = str(model_dir),
                                 source = "lmstudio",
                                 model_format = _dir_model_format(model_dir),
+                                # Config but no weights: listed, but not
+                                # something an unattended load should try.
+                                partial = not has_weights,
                                 updated_at = updated_at,
                             ),
                         )

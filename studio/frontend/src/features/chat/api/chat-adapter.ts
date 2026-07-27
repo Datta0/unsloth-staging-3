@@ -44,6 +44,7 @@ import {
   type PendingImageEditReference,
   type RagAutoInject,
   GPU_LAYERS_AUTO,
+  isLocalModelPath,
   loadedGpuMemoryFields,
   reconcilePersistedGpuIds,
   resolveLoadedSpeculativeSettings,
@@ -1512,7 +1513,7 @@ async function autoLoadSmallestModel(): Promise<{
     platform.chatOnlyReason !== "mlx_unavailable" &&
     platform.chatOnlyReason !== "intel_mac";
   // Filled in from the cached listings below, before any local tier runs.
-  const cachedRepoDirs: { repoId: string; cachePath: string }[] = [];
+  const cachedRepoLoadDirs: { repoId: string; loadPath: string }[] = [];
 
   // A registered HF cache surfaces its repos twice: the cached tiers address the
   // model by repo id, while collect_local_models keeps a custom row for the same
@@ -1539,12 +1540,18 @@ async function autoLoadSmallestModel(): Promise<{
     );
   }
 
-  /** The repo id the cached tiers address this local row by, or null. Both the
-   * matching id and containment in that repo's cache dir are required: the id
-   * alone is a name, and several caches can hold the same repo, so a failure in
-   * one must not blacklist a healthy copy in another. A cache whose realpath
-   * moved out from under cache_path simply gets no alias, which is the behaviour
-   * from before the alias existed rather than a wrong one. */
+  /** The repo id the cached tiers address this local row by, or null.
+   *
+   * Keyed on the cached candidate's *load target*, not on where its files were
+   * found. A cached row whose `load_id` is a snapshot path is loaded by that
+   * path, so a registered row inside it is the same load. A row without one is
+   * loaded by repo id, which the backend resolves through the active cache: that
+   * can be a different copy from the one the listing measured (both listings keep
+   * the largest of the duplicates), and every cached safetensors row is in this
+   * position, since only the GGUF listing computes a load_id. Aliasing those
+   * would let a registered inactive snapshot blacklist a healthy active-cache
+   * load. Both the id and containment are required, and anything unresolvable
+   * simply gets no alias, which is the behaviour from before the alias existed. */
   function cachedRepoAliasFor(model: LocalModelInfo): string | null {
     if (model.active_cache !== false) {
       return null;
@@ -1553,10 +1560,10 @@ async function autoLoadSmallestModel(): Promise<{
     if (!modelId) {
       return null;
     }
-    const match = cachedRepoDirs.find(
+    const match = cachedRepoLoadDirs.find(
       (repo) =>
         repo.repoId.toLowerCase() === modelId.toLowerCase() &&
-        isPathInside(model.path, repo.cachePath),
+        isPathInside(model.path, repo.loadPath),
     );
     return match ? modelId : null;
   }
@@ -2060,15 +2067,17 @@ async function autoLoadSmallestModel(): Promise<{
       listLocalModels().catch(() => ({ models: [] as LocalModelInfo[] })),
     ]);
     const localModels = localInventory.models;
-    // Record which cache dir each cached candidate was read from, so the local
-    // tiers can tell a registered re-surfacing of that exact copy apart from a
-    // same-named repo in another cache. Both listings collapse duplicates by
-    // repo id, so at most one dir per id reaches this.
+    // Record the path each cached candidate will actually be loaded from, so the
+    // local tiers can tell a registered re-surfacing of that exact load apart
+    // from a same-named repo elsewhere. Only a load_id qualifies: it is set when
+    // the repo id does not resolve on its own, which is precisely when the load
+    // targets this snapshot. Both listings collapse duplicates by repo id, so at
+    // most one entry per id reaches this.
     for (const repo of [...ggufRepos, ...modelRepos]) {
-      if (repo.cache_path) {
-        cachedRepoDirs.push({
+      if (repo.load_id && isLocalModelPath(repo.load_id)) {
+        cachedRepoLoadDirs.push({
           repoId: repo.repo_id,
-          cachePath: repo.cache_path,
+          loadPath: repo.load_id,
         });
       }
     }

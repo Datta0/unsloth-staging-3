@@ -233,3 +233,36 @@ def test_local_variants_keep_a_complete_split(tmp_path):
     variants, _ = list_local_gguf_variants(str(d))
 
     assert [v.quant for v in variants] == ["Q8_0"]
+
+
+def test_weightless_local_rows_are_flagged_partial(tmp_path):
+    """A folder admitted on its config alone has nothing to serve, so an
+    unattended load would resolve the config, spend an attempt and then fail.
+    It stays listed, flagged the way an incomplete cache download is, which the
+    auto-load predicate already refuses."""
+    weightless = tmp_path / "interrupted-copy"
+    _touch(weightless / "config.json")
+    real = tmp_path / "real-model"
+    _touch(real / "config.json")
+    _touch(real / "model.safetensors")
+    gguf_only = tmp_path / "gguf-only"
+    _touch(gguf_only / "m-Q4_K_M.gguf")
+
+    rows = {r.display_name: r.partial for r in models_route._scan_models_dir(tmp_path)}
+
+    assert rows["interrupted-copy"] is True
+    assert rows["real-model"] is False
+    assert rows["gguf-only"] is False
+
+
+def test_weightless_lmstudio_rows_are_flagged_partial(tmp_path):
+    """The LM Studio publisher branch admits on config alone in the same way."""
+    _touch(tmp_path / "publisher" / "interrupted" / "config.json")
+    _touch(tmp_path / "publisher" / "real" / "config.json")
+    _touch(tmp_path / "publisher" / "real" / "model.safetensors")
+
+    rows = {r.display_name: r.partial for r in models_route._scan_lmstudio_dir(tmp_path)}
+
+    assert rows["interrupted"] is True
+    assert rows["real"] is False
+
