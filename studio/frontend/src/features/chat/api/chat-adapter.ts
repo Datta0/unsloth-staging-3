@@ -1499,6 +1499,45 @@ async function autoLoadSmallestModel(): Promise<{
   let loadAttempts = 0;
   const skippedAutoLoadCandidates = new Set<string>();
 
+  // A registered HF cache surfaces its repos twice: the cached tiers address the
+  // model by repo id, while collect_local_models keeps a custom row for the same
+  // snapshot addressed by absolute path. Keying a failure by candidate id alone
+  // therefore lets one broken model spend a second slot of the attempt budget
+  // under the other spelling. Cache-derived rows are the only local rows that
+  // carry model_id, so it is an exact alias rather than a guess.
+  function localCandidateKeys(
+    kind: LastLocalModelKind,
+    model: LocalModelInfo,
+    ggufVariant: string | null,
+  ): string[] {
+    const keys = [autoLoadCandidateKey(kind, model.id, ggufVariant)];
+    const alias = model.model_id?.trim();
+    if (alias && alias !== model.id) {
+      keys.push(autoLoadCandidateKey(kind, alias, ggufVariant));
+    }
+    return keys;
+  }
+
+  function isSkippedLocalCandidate(
+    kind: LastLocalModelKind,
+    model: LocalModelInfo,
+    ggufVariant: string | null,
+  ): boolean {
+    return localCandidateKeys(kind, model, ggufVariant).some((key) =>
+      skippedAutoLoadCandidates.has(key),
+    );
+  }
+
+  function recordSkippedLocalCandidate(
+    kind: LastLocalModelKind,
+    model: LocalModelInfo,
+    ggufVariant: string | null,
+  ): void {
+    for (const key of localCandidateKeys(kind, model, ggufVariant)) {
+      skippedAutoLoadCandidates.add(key);
+    }
+  }
+
   async function canAutoLoad(payload: {
     model_path: string;
     max_seq_length: number;
@@ -1769,11 +1808,7 @@ async function autoLoadSmallestModel(): Promise<{
       if (hasBigEndianGgufMarker(model.path)) {
         return false;
       }
-      if (
-        skippedAutoLoadCandidates.has(
-          autoLoadCandidateKey("gguf", model.id, null),
-        )
-      ) {
+      if (isSkippedLocalCandidate("gguf", model, null)) {
         return false;
       }
       return loadAutoLoadCandidate({
@@ -1812,11 +1847,7 @@ async function autoLoadSmallestModel(): Promise<{
         if (!variant.quant) {
           continue;
         }
-        if (
-          skippedAutoLoadCandidates.has(
-            autoLoadCandidateKey("gguf", model.id, variant.quant),
-          )
-        ) {
+        if (isSkippedLocalCandidate("gguf", model, variant.quant)) {
           continue;
         }
         // A bad quant must not abort the rest of the folder, and the skip key
@@ -1835,16 +1866,12 @@ async function autoLoadSmallestModel(): Promise<{
           }
         } catch {
           hadNonTrustFailure = true;
-          skippedAutoLoadCandidates.add(
-            autoLoadCandidateKey("gguf", model.id, variant.quant),
-          );
+          recordSkippedLocalCandidate("gguf", model, variant.quant);
         }
       }
     } catch {
       hadNonTrustFailure = true;
-      skippedAutoLoadCandidates.add(
-        autoLoadCandidateKey("gguf", model.id, preferredVariant),
-      );
+      recordSkippedLocalCandidate("gguf", model, preferredVariant ?? null);
     }
     return false;
   }
@@ -1893,12 +1920,10 @@ async function autoLoadSmallestModel(): Promise<{
       // Fall through to the cascade, but record the failure: the sweep walks the
       // same inventory, and retrying this model would burn a second attempt.
       hadNonTrustFailure = true;
-      skippedAutoLoadCandidates.add(
-        autoLoadCandidateKey(
-          preferred.kind,
-          remembered.id,
-          preferred.kind === "gguf" ? preferred.ggufVariant ?? null : null,
-        ),
+      recordSkippedLocalCandidate(
+        preferred.kind,
+        remembered,
+        preferred.kind === "gguf" ? preferred.ggufVariant ?? null : null,
       );
       return false;
     }
@@ -1932,7 +1957,7 @@ async function autoLoadSmallestModel(): Promise<{
           continue;
         }
         if (
-          skippedAutoLoadCandidates.has(autoLoadCandidateKey("model", model.id))
+          isSkippedLocalCandidate("model", model, null)
         ) {
           continue;
         }
@@ -1952,10 +1977,10 @@ async function autoLoadSmallestModel(): Promise<{
         // LM Studio row for the same path, so record the key the next visit
         // checks (`gguf:<id>:` for a standalone file, `model:<id>:` otherwise) or
         // the identical broken entry burns another slot of the attempt budget.
+        // The repo-id alias goes in too, so the cached safetensors fallback below
+        // does not retry the same snapshot under its Hub spelling.
         hadNonTrustFailure = true;
-        skippedAutoLoadCandidates.add(
-          autoLoadCandidateKey(isGguf ? "gguf" : "model", model.id, null),
-        );
+        recordSkippedLocalCandidate(isGguf ? "gguf" : "model", model, null);
       }
     }
     return false;

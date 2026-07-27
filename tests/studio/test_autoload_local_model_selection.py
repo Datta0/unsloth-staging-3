@@ -310,6 +310,9 @@ def _run_local_gguf_variants(*, failing_quant: str, preferred: str | None = None
         "const isDirectGgufPath = helpers.isDirectGgufPath;\n"
         "let hadNonTrustFailure = false;\n"
         "const skippedAutoLoadCandidates = new Set<string>();\n"
+        # The local tiers consult the skip set through these helpers, so the
+        # sliced functions need the real implementations, not stand-ins.
+        f"{_slice(src, '  function localCandidateKeys(', '  async function canAutoLoad(')}\n"
         "const attempted: string[] = [];\n"
         "function hasBigEndianGgufMarker(_p: string) { return false; }\n"
         "function isAutoLoadableGgufVariant(_v: any) { return true; }\n"
@@ -383,6 +386,9 @@ def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
         f"{src[key_start:key_end]}\n"
         "let hadNonTrustFailure = false;\n"
         "const skippedAutoLoadCandidates = new Set<string>();\n"
+        # The local tiers consult the skip set through these helpers, so the
+        # sliced functions need the real implementations, not stand-ins.
+        f"{_slice(src, '  function localCandidateKeys(', '  async function canAutoLoad(')}\n"
         "const toastId = 't';\n"
         "const toast: any = () => {};\n"
         "const store = { params: { maxSeqLength: 4096 } };\n"
@@ -401,7 +407,8 @@ def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
         f"const ggufVariant = {json.dumps(gguf_variant)};\n"
         "const models = [{\n"
         "  id: '/custom/MyModel', model_id: 'MyModel', display_name: 'MyModel',\n"
-        "  model_format: kind === 'gguf' ? 'gguf' : 'safetensors',\n"
+        # Only "gguf" or nothing: the vocabulary /api/models/local reports.
+        "  model_format: kind === 'gguf' ? 'gguf' : undefined,\n"
         "}];\n"
         "const loaded = await tryAutoLoadRememberedLocalModel(models, {\n"
         "  id: '/custom/MyModel', kind, ggufVariant,\n"
@@ -413,16 +420,18 @@ def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
 
 
 @pytest.mark.parametrize(
-    "kind,gguf_variant,expected_key",
+    "kind,gguf_variant,expected_keys",
     [
-        # A standalone GGUF: the sweep's own check keys on a null variant.
-        ("gguf", None, "gguf:/custom/mymodel:"),
-        ("gguf", "Q4_K_M", "gguf:/custom/mymodel:q4_k_m"),
-        ("model", None, "model:/custom/mymodel:"),
+        # A standalone GGUF: the sweep's own check keys on a null variant. The
+        # repo-id alias is recorded beside the path so the cached tiers, which
+        # address the same snapshot by repo id, see the failure too.
+        ("gguf", None, ["gguf:/custom/mymodel:", "gguf:mymodel:"]),
+        ("gguf", "Q4_K_M", ["gguf:/custom/mymodel:q4_k_m", "gguf:mymodel:q4_k_m"]),
+        ("model", None, ["model:/custom/mymodel:", "model:mymodel:"]),
     ],
 )
 def test_a_failed_remembered_local_model_is_not_retried_by_the_sweep(
-    kind, gguf_variant, expected_key
+    kind, gguf_variant, expected_keys
 ):
     """The sweep walks the same inventory, so a remembered entry that threw would
     consume a second slot of the three-attempt budget and could starve a valid
@@ -431,7 +440,7 @@ def test_a_failed_remembered_local_model_is_not_retried_by_the_sweep(
 
     assert out["loaded"] is False
     assert out["hadNonTrustFailure"] is True
-    assert out["skippedKeys"] == [expected_key]
+    assert out["skippedKeys"] == expected_keys
 
 
 def _run_local_sweep(
@@ -439,6 +448,7 @@ def _run_local_sweep(
     *,
     failing: list[str],
     gguf_folder_fail: str | None = None,
+    preskipped: list[str] | None = None,
 ):
     """Run the REAL ``tryAutoLoadLocalModels`` (driving the real
     ``tryAutoLoadLocalGgufModel``) over *models*, failing every load whose id is
@@ -463,7 +473,10 @@ def _run_local_sweep(
         "const MAX_AUTO_LOAD_ATTEMPTS = 3;\n"
         "let loadAttempts = 0;\n"
         "let hadNonTrustFailure = false;\n"
-        "const skippedAutoLoadCandidates = new Set<string>();\n"
+        f"const skippedAutoLoadCandidates = new Set<string>({json.dumps(preskipped or [])});\n"
+        # The local tiers consult the skip set through these helpers, so the
+        # sliced functions need the real implementations, not stand-ins.
+        f"{_slice(src, '  function localCandidateKeys(', '  async function canAutoLoad(')}\n"
         "const attempted: string[] = [];\n"
         "const isDirectGgufPath = helpers.isDirectGgufPath;\n"
         "const localModelIsGguf = helpers.localModelIsGguf;\n"
@@ -563,6 +576,61 @@ def test_a_clean_sweep_blacklists_nothing():
     assert out["skippedKeys"] == []
     assert out["loaded"] is True
     assert out["hadNonTrustFailure"] is False
+
+
+# Registering an HF cache as a scan folder surfaces each repo twice: the cached
+# tiers address it by repo id, collect_local_models keeps a custom row for the
+# same snapshot addressed by absolute path. Only cache-derived rows carry
+# model_id, so it is an exact alias between the two spellings.
+REGISTERED_CACHE_ROWS = [
+    {
+        "id": "/hub/models--Org--Foo-GGUF/snapshots/rev0",
+        "path": "/hub/models--Org--Foo-GGUF/snapshots/rev0",
+        "model_id": "Org/Foo-GGUF",
+        "display_name": "Foo-GGUF",
+        "source": "custom",
+        "model_format": "gguf",
+        "updated_at": 2000,
+    },
+    {
+        "path": "/scan/ZGood-GGUF",
+        "source": "custom",
+        "display_name": "ZGood-GGUF",
+        "model_format": "gguf",
+        "updated_at": 1000,
+    },
+]
+
+
+def test_a_cached_failure_is_not_retried_by_its_registered_cache_row():
+    """The cached GGUF tier runs first and records its failure under the repo
+    id. The same snapshot arrives in the sweep under its absolute path, so
+    without the alias it spends a second slot of the three-attempt budget."""
+    out = _run_local_sweep(
+        REGISTERED_CACHE_ROWS,
+        failing = [],
+        preskipped = ["gguf:org/foo-gguf:q4_k_m"],
+    )
+
+    assert out["attempted"] == ["gguf|/scan/ZGood-GGUF|Q4_K_M"]
+    assert out["loadAttempts"] == 1
+    assert out["loaded"] is True
+
+
+def test_a_registered_cache_row_records_both_spellings_when_it_fails():
+    """Recorded the other way too, so the cached safetensors fallback that runs
+    after the sweep does not retry the same snapshot under its Hub id."""
+    out = _run_local_sweep(
+        REGISTERED_CACHE_ROWS,
+        failing = [],
+        gguf_folder_fail = "/hub/models--Org--Foo-GGUF/snapshots/rev0",
+    )
+
+    assert out["skippedKeys"] == [
+        "gguf:/hub/models--org--foo-gguf/snapshots/rev0:q4_k_m",
+        "gguf:org/foo-gguf:q4_k_m",
+    ]
+    assert out["loaded"] is True
 
 
 # A scan folder that is itself an HF cache surfaces snapshot rows as "custom".
