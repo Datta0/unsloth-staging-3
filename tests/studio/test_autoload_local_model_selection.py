@@ -1078,4 +1078,3 @@ def test_a_successful_cached_gguf_load_records_nothing():
     assert out["loaded"] is True
     assert out["skippedKeys"] == []
     assert out["hadNonTrustFailure"] is False
-
