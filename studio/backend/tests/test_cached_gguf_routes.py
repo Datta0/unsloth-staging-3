@@ -835,7 +835,13 @@ def test_list_cached_models_includes_repo_with_only_mmproj_gguf(monkeypatch, tmp
 
     result = asyncio.run(models_route.list_cached_models(current_subject = "test-user"))
 
-    assert result["cached"] == [{"repo_id": "Org/MmprojAux", "size_bytes": 15_000}]
+    assert result["cached"] == [
+        {
+            "repo_id": "Org/MmprojAux",
+            "size_bytes": 15_000,
+            "cache_path": str(mmproj_aux.repo_path),
+        },
+    ]
 
 
 def test_list_cached_gguf_includes_vision_repo_with_main_gguf_and_mmproj(monkeypatch, tmp_path):
@@ -1197,3 +1203,30 @@ def test_legacy_delete_delegates_to_shared_service(monkeypatch):
 
     assert result == {"status": "deleted", "repo_id": "org/repo"}
     assert calls == [("org/repo", None, "token", "/data/hf/hub")]
+
+
+def test_cached_models_rows_report_the_cache_they_came_from(monkeypatch, tmp_path):
+    """Rows are collapsed by repo id across every scanned cache, so a caller that
+    has to tell one copy from another (a delete, or auto-load matching a
+    registered cache folder's local row) needs the owning cache dir. The GGUF
+    listing already reports it."""
+    repo_path = tmp_path / "models--BAAI--bge-small-en-v1.5"
+    scan = SimpleNamespace(
+        repos = [
+            _repo(
+                "BAAI/bge-small-en-v1.5",
+                [_file("model.safetensors", 20)],
+                repo_path,
+            ),
+        ],
+    )
+    monkeypatch.setattr(models_route, "_all_hf_cache_scans", lambda: [scan])
+
+    out = asyncio.run(
+        models_route.list_cached_models(current_subject = "test", hf_token = None)
+    )
+
+    [row] = out["cached"]
+    assert row["repo_id"] == "BAAI/bge-small-en-v1.5"
+    assert row["cache_path"] == str(repo_path)
+

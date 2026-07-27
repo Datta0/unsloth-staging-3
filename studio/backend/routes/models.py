@@ -3224,6 +3224,12 @@ async def list_cached_models(
                         row = {
                             "repo_id": repo_id,
                             "size_bytes": total_size,
+                            # Which cache this copy was read from, like the GGUF
+                            # listing. Callers that address the same repo by path
+                            # (a delete, or auto-load matching a registered cache
+                            # folder's row) need to know which copy this is, since
+                            # the rows are collapsed by repo id across caches.
+                            "cache_path": str(repo_info.repo_path),
                         }
                         # Keep the newest timestamp across duplicate caches;
                         # attach only when known so absent rows sort as oldest.

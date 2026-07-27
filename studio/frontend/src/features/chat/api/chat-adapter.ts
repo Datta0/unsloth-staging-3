@@ -1500,10 +1500,17 @@ async function autoLoadSmallestModel(): Promise<{
   let hadNonTrustFailure = false;
   let loadAttempts = 0;
   const skippedAutoLoadCandidates = new Set<string>();
-  // The picker gates its local MLX rows on the same value. The store holds a
-  // browser-derived fallback until /api/health answers, which fails open (no
-  // filtering) rather than hiding a Mac's own MLX models.
-  const isMac = usePlatformStore.getState().deviceType === "mac";
+  // Whether this host can actually run an MLX build. device_type alone is not
+  // enough: /api/health derives it from sys.platform, so an Intel Mac and an
+  // Apple Silicon Mac with a missing or broken MLX stack both report "mac" while
+  // detect_hardware selects CPU. It records why in CHAT_ONLY_REASON, which is the
+  // signal used here. Unknown reads as capable, so an unfetched store or a real
+  // MLX Mac never has its own models filtered out.
+  const platform = usePlatformStore.getState();
+  const hostRunsMlx =
+    platform.deviceType === "mac" &&
+    platform.chatOnlyReason !== "mlx_unavailable" &&
+    platform.chatOnlyReason !== "intel_mac";
   // Filled in from the cached listings below, before any local tier runs.
   const cachedRepoDirs: { repoId: string; cachePath: string }[] = [];
 
@@ -1939,7 +1946,7 @@ async function autoLoadSmallestModel(): Promise<{
       models.filter(
         (model) =>
           isAutoLoadLocalModel(model) &&
-          !isUnsupportedMlxLocalModel(model, isMac),
+          !isUnsupportedMlxLocalModel(model, hostRunsMlx),
       ),
       preferred.id,
     );
@@ -1992,7 +1999,7 @@ async function autoLoadSmallestModel(): Promise<{
       models.filter(
         (model) =>
           isAutoLoadLocalModel(model) &&
-          !isUnsupportedMlxLocalModel(model, isMac),
+          !isUnsupportedMlxLocalModel(model, hostRunsMlx),
       ),
     );
     if (localModels.length === 0) {

@@ -92,14 +92,18 @@ export function isAutoLoadLocalModel(model: LocalModelInfo): boolean {
  * the MLX runner purely from the detected device, so anywhere else the checkpoint
  * falls through to the transformers worker and cannot load; /validate has no MLX
  * preflight, so the candidate passes the guard, spends one of the three auto-load
- * attempts and only then fails. The model picker gates its local MLX rows on the
- * same `deviceType` for the same reason. Name-based, like the picker: the
- * inventory carries no runtime field. */
+ * attempts and only then fails.
+ *
+ * `hostRunsMlx` is narrower than "is a Mac", which is what the picker gates on:
+ * `/api/health` derives `device_type` from `sys.platform` alone, so an Intel Mac
+ * and an Apple Silicon Mac whose MLX stack is missing or broken both report
+ * "mac" while `detect_hardware` falls through to CPU. Name-based matching, like
+ * the picker: the inventory carries no runtime field. */
 export function isUnsupportedMlxLocalModel(
   model: LocalModelInfo,
-  isMac: boolean,
+  hostRunsMlx: boolean,
 ): boolean {
-  if (isMac) {
+  if (hostRunsMlx) {
     return false;
   }
   const modelId = model.model_id ?? "";

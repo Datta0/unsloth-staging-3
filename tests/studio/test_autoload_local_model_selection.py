@@ -311,7 +311,7 @@ def _run_local_gguf_variants(*, failing_quant: str, preferred: str | None = None
         "let hadNonTrustFailure = false;\n"
         "const skippedAutoLoadCandidates = new Set<string>();\n"
         "const cachedRepoDirs: any[] = [];\n"
-        "const isMac = false;\n"
+        "const hostRunsMlx = false;\n"
         "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
         # The local tiers consult the skip set through these helpers, so the
         # sliced functions need the real implementations, not stand-ins.
@@ -396,7 +396,7 @@ def _run_remembered_local(
         "let hadNonTrustFailure = false;\n"
         "const skippedAutoLoadCandidates = new Set<string>();\n"
         "const cachedRepoDirs: any[] = [];\n"
-        f"const isMac = {json.dumps(is_mac)};\n"
+        f"const hostRunsMlx = {json.dumps(is_mac)};\n"
         "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
         # The local tiers consult the skip set through these helpers, so the
         # sliced functions need the real implementations, not stand-ins.
@@ -499,7 +499,7 @@ def _run_local_sweep(
         "const localModelIsGguf = helpers.localModelIsGguf;\n"
         "const isAutoLoadLocalModel = helpers.isAutoLoadLocalModel;\n"
         "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
-        f"const isMac = {json.dumps(is_mac)};\n"
+        f"const hostRunsMlx = {json.dumps(is_mac)};\n"
         f"const cachedRepoDirs = {json.dumps(cached_repo_dirs or [])};\n"
         "const sortLocalModelsForAutoLoad = helpers.sortLocalModelsForAutoLoad;\n"
         "function hasBigEndianGgufMarker(_p: string) { return false; }\n"
@@ -975,3 +975,33 @@ def test_only_the_cached_copy_is_aliased_not_a_same_named_repo_elsewhere():
 
     assert out["attempted"] == ["gguf|/hubB/models--Org--Foo-GGUF/snapshots/rev0|Q4_K_M"]
     assert out["loaded"] is True
+
+
+def test_the_mlx_gate_reads_a_capability_not_the_os_family():
+    """/api/health derives device_type from sys.platform, so an Intel Mac and an
+    Apple Silicon Mac with a broken MLX stack both report "mac" while
+    detect_hardware falls through to CPU and records why. The adapter has to key
+    off that reason, not off the OS."""
+    src = ADAPTER.read_text()
+    gate = _slice(src, "  const hostRunsMlx =", ";\n")
+    assert 'platform.deviceType === "mac"' in gate
+    assert 'platform.chatOnlyReason !== "mlx_unavailable"' in gate
+    assert 'platform.chatOnlyReason !== "intel_mac"' in gate
+    # Both reason strings come from hardware.py's CPU fallback.
+    hardware = _source_path("studio/backend/utils/hardware/hardware.py").read_text()
+    assert 'CHAT_ONLY_REASON = "mlx_unavailable"' in hardware
+    assert 'CHAT_ONLY_REASON = "intel_mac"' in hardware
+
+
+def test_the_cached_safetensors_listing_carries_its_cache_path():
+    """The alias matches a local row against the cache dir its cached candidate
+    was read from, so the safetensors listing has to report one like the GGUF
+    listing does, or the alias is inert for the kind: "model" tier."""
+    routes = _source_path("studio/backend/routes/models.py").read_text()
+    body = _slice(
+        routes,
+        "async def list_cached_models(",
+        "@router.delete(\"/delete-cached\")",
+    )
+    assert '"cache_path": str(repo_info.repo_path),' in body
+
