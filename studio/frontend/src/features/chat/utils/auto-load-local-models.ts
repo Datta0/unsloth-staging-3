@@ -48,23 +48,29 @@ export function isGgufCompanionPath(path: string): boolean {
   return shard !== null && Number(shard[1]) > 1;
 }
 
-/** Formats the backend reports when it positively identified non-GGUF weights.
- * Anything else (gguf, or a folder it could not classify) keeps the companion
- * rules, so a directory holding only companion GGUFs is still refused. */
-const NON_GGUF_LOCAL_FORMATS = new Set(["safetensors", "adapter", "checkpoint"]);
-
 /** Local models outside the HF cache that auto-load should consider. Companions
  * and partial downloads are never loadable. The companion rules apply to GGUF
  * rows only, like the backend predicates they mirror (which return False for any
- * non-`.gguf` path): a safetensors checkpoint in an `mtp-...` folder is real. */
+ * non-`.gguf` path): a safetensors checkpoint in an `mtp-...` folder is real.
+ *
+ * The classification has to be positive rather than "not a known non-GGUF
+ * format". `/api/models/local` reports only `"gguf"` or nothing: every
+ * `model_format` in `routes/models.py` is the literal `"gguf"` or comes from
+ * `_dir_model_format`, which returns `"gguf"` or `None`. The richer vocabulary
+ * ("safetensors", "adapter", "unknown") belongs to the hub inventory schema,
+ * which feeds the picker, not this path, so keying off it never matches a real
+ * row and leaves genuine checkpoints under `mtp-.../MTP/mmproj...` unloadable.
+ *
+ * The case that gives up: a directory the scanner left unclassified because its
+ * only GGUFs are mmproj projectors, and which is also named like a companion.
+ * That one becomes a candidate whose load fails and is skipped, rather than a
+ * real checkpoint that can never be auto-loaded at all. Directories holding a
+ * main GGUF (MTP drafters included) are classified `"gguf"` and still refused. */
 export function isAutoLoadLocalModel(model: LocalModelInfo): boolean {
   if (model.partial) {
     return false;
   }
-  if (
-    !NON_GGUF_LOCAL_FORMATS.has(model.model_format ?? "") &&
-    isGgufCompanionPath(model.path)
-  ) {
+  if (localModelIsGguf(model) && isGgufCompanionPath(model.path)) {
     return false;
   }
   return (

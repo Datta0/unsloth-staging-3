@@ -261,13 +261,17 @@ def test_companion_filtering_is_scoped_to_gguf_entries():
     ``is_mtp_drafter_path``, ``core/inference/llama_cpp.py``
     ``_is_companion_gguf_path``) return False for any non-``.gguf`` path, so a
     safetensors checkpoint in an ``mtp-...``/``MTP``/``mmproj`` folder is a real
-    model. Every actual companion still carries a GGUF signal."""
+    model. Every actual companion still carries a GGUF signal.
+
+    The rows use the vocabulary ``/api/models/local`` actually reports: a folder
+    holding non-GGUF weights comes back with no ``model_format`` at all, because
+    ``_scan_models_dir`` and ``_dir_model_format`` emit ``"gguf"`` or nothing."""
     out = _run(
         "const nonGguf = [\n"
-        "  { path: '/models/mtp-qwen3-next-80b-a3b', model_format: 'safetensors' },\n"
-        "  { path: '/models/mmproj-training-run', model_format: 'safetensors' },\n"
-        "  { path: '/models/MTP', model_format: 'safetensors' },\n"
-        "  { path: '/models/DeepSeek-V4/mtp/stage2', model_format: 'safetensors' },\n"
+        "  { path: '/models/mtp-qwen3-next-80b-a3b' },\n"
+        "  { path: '/models/mmproj-training-run' },\n"
+        "  { path: '/models/MTP' },\n"
+        "  { path: '/models/DeepSeek-V4/mtp/stage2' },\n"
         "];\n"
         "const companions = [\n"
         "  { path: '/m/a-GGUF/mmproj-F16.gguf', model_format: 'gguf' },\n"
@@ -280,7 +284,7 @@ def test_companion_filtering_is_scoped_to_gguf_entries():
         "  nonGguf: nonGguf.map((o) => helpers.isAutoLoadLocalModel(M(o))),\n"
         "  companions: companions.map((o) => helpers.isAutoLoadLocalModel(M(o))),\n"
         "  partialStillSkipped: helpers.isAutoLoadLocalModel(\n"
-        "    M({ path: '/models/mtp-qwen3-next-80b-a3b', model_format: 'safetensors', partial: true })),\n"
+        "    M({ path: '/models/mtp-qwen3-next-80b-a3b', partial: true })),\n"
         "}));\n"
     )
     assert out == {
@@ -636,30 +640,70 @@ def test_manual_local_picks_are_remembered_as_the_last_used_model():
     assert out == [expected for _, expected in MANUAL_LOAD_CASES]
 
 
-def test_companion_filter_still_covers_unclassified_folders():
-    """A directory holding only companion GGUFs has no MAIN gguf file
-    (``_is_main_gguf_filename`` drops mmproj/MTP), so ``_classify_local_path``
-    falls back to ``model_format="unknown"``. Scoping the companion rules must
-    key off a positively non-GGUF format, not off ``localModelIsGguf``, or such
-    a folder becomes an auto-load candidate on the ``kind: "model"`` path."""
+def test_local_inventory_only_reports_gguf_or_no_format():
+    """The companion scoping keys off a positive GGUF classification, which is
+    only sound because ``/api/models/local`` has no non-GGUF vocabulary. Pin
+    that: every ``model_format`` the route sets is the literal ``"gguf"`` or
+    comes from ``_dir_model_format``, which returns ``"gguf"`` or ``None``.
+
+    The richer set ("safetensors", "adapter", "unknown") is the hub inventory
+    schema, which feeds the picker rather than auto-load. Reintroducing an
+    allowlist of those names here silently matches nothing."""
+    source = _source_path("studio/backend/routes/models.py").read_text()
+    assignments = {
+        line.strip()
+        for line in source.splitlines()
+        if line.strip().startswith("model_format =")
+    }
+    assert assignments, "no model_format assignments found; path moved?"
+    for assignment in assignments:
+        value = assignment.split("=", 1)[1].strip().rstrip(",")
+        assert (
+            value.startswith("_dir_model_format(")
+            or value.startswith("model_format")
+            or value == '"gguf"'
+            or value.startswith('"gguf" if ')
+            or value == "("  # multi-line _dir_model_format call
+        ), assignment
+    for dead in ('model_format = "safetensors"', 'model_format = "adapter"',
+                 'model_format = "checkpoint"', 'model_format = "unknown"'):
+        assert dead not in source
+
+
+def test_a_companion_named_checkpoint_is_still_loadable():
+    """The bug the scoping exists for: a real non-GGUF checkpoint whose folder
+    is named like a companion. The scanner reports no format for it (it holds no
+    GGUF), so the companion predicate must not judge it."""
     out = _run(
         "console.log(JSON.stringify({\n"
-        "  unknownMtpDir: helpers.isAutoLoadLocalModel(M({\n"
-        "    path: '/models/Gemma-4-26B-A4B-GGUF/MTP', model_format: 'unknown' })),\n"
-        "  noFormatMtpDir: helpers.isAutoLoadLocalModel(M({\n"
-        "    path: '/models/Gemma-4-26B-A4B-GGUF/MTP' })),\n"
-        "  unknownMmprojDir: helpers.isAutoLoadLocalModel(M({\n"
-        "    path: '/models/repo/mmproj-parts', model_format: 'unknown' })),\n"
-        "  safetensorsMtpDir: helpers.isAutoLoadLocalModel(M({\n"
-        "    path: '/models/mtp-qwen3-next-80b-a3b', model_format: 'safetensors' })),\n"
-        "  adapterMmprojDir: helpers.isAutoLoadLocalModel(M({\n"
-        "    path: '/models/mmproj-lora', model_format: 'adapter' })),\n"
+        # No format: a real checkpoint, admitted.
+        "  mtpNamedCheckpoint: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/mtp-qwen3-next-80b-a3b' })),\n"
+        "  mmprojNamedCheckpoint: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/mmproj-training-run' })),\n"
+        # Classified gguf: a real companion, still refused. A folder whose only
+        # GGUFs are MTP drafters is classified "gguf" (_is_main_gguf_filename
+        # drops mmproj only), so this covers the drafter directory too.
+        "  ggufMtpDir: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/Gemma-4-26B-A4B-GGUF/MTP', model_format: 'gguf' })),\n"
+        "  ggufMmprojFile: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/repo/mmproj-F16.gguf', model_format: 'gguf' })),\n"
+        # A .gguf path classifies itself, with or without the hint.
+        "  bareMmprojFile: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/repo/mmproj-F16.gguf' })),\n"
+        "  bareTailShard: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/repo/gemma-Q4_K_M-00002-of-00002.gguf' })),\n"
+        # A -GGUF repo name classifies itself too.
+        "  suffixNamedMtpDir: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/Gemma-GGUF/MTP', display_name: 'Gemma-GGUF' })),\n"
         "}));\n"
     )
     assert out == {
-        "unknownMtpDir": False,
-        "noFormatMtpDir": False,
-        "unknownMmprojDir": False,
-        "safetensorsMtpDir": True,
-        "adapterMmprojDir": True,
+        "mtpNamedCheckpoint": True,
+        "mmprojNamedCheckpoint": True,
+        "ggufMtpDir": False,
+        "ggufMmprojFile": False,
+        "bareMmprojFile": False,
+        "bareTailShard": False,
+        "suffixNamedMtpDir": False,
     }
