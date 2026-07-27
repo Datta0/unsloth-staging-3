@@ -28,6 +28,10 @@ class CachedModelRepo(BaseModel):
     repo_id: str
     size_bytes: int
     last_modified: Optional[float] = None
+    # Which cache this copy was read from. Rows are collapsed by repo id across
+    # every scanned cache, so a caller addressing one specific copy by path needs
+    # it. Declared here because response_model filtering drops undeclared keys.
+    cache_path: Optional[str] = None
 
 
 class CachedModelsResponse(BaseModel):

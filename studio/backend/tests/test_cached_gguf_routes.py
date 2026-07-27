@@ -1227,3 +1227,10 @@ def test_cached_models_rows_report_the_cache_they_came_from(monkeypatch, tmp_pat
     [row] = out["cached"]
     assert row["repo_id"] == "BAAI/bge-small-en-v1.5"
     assert row["cache_path"] == str(repo_path)
+
+    # The route declares response_model = CachedModelsResponse, and FastAPI drops
+    # any key the model does not declare, so asserting on the raw return value
+    # alone would not prove the field reaches the client.
+    serialized = models_route.CachedModelsResponse(**out).model_dump()
+    assert serialized["cached"][0]["cache_path"] == str(repo_path)
+
