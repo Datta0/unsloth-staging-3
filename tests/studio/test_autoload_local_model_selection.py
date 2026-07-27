@@ -634,3 +634,32 @@ def test_manual_local_picks_are_remembered_as_the_last_used_model():
     out = _run_manual_load_record_guard([case for case, _ in MANUAL_LOAD_CASES])
 
     assert out == [expected for _, expected in MANUAL_LOAD_CASES]
+
+
+def test_companion_filter_still_covers_unclassified_folders():
+    """A directory holding only companion GGUFs has no MAIN gguf file
+    (``_is_main_gguf_filename`` drops mmproj/MTP), so ``_classify_local_path``
+    falls back to ``model_format="unknown"``. Scoping the companion rules must
+    key off a positively non-GGUF format, not off ``localModelIsGguf``, or such
+    a folder becomes an auto-load candidate on the ``kind: "model"`` path."""
+    out = _run(
+        "console.log(JSON.stringify({\n"
+        "  unknownMtpDir: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/Gemma-4-26B-A4B-GGUF/MTP', model_format: 'unknown' })),\n"
+        "  noFormatMtpDir: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/Gemma-4-26B-A4B-GGUF/MTP' })),\n"
+        "  unknownMmprojDir: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/repo/mmproj-parts', model_format: 'unknown' })),\n"
+        "  safetensorsMtpDir: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/mtp-qwen3-next-80b-a3b', model_format: 'safetensors' })),\n"
+        "  adapterMmprojDir: helpers.isAutoLoadLocalModel(M({\n"
+        "    path: '/models/mmproj-lora', model_format: 'adapter' })),\n"
+        "}));\n"
+    )
+    assert out == {
+        "unknownMtpDir": False,
+        "noFormatMtpDir": False,
+        "unknownMmprojDir": False,
+        "safetensorsMtpDir": True,
+        "adapterMmprojDir": True,
+    }

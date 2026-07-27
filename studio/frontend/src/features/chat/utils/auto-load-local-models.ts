@@ -48,6 +48,11 @@ export function isGgufCompanionPath(path: string): boolean {
   return shard !== null && Number(shard[1]) > 1;
 }
 
+/** Formats the backend reports when it positively identified non-GGUF weights.
+ * Anything else (gguf, or a folder it could not classify) keeps the companion
+ * rules, so a directory holding only companion GGUFs is still refused. */
+const NON_GGUF_LOCAL_FORMATS = new Set(["safetensors", "adapter", "checkpoint"]);
+
 /** Local models outside the HF cache that auto-load should consider. Companions
  * and partial downloads are never loadable. The companion rules apply to GGUF
  * rows only, like the backend predicates they mirror (which return False for any
@@ -56,7 +61,10 @@ export function isAutoLoadLocalModel(model: LocalModelInfo): boolean {
   if (model.partial) {
     return false;
   }
-  if (localModelIsGguf(model) && isGgufCompanionPath(model.path)) {
+  if (
+    !NON_GGUF_LOCAL_FORMATS.has(model.model_format ?? "") &&
+    isGgufCompanionPath(model.path)
+  ) {
     return false;
   }
   return (
