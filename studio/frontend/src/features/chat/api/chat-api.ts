@@ -348,7 +348,8 @@ export interface LocalModelInfo {
   // Backend-detected weights format ("gguf" when known), so the UI can
   // classify scanned folders whose name lacks a -GGUF suffix.
   model_format?: string | null;
-  /** The copy on disk is an incomplete download, so it is not loadable. */
+  // Set when a cached snapshot holds an incomplete download, so consumers can skip
+  // weights that cannot load yet.
   partial?: boolean;
   updated_at?: number | null;
 }
