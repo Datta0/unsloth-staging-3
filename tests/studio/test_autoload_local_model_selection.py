@@ -1138,3 +1138,21 @@ def test_a_remembered_repo_id_only_matches_a_cache_snapshot():
         "lmStudioByPath": "/lmstudio/Org/Foo",
         "bothPrefersCache": "/hub/models--Org--Foo/snapshots/rev0",
     }
+
+
+def test_the_mlx_test_is_scoped_to_the_entrys_own_segment():
+    """A parent directory named like an MLX drive must not condemn every
+    checkpoint under it, the same false positive localModelIsGguf guards."""
+    out = _run(
+        "console.log(JSON.stringify({\n"
+        "  parentOnly: helpers.isUnsupportedMlxLocalModel(M({\n"
+        "    path: '/mnt/my-MLX-models/Qwen3-4B', display_name: 'Qwen3-4B' }), false),\n"
+        "  ownName: helpers.isUnsupportedMlxLocalModel(M({\n"
+        "    path: '/mnt/models/Qwen3-4B-MLX', display_name: 'Qwen3-4B-MLX' }), false),\n"
+        "  byRepoId: helpers.isUnsupportedMlxLocalModel(M({\n"
+        "    path: '/lmstudio/mlx-community/Qwen3-4B', display_name: 'Qwen3-4B',\n"
+        "    model_id: 'mlx-community/Qwen3-4B' }), false),\n"
+        "}));\n"
+    )
+    assert out == {"parentOnly": False, "ownName": True, "byRepoId": True}
+

@@ -117,8 +117,12 @@ export function isUnsupportedMlxLocalModel(
     return false;
   }
   const modelId = model.model_id ?? "";
+  // Scoped to the entry's own segment, like localModelIsGguf, so a parent such
+  // as /mnt/my-MLX-models/ cannot condemn every checkpoint underneath it.
+  const segments = pathSegments(model.id);
+  const name = segments[segments.length - 1] ?? model.id;
   return (
-    MLX_RE.test(model.id) ||
+    MLX_RE.test(name) ||
     MLX_RE.test(model.display_name) ||
     MLX_RE.test(modelId) ||
     modelId.toLowerCase().startsWith(MLX_REPO_PREFIX)

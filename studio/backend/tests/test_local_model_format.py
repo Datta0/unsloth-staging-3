@@ -265,3 +265,63 @@ def test_weightless_lmstudio_rows_are_flagged_partial(tmp_path):
 
     assert rows["interrupted"] is True
     assert rows["real"] is False
+
+
+def test_projector_only_directory_is_flagged_partial(tmp_path):
+    """A projector is not a servable weight, so a folder holding a config and an
+    mmproj alone has nothing to load."""
+    d = tmp_path / "vision-model"
+    _touch(d / "config.json")
+    _touch(d / "mmproj-F16.gguf")
+
+    [row] = [r for r in models_route._scan_models_dir(tmp_path) if r.display_name == "vision-model"]
+
+    assert row.partial is True
+
+
+def test_lmstudio_bin_checkpoint_is_not_flagged_partial(tmp_path):
+    """A PyTorch .bin checkpoint is real weights: _is_model_directory and
+    _has_non_gguf_weights both recognise the name, so the LM Studio branch has
+    to as well or a valid model is excluded from auto-load."""
+    real = tmp_path / "publisher" / "bin-model"
+    _touch(real / "config.json")
+    _touch(real / "pytorch_model.bin")
+    companion = tmp_path / "publisher" / "tokenizer-only"
+    _touch(companion / "config.json")
+    _touch(companion / "tokenizer.bin")
+
+    rows = {r.display_name: r.partial for r in models_route._scan_lmstudio_dir(tmp_path)}
+
+    assert rows["bin-model"] is False
+    assert rows["tokenizer-only"] is True
+
+
+def test_local_variants_drop_a_split_missing_its_first_shard(tmp_path):
+    """Three distinct indices satisfy a bare count while shard 1 is absent."""
+    from utils.models.model_config import list_local_gguf_variants
+
+    d = tmp_path / "repo"
+    d.mkdir()
+    for index in (2, 3, 4):
+        _touch(d / f"m-Q8_0-{index:05d}-of-00004.gguf")
+
+    variants, _ = list_local_gguf_variants(str(d))
+
+    assert variants == []
+
+
+def test_local_variants_drop_mixed_split_generations(tmp_path):
+    """An interrupted replacement leaves shards of two different splits under one
+    quant label; neither set is whole, so the quant is not offered."""
+    from utils.models.model_config import list_local_gguf_variants
+
+    d = tmp_path / "repo"
+    d.mkdir()
+    _touch(d / "m-Q4_K_M-00001-of-00002.gguf")
+    _touch(d / "m-Q4_K_M-00002-of-00003.gguf")
+    _touch(d / "m-Q4_K_M-00003-of-00003.gguf")
+
+    variants, _ = list_local_gguf_variants(str(d))
+
+    assert variants == []
+

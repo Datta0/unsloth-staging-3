@@ -1913,10 +1913,11 @@ def list_local_gguf_variants(directory: str) -> tuple[list[GgufVariantInfo], boo
     quant_totals: dict[str, int] = {}
     quant_first_file: dict[str, str] = {}
     # Split quants, so an interrupted download is not offered as usable: llama.cpp
-    # is given shard 1 and fails on the missing siblings. Expected count per quant
-    # from the ``-NNNNN-of-MMMMM`` suffix, against the indices actually present.
-    shard_expected: dict[str, int] = {}
-    shard_seen: dict[str, set[int]] = {}
+    # is given shard 1 and fails on the missing siblings. Keyed by split identity,
+    # the ``(quant, prefix, declared total)`` triple, because an interrupted
+    # replacement can leave shards of two different splits under one quant label
+    # and a bare count would accept the mixture.
+    shard_seen: dict[tuple[str, str, int], set[int]] = {}
     has_vision = False
 
     # Recurse so variant-specific subdirs (e.g. ``BF16/...gguf`` used by
@@ -1944,13 +1945,15 @@ def list_local_gguf_variants(directory: str) -> tuple[list[GgufVariantInfo], boo
             quant_first_file[quant] = rel
         shard = _GGUF_SPLIT_FILE_RE.match(f.name)
         if shard:
-            shard_expected[quant] = int(shard.group("total"))
-            shard_seen.setdefault(quant, set()).add(int(shard.group("index")))
+            identity = (quant, shard.group("prefix"), int(shard.group("total")))
+            shard_seen.setdefault(identity, set()).add(int(shard.group("index")))
 
     # An incomplete split is not a variant anyone can load, and its short byte
-    # total would otherwise make it look like the cheapest one to try.
-    for quant, expected in shard_expected.items():
-        if len(shard_seen.get(quant, set())) != expected:
+    # total would otherwise make it look like the cheapest one to try. Every split
+    # under a quant has to be whole: _find_local_gguf_by_variant returns the first
+    # match by name, so one broken set beside a good one still breaks the load.
+    for (quant, _prefix, total), indices in shard_seen.items():
+        if indices != set(range(1, total + 1)):
             quant_totals.pop(quant, None)
             quant_first_file.pop(quant, None)
 

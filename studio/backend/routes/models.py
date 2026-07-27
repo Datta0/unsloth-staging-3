@@ -357,7 +357,9 @@ def _scan_models_dir(models_dir: Path, *, limit: int | None = None) -> List[Loca
                 path = str(child),
                 source = "models_dir",
                 model_format = model_format,
-                partial = not (has_gguf or has_non_gguf_weights),
+                # A projector is not a servable weight, so an mmproj-only
+                # folder counts as having nothing to load.
+                partial = not (has_main_gguf or has_non_gguf_weights),
                 updated_at = updated_at,
             ),
         )
@@ -549,10 +551,18 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
             for model_dir in child.iterdir():
                 try:
                     if model_dir.is_dir():
-                        has_weights = any(model_dir.glob("*.gguf")) or any(
-                            model_dir.glob("*.safetensors")
+                        gguf_names = [f.name for f in model_dir.glob("*.gguf")]
+                        # _has_non_gguf_weights is the canonical non-GGUF test:
+                        # it covers .safetensors and the PyTorch weight .bin
+                        # names, and ignores companions like tokenizer.bin.
+                        has_weights = any(
+                            _is_main_gguf_filename(name) for name in gguf_names
+                        ) or _has_non_gguf_weights(model_dir)
+                        has_model = (
+                            bool(gguf_names)
+                            or (model_dir / "config.json").exists()
+                            or any(model_dir.glob("*.safetensors"))
                         )
-                        has_model = has_weights or (model_dir / "config.json").exists()
                         if not has_model:
                             continue
                         model_id = f"{child.name}/{model_dir.name}"
