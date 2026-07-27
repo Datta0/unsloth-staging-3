@@ -265,4 +265,3 @@ def test_weightless_lmstudio_rows_are_flagged_partial(tmp_path):
 
     assert rows["interrupted"] is True
     assert rows["real"] is False
-

@@ -552,9 +552,7 @@ def _scan_lmstudio_dir(lm_dir: Path) -> List[LocalModelInfo]:
                         has_weights = any(model_dir.glob("*.gguf")) or any(
                             model_dir.glob("*.safetensors")
                         )
-                        has_model = (
-                            has_weights or (model_dir / "config.json").exists()
-                        )
+                        has_model = has_weights or (model_dir / "config.json").exists()
                         if not has_model:
                             continue
                         model_id = f"{child.name}/{model_dir.name}"
