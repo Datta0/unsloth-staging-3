@@ -1233,4 +1233,3 @@ def test_cached_models_rows_report_the_cache_they_came_from(monkeypatch, tmp_pat
     # alone would not prove the field reaches the client.
     serialized = models_route.CachedModelsResponse(**out).model_dump()
     assert serialized["cached"][0]["cache_path"] == str(repo_path)
-
