@@ -407,6 +407,7 @@ def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
         f"const ggufVariant = {json.dumps(gguf_variant)};\n"
         "const models = [{\n"
         "  id: '/custom/MyModel', model_id: 'MyModel', display_name: 'MyModel',\n"
+        "  active_cache: false,\n"
         # Only "gguf" or nothing: the vocabulary /api/models/local reports.
         "  model_format: kind === 'gguf' ? 'gguf' : undefined,\n"
         "}];\n"
@@ -449,6 +450,7 @@ def _run_local_sweep(
     failing: list[str],
     gguf_folder_fail: str | None = None,
     preskipped: list[str] | None = None,
+    is_mac: bool = False,
 ):
     """Run the REAL ``tryAutoLoadLocalModels`` (driving the real
     ``tryAutoLoadLocalGgufModel``) over *models*, failing every load whose id is
@@ -481,6 +483,9 @@ def _run_local_sweep(
         "const isDirectGgufPath = helpers.isDirectGgufPath;\n"
         "const localModelIsGguf = helpers.localModelIsGguf;\n"
         "const isAutoLoadLocalModel = helpers.isAutoLoadLocalModel;\n"
+        "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
+        f"const usePlatformStore = {{ getState: () => ({{ deviceType: "
+        f"{json.dumps('mac' if is_mac else 'linux')} }}) }};\n"
         "const sortLocalModelsForAutoLoad = helpers.sortLocalModelsForAutoLoad;\n"
         "function hasBigEndianGgufMarker(_p: string) { return false; }\n"
         "function isAutoLoadableGgufVariant(_v: any) { return true; }\n"
@@ -589,6 +594,8 @@ REGISTERED_CACHE_ROWS = [
         "model_id": "Org/Foo-GGUF",
         "display_name": "Foo-GGUF",
         "source": "custom",
+        # Set by _scan_hf_cache alone: this row is the cache duplicate.
+        "active_cache": False,
         "model_format": "gguf",
         "updated_at": 2000,
     },
@@ -777,3 +784,109 @@ def test_a_companion_named_checkpoint_is_still_loadable():
         "bareTailShard": False,
         "suffixNamedMtpDir": False,
     }
+
+
+# An LM Studio row carries a `publisher/model-name` model_id of the same shape as
+# a Hub repo id, for an independent copy with its own files on disk.
+LMSTUDIO_LOOKALIKE = [
+    {
+        "id": "/lmstudio/unsloth/gemma-3-4b-it-GGUF",
+        "path": "/lmstudio/unsloth/gemma-3-4b-it-GGUF",
+        "model_id": "unsloth/gemma-3-4b-it-GGUF",
+        "display_name": "gemma-3-4b-it-GGUF",
+        "source": "lmstudio",
+        "model_format": "gguf",
+        "updated_at": 2000,
+    },
+]
+
+
+def test_an_lmstudio_copy_is_not_aliased_to_a_cached_repo():
+    """The alias is only sound for the registered-cache duplicate. An LM Studio
+    copy is a different set of files under the same Hub-shaped name, so a cached
+    failure must not blacklist it (and its own failure must not blacklist the
+    cached repo in the fallback below)."""
+    honoured = _run_local_sweep(
+        LMSTUDIO_LOOKALIKE,
+        failing = [],
+        preskipped = ["gguf:unsloth/gemma-3-4b-it-gguf:q4_k_m"],
+    )
+    assert honoured["attempted"] == ["gguf|/lmstudio/unsloth/gemma-3-4b-it-GGUF|Q4_K_M"]
+
+    recorded = _run_local_sweep(
+        LMSTUDIO_LOOKALIKE,
+        failing = [],
+        gguf_folder_fail = "/lmstudio/unsloth/gemma-3-4b-it-GGUF",
+    )
+    assert recorded["skippedKeys"] == ["gguf:/lmstudio/unsloth/gemma-3-4b-it-gguf:q4_k_m"]
+
+
+def test_mlx_builds_are_only_candidates_on_a_mac():
+    """worker.py picks the MLX runner from the detected device, and /validate has
+    no MLX preflight, so off a Mac each MLX row spends an attempt and then fails."""
+    out = _run(
+        "const rows = [\n"
+        "  { path: '/models/Qwen3-4B-MLX', display_name: 'Qwen3-4B-MLX' },\n"
+        "  { path: '/models/gemma-3-4b-it-MLX-4bit', display_name: 'gemma-3-4b-it-MLX-4bit' },\n"
+        "  { id: 'mlx-community/Qwen3-4B', path: '/models/x', display_name: 'Qwen3-4B',\n"
+        "    model_id: 'mlx-community/Qwen3-4B' },\n"
+        "];\n"
+        "const notMlx = [\n"
+        "  { path: '/models/Qwen3-4B-GGUF', display_name: 'Qwen3-4B-GGUF' },\n"
+        # "MLX" inside a longer word must not match, like the picker's rule.
+        "  { path: '/models/MLXplorer-7B', display_name: 'MLXplorer-7B' },\n"
+        "];\n"
+        "console.log(JSON.stringify({\n"
+        "  onLinux: rows.map((o) => helpers.isUnsupportedMlxLocalModel(M(o), false)),\n"
+        "  onMac: rows.map((o) => helpers.isUnsupportedMlxLocalModel(M(o), true)),\n"
+        "  nonMlxOnLinux: notMlx.map((o) => helpers.isUnsupportedMlxLocalModel(M(o), false)),\n"
+        "}));\n"
+    )
+    assert out == {
+        "onLinux": [True, True, True],
+        "onMac": [False, False, False],
+        "nonMlxOnLinux": [False, False],
+    }
+
+
+def test_the_mlx_pattern_matches_the_pickers():
+    """The regex is copied so this module keeps no value imports. Pin the two
+    literals against each other so they cannot drift apart."""
+    helpers_src = HELPERS.read_text()
+    picker_src = _source_path(
+        "studio/frontend/src/features/model-picker/components/model-selector/recommended-fit.ts"
+    ).read_text()
+    literal = "/-MLX(?:$|-)/i"
+    assert f"const MLX_RE = {literal};" in helpers_src
+    assert f"const MLX_RE = {literal};" in picker_src
+
+
+MLX_AND_GGUF = [
+    {"path": "/scan/Qwen3-4B-MLX", "display_name": "Qwen3-4B-MLX", "updated_at": 3000},
+    {"path": "/scan/Llama-3-8B-MLX", "display_name": "Llama-3-8B-MLX", "updated_at": 2500},
+    {"path": "/scan/Phi-4-MLX", "display_name": "Phi-4-MLX", "updated_at": 2400},
+    {
+        "path": "/scan/Qwen3-4B-GGUF",
+        "display_name": "Qwen3-4B-GGUF",
+        "model_format": "gguf",
+        "updated_at": 1000,
+    },
+]
+
+
+def test_the_sweep_skips_mlx_rows_off_a_mac():
+    """Three MLX directories sorted ahead of a loadable GGUF would otherwise
+    spend the whole three-attempt budget before reaching it."""
+    out = _run_local_sweep(MLX_AND_GGUF, failing = [], is_mac = False)
+
+    assert out["attempted"] == ["gguf|/scan/Qwen3-4B-GGUF|Q4_K_M"]
+    assert out["loadAttempts"] == 1
+    assert out["loaded"] is True
+
+
+def test_the_sweep_keeps_mlx_rows_on_a_mac():
+    """On a Mac they are the fastest local option, so ordering is untouched."""
+    out = _run_local_sweep(MLX_AND_GGUF, failing = [], is_mac = True)
+
+    assert out["attempted"] == ["model|/scan/Qwen3-4B-MLX|"]
+    assert out["loaded"] is True

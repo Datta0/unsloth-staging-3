@@ -351,6 +351,9 @@ export interface LocalModelInfo {
   // Set when a cached snapshot holds an incomplete download, so consumers can skip
   // weights that cannot load yet.
   partial?: boolean;
+  // Set only by the HF cache scanner, so `false` identifies a row that is a
+  // snapshot of an inactive cache rather than an independent local copy.
+  active_cache?: boolean | null;
   updated_at?: number | null;
 }
 

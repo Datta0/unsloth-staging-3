@@ -2,6 +2,7 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import { getAuthToken } from "@/features/auth";
+import { usePlatformStore } from "@/config/env";
 import { resolveInitialConfig } from "@/features/model-picker";
 import { projectHasSources } from "@/features/rag/api/rag-api";
 import { apiUrl } from "@/lib/api-base";
@@ -79,6 +80,7 @@ import {
 import {
   findLocalModel,
   isAutoLoadLocalModel,
+  isUnsupportedMlxLocalModel,
   isDirectGgufPath,
   localModelIsGguf,
   sortLocalModelsForAutoLoad,
@@ -1503,15 +1505,22 @@ async function autoLoadSmallestModel(): Promise<{
   // model by repo id, while collect_local_models keeps a custom row for the same
   // snapshot addressed by absolute path. Keying a failure by candidate id alone
   // therefore lets one broken model spend a second slot of the attempt budget
-  // under the other spelling. Cache-derived rows are the only local rows that
-  // carry model_id, so it is an exact alias rather than a guess.
+  // under the other spelling.
+  //
+  // Only a cache snapshot gets the alias. model_id alone is not enough: LM Studio
+  // rows carry a `publisher/model-name` model_id of the same shape (and Ollama
+  // rows an `ollama/name:tag` one) for an independent copy with its own files, so
+  // aliasing those would let a broken local copy blacklist a healthy cached repo
+  // of the same name. active_cache is set by _scan_hf_cache alone, and the sweep
+  // already excludes source "hf_cache", so `false` here means exactly the
+  // registered-cache duplicate.
   function localCandidateKeys(
     kind: LastLocalModelKind,
     model: LocalModelInfo,
     ggufVariant: string | null,
   ): string[] {
     const keys = [autoLoadCandidateKey(kind, model.id, ggufVariant)];
-    const alias = model.model_id?.trim();
+    const alias = model.active_cache === false ? model.model_id?.trim() : null;
     if (alias && alias !== model.id) {
       keys.push(autoLoadCandidateKey(kind, alias, ggufVariant));
     }
@@ -1932,8 +1941,17 @@ async function autoLoadSmallestModel(): Promise<{
   async function tryAutoLoadLocalModels(
     models: LocalModelInfo[],
   ): Promise<boolean> {
+    // An MLX build cannot load off a Mac, and it fails only after the guard has
+    // passed and an attempt has been spent, so a few of them would exhaust the
+    // budget ahead of a loadable model. Read once: the store holds a browser
+    // fallback until /api/health answers, and the picker gates on the same value.
+    const isMac = usePlatformStore.getState().deviceType === "mac";
     const localModels = sortLocalModelsForAutoLoad(
-      models.filter(isAutoLoadLocalModel),
+      models.filter(
+        (model) =>
+          isAutoLoadLocalModel(model) &&
+          !isUnsupportedMlxLocalModel(model, isMac),
+      ),
     );
     if (localModels.length === 0) {
       return false;

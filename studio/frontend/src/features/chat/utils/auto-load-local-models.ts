@@ -4,6 +4,14 @@
 import type { LocalModelInfo } from "../api/chat-api";
 
 const GGUF_REPO_SUFFIX_RE = /-GGUF(?:$|-)/i;
+// Kept in step with `isMlxId` in model-selector/recommended-fit.ts, which gates
+// the picker's MLX rows. Copied rather than imported so this module keeps no
+// value imports: it is loaded standalone by its contract tests, and a test pins
+// the two literals against each other.
+const MLX_RE = /-MLX(?:$|-)/i;
+// The publisher LM Studio rows carry for MLX builds, whose folder name alone
+// often has no -MLX token. Mirrors `_looks_like_mlx_repo` in routes/models.py.
+const MLX_REPO_PREFIX = "mlx-community/";
 // Only shard 1 of a split GGUF is loadable; llama.cpp finds the siblings itself.
 const GGUF_TAIL_SHARD_RE = /-(\d{3,})-of-\d{3,}\.gguf$/i;
 
@@ -77,6 +85,29 @@ export function isAutoLoadLocalModel(model: LocalModelInfo): boolean {
     model.source === "custom" ||
     model.source === "models_dir" ||
     model.source === "lmstudio"
+  );
+}
+
+/** An MLX build on a host that cannot run one. `core/inference/worker.py` picks
+ * the MLX runner purely from the detected device, so anywhere else the checkpoint
+ * falls through to the transformers worker and cannot load; /validate has no MLX
+ * preflight, so the candidate passes the guard, spends one of the three auto-load
+ * attempts and only then fails. The model picker gates its local MLX rows on the
+ * same `deviceType` for the same reason. Name-based, like the picker: the
+ * inventory carries no runtime field. */
+export function isUnsupportedMlxLocalModel(
+  model: LocalModelInfo,
+  isMac: boolean,
+): boolean {
+  if (isMac) {
+    return false;
+  }
+  const modelId = model.model_id ?? "";
+  return (
+    MLX_RE.test(model.id) ||
+    MLX_RE.test(model.display_name) ||
+    MLX_RE.test(modelId) ||
+    modelId.toLowerCase().startsWith(MLX_REPO_PREFIX)
   );
 }
 
