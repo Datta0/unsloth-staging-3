@@ -1155,4 +1155,3 @@ def test_the_mlx_test_is_scoped_to_the_entrys_own_segment():
         "}));\n"
     )
     assert out == {"parentOnly": False, "ownName": True, "byRepoId": True}
-

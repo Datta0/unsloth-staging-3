@@ -324,4 +324,3 @@ def test_local_variants_drop_mixed_split_generations(tmp_path):
     variants, _ = list_local_gguf_variants(str(d))
 
     assert variants == []
-
