@@ -1001,7 +1001,6 @@ def test_the_cached_safetensors_listing_carries_its_cache_path():
     body = _slice(
         routes,
         "async def list_cached_models(",
-        "@router.delete(\"/delete-cached\")",
+        '@router.delete("/delete-cached")',
     )
     assert '"cache_path": str(repo_info.repo_path),' in body
-

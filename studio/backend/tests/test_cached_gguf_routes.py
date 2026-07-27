@@ -1222,11 +1222,8 @@ def test_cached_models_rows_report_the_cache_they_came_from(monkeypatch, tmp_pat
     )
     monkeypatch.setattr(models_route, "_all_hf_cache_scans", lambda: [scan])
 
-    out = asyncio.run(
-        models_route.list_cached_models(current_subject = "test", hf_token = None)
-    )
+    out = asyncio.run(models_route.list_cached_models(current_subject = "test", hf_token = None))
 
     [row] = out["cached"]
     assert row["repo_id"] == "BAAI/bge-small-en-v1.5"
     assert row["cache_path"] == str(repo_path)
-
