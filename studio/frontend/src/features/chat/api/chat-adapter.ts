@@ -1500,6 +1500,12 @@ async function autoLoadSmallestModel(): Promise<{
   let hadNonTrustFailure = false;
   let loadAttempts = 0;
   const skippedAutoLoadCandidates = new Set<string>();
+  // The picker gates its local MLX rows on the same value. The store holds a
+  // browser-derived fallback until /api/health answers, which fails open (no
+  // filtering) rather than hiding a Mac's own MLX models.
+  const isMac = usePlatformStore.getState().deviceType === "mac";
+  // Filled in from the cached listings below, before any local tier runs.
+  const cachedRepoDirs: { repoId: string; cachePath: string }[] = [];
 
   // A registered HF cache surfaces its repos twice: the cached tiers address the
   // model by repo id, while collect_local_models keeps a custom row for the same
@@ -1514,13 +1520,47 @@ async function autoLoadSmallestModel(): Promise<{
   // of the same name. active_cache is set by _scan_hf_cache alone, and the sweep
   // already excludes source "hf_cache", so `false` here means exactly the
   // registered-cache duplicate.
+  /** Path containment, tolerating both separators and a trailing slash. */
+  function isPathInside(child: string, parent: string): boolean {
+    const norm = (value: string) =>
+      value.replace(/\\/g, "/").replace(/\/+$/, "");
+    const parentPath = norm(parent);
+    const childPath = norm(child);
+    return (
+      parentPath.length > 0 &&
+      (childPath === parentPath || childPath.startsWith(`${parentPath}/`))
+    );
+  }
+
+  /** The repo id the cached tiers address this local row by, or null. Both the
+   * matching id and containment in that repo's cache dir are required: the id
+   * alone is a name, and several caches can hold the same repo, so a failure in
+   * one must not blacklist a healthy copy in another. A cache whose realpath
+   * moved out from under cache_path simply gets no alias, which is the behaviour
+   * from before the alias existed rather than a wrong one. */
+  function cachedRepoAliasFor(model: LocalModelInfo): string | null {
+    if (model.active_cache !== false) {
+      return null;
+    }
+    const modelId = model.model_id?.trim();
+    if (!modelId) {
+      return null;
+    }
+    const match = cachedRepoDirs.find(
+      (repo) =>
+        repo.repoId.toLowerCase() === modelId.toLowerCase() &&
+        isPathInside(model.path, repo.cachePath),
+    );
+    return match ? modelId : null;
+  }
+
   function localCandidateKeys(
     kind: LastLocalModelKind,
     model: LocalModelInfo,
     ggufVariant: string | null,
   ): string[] {
     const keys = [autoLoadCandidateKey(kind, model.id, ggufVariant)];
-    const alias = model.active_cache === false ? model.model_id?.trim() : null;
+    const alias = cachedRepoAliasFor(model);
     if (alias && alias !== model.id) {
       keys.push(autoLoadCandidateKey(kind, alias, ggufVariant));
     }
@@ -1896,7 +1936,11 @@ async function autoLoadSmallestModel(): Promise<{
     },
   ): Promise<boolean> {
     const remembered = findLocalModel(
-      models.filter(isAutoLoadLocalModel),
+      models.filter(
+        (model) =>
+          isAutoLoadLocalModel(model) &&
+          !isUnsupportedMlxLocalModel(model, isMac),
+      ),
       preferred.id,
     );
     if (!remembered) {
@@ -1943,9 +1987,7 @@ async function autoLoadSmallestModel(): Promise<{
   ): Promise<boolean> {
     // An MLX build cannot load off a Mac, and it fails only after the guard has
     // passed and an attempt has been spent, so a few of them would exhaust the
-    // budget ahead of a loadable model. Read once: the store holds a browser
-    // fallback until /api/health answers, and the picker gates on the same value.
-    const isMac = usePlatformStore.getState().deviceType === "mac";
+    // budget ahead of a loadable model.
     const localModels = sortLocalModelsForAutoLoad(
       models.filter(
         (model) =>
@@ -2011,6 +2053,18 @@ async function autoLoadSmallestModel(): Promise<{
       listLocalModels().catch(() => ({ models: [] as LocalModelInfo[] })),
     ]);
     const localModels = localInventory.models;
+    // Record which cache dir each cached candidate was read from, so the local
+    // tiers can tell a registered re-surfacing of that exact copy apart from a
+    // same-named repo in another cache. Both listings collapse duplicates by
+    // repo id, so at most one dir per id reaches this.
+    for (const repo of [...ggufRepos, ...modelRepos]) {
+      if (repo.cache_path) {
+        cachedRepoDirs.push({
+          repoId: repo.repo_id,
+          cachePath: repo.cache_path,
+        });
+      }
+    }
 
     if (lastLoaded) {
       if (lastLoaded.kind === "gguf") {

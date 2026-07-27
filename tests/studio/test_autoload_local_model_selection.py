@@ -310,9 +310,12 @@ def _run_local_gguf_variants(*, failing_quant: str, preferred: str | None = None
         "const isDirectGgufPath = helpers.isDirectGgufPath;\n"
         "let hadNonTrustFailure = false;\n"
         "const skippedAutoLoadCandidates = new Set<string>();\n"
+        "const cachedRepoDirs: any[] = [];\n"
+        "const isMac = false;\n"
+        "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
         # The local tiers consult the skip set through these helpers, so the
         # sliced functions need the real implementations, not stand-ins.
-        f"{_slice(src, '  function localCandidateKeys(', '  async function canAutoLoad(')}\n"
+        f"{_slice(src, '  function isPathInside(', '  async function canAutoLoad(')}\n"
         "const attempted: string[] = [];\n"
         "function hasBigEndianGgufMarker(_p: string) { return false; }\n"
         "function isAutoLoadableGgufVariant(_v: any) { return true; }\n"
@@ -372,7 +375,13 @@ def test_a_preferred_local_gguf_variant_still_leads_and_falls_back():
     assert out["skippedKeys"] == ["gguf:/custom/myrepo-gguf:q4_k_m"]
 
 
-def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
+def _run_remembered_local(
+    *,
+    kind: str,
+    gguf_variant: str | None = None,
+    name: str = "MyModel",
+    is_mac: bool = False,
+):
     """Run the REAL ``tryAutoLoadRememberedLocalModel`` against a remembered entry
     whose load throws, then report the skip keys it recorded."""
     src = ADAPTER.read_text()
@@ -386,9 +395,12 @@ def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
         f"{src[key_start:key_end]}\n"
         "let hadNonTrustFailure = false;\n"
         "const skippedAutoLoadCandidates = new Set<string>();\n"
+        "const cachedRepoDirs: any[] = [];\n"
+        f"const isMac = {json.dumps(is_mac)};\n"
+        "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
         # The local tiers consult the skip set through these helpers, so the
         # sliced functions need the real implementations, not stand-ins.
-        f"{_slice(src, '  function localCandidateKeys(', '  async function canAutoLoad(')}\n"
+        f"{_slice(src, '  function isPathInside(', '  async function canAutoLoad(')}\n"
         "const toastId = 't';\n"
         "const toast: any = () => {};\n"
         "const store = { params: { maxSeqLength: 4096 } };\n"
@@ -405,14 +417,16 @@ def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
         f"{src[start:end]}\n"
         f"const kind = {json.dumps(kind)};\n"
         f"const ggufVariant = {json.dumps(gguf_variant)};\n"
+        f"const name = {json.dumps(name)};\n"
         "const models = [{\n"
-        "  id: '/custom/MyModel', model_id: 'MyModel', display_name: 'MyModel',\n"
+        "  id: `/custom/${name}`, model_id: name, display_name: name,\n"
+        "  path: `/custom/${name}`,\n"
         "  active_cache: false,\n"
         # Only "gguf" or nothing: the vocabulary /api/models/local reports.
         "  model_format: kind === 'gguf' ? 'gguf' : undefined,\n"
         "}];\n"
         "const loaded = await tryAutoLoadRememberedLocalModel(models, {\n"
-        "  id: '/custom/MyModel', kind, ggufVariant,\n"
+        "  id: `/custom/${name}`, kind, ggufVariant,\n"
         "});\n"
         "console.log(JSON.stringify({\n"
         "  loaded, skippedKeys: [...skippedAutoLoadCandidates], hadNonTrustFailure,\n"
@@ -423,12 +437,12 @@ def _run_remembered_local(*, kind: str, gguf_variant: str | None = None):
 @pytest.mark.parametrize(
     "kind,gguf_variant,expected_keys",
     [
-        # A standalone GGUF: the sweep's own check keys on a null variant. The
-        # repo-id alias is recorded beside the path so the cached tiers, which
-        # address the same snapshot by repo id, see the failure too.
-        ("gguf", None, ["gguf:/custom/mymodel:", "gguf:mymodel:"]),
-        ("gguf", "Q4_K_M", ["gguf:/custom/mymodel:q4_k_m", "gguf:mymodel:q4_k_m"]),
-        ("model", None, ["model:/custom/mymodel:", "model:mymodel:"]),
+        # A standalone GGUF: the sweep's own check keys on a null variant. No
+        # repo-id alias here, because the row is not inside any cached
+        # candidate's cache dir, so its model_id is only a name.
+        ("gguf", None, ["gguf:/custom/mymodel:"]),
+        ("gguf", "Q4_K_M", ["gguf:/custom/mymodel:q4_k_m"]),
+        ("model", None, ["model:/custom/mymodel:"]),
     ],
 )
 def test_a_failed_remembered_local_model_is_not_retried_by_the_sweep(
@@ -451,6 +465,7 @@ def _run_local_sweep(
     gguf_folder_fail: str | None = None,
     preskipped: list[str] | None = None,
     is_mac: bool = False,
+    cached_repo_dirs: list[dict] | None = None,
 ):
     """Run the REAL ``tryAutoLoadLocalModels`` (driving the real
     ``tryAutoLoadLocalGgufModel``) over *models*, failing every load whose id is
@@ -478,14 +493,14 @@ def _run_local_sweep(
         f"const skippedAutoLoadCandidates = new Set<string>({json.dumps(preskipped or [])});\n"
         # The local tiers consult the skip set through these helpers, so the
         # sliced functions need the real implementations, not stand-ins.
-        f"{_slice(src, '  function localCandidateKeys(', '  async function canAutoLoad(')}\n"
+        f"{_slice(src, '  function isPathInside(', '  async function canAutoLoad(')}\n"
         "const attempted: string[] = [];\n"
         "const isDirectGgufPath = helpers.isDirectGgufPath;\n"
         "const localModelIsGguf = helpers.localModelIsGguf;\n"
         "const isAutoLoadLocalModel = helpers.isAutoLoadLocalModel;\n"
         "const isUnsupportedMlxLocalModel = helpers.isUnsupportedMlxLocalModel;\n"
-        f"const usePlatformStore = {{ getState: () => ({{ deviceType: "
-        f"{json.dumps('mac' if is_mac else 'linux')} }}) }};\n"
+        f"const isMac = {json.dumps(is_mac)};\n"
+        f"const cachedRepoDirs = {json.dumps(cached_repo_dirs or [])};\n"
         "const sortLocalModelsForAutoLoad = helpers.sortLocalModelsForAutoLoad;\n"
         "function hasBigEndianGgufMarker(_p: string) { return false; }\n"
         "function isAutoLoadableGgufVariant(_v: any) { return true; }\n"
@@ -587,6 +602,11 @@ def test_a_clean_sweep_blacklists_nothing():
 # tiers address it by repo id, collect_local_models keeps a custom row for the
 # same snapshot addressed by absolute path. Only cache-derived rows carry
 # model_id, so it is an exact alias between the two spellings.
+# What listCachedGguf reported: the repo dir this copy was read from.
+CACHED_REPO_DIRS = [
+    {"repoId": "Org/Foo-GGUF", "cachePath": "/hub/models--Org--Foo-GGUF"},
+]
+
 REGISTERED_CACHE_ROWS = [
     {
         "id": "/hub/models--Org--Foo-GGUF/snapshots/rev0",
@@ -617,6 +637,7 @@ def test_a_cached_failure_is_not_retried_by_its_registered_cache_row():
         REGISTERED_CACHE_ROWS,
         failing = [],
         preskipped = ["gguf:org/foo-gguf:q4_k_m"],
+        cached_repo_dirs = CACHED_REPO_DIRS,
     )
 
     assert out["attempted"] == ["gguf|/scan/ZGood-GGUF|Q4_K_M"]
@@ -631,6 +652,7 @@ def test_a_registered_cache_row_records_both_spellings_when_it_fails():
         REGISTERED_CACHE_ROWS,
         failing = [],
         gguf_folder_fail = "/hub/models--Org--Foo-GGUF/snapshots/rev0",
+        cached_repo_dirs = CACHED_REPO_DIRS,
     )
 
     assert out["skippedKeys"] == [
@@ -810,6 +832,12 @@ def test_an_lmstudio_copy_is_not_aliased_to_a_cached_repo():
         LMSTUDIO_LOOKALIKE,
         failing = [],
         preskipped = ["gguf:unsloth/gemma-3-4b-it-gguf:q4_k_m"],
+        cached_repo_dirs = [
+            {
+                "repoId": "unsloth/gemma-3-4b-it-GGUF",
+                "cachePath": "/hub/models--unsloth--gemma-3-4b-it-GGUF",
+            },
+        ],
     )
     assert honoured["attempted"] == ["gguf|/lmstudio/unsloth/gemma-3-4b-it-GGUF|Q4_K_M"]
 
@@ -890,3 +918,63 @@ def test_the_sweep_keeps_mlx_rows_on_a_mac():
 
     assert out["attempted"] == ["model|/scan/Qwen3-4B-MLX|"]
     assert out["loaded"] is True
+
+
+def test_a_remembered_mlx_model_is_not_restored_off_a_mac():
+    """The record lives client side while the host is server side, so the same
+    browser profile can point at a Linux server with the path still present (a
+    shared models mount). The remembered tier runs before the sweep, so without
+    the filter it spends an attempt the sweep's own filter never sees."""
+    off_mac = _run_remembered_local(kind = "model", name = "Qwen3-4B-MLX")
+    assert off_mac["loaded"] is False
+    assert off_mac["skippedKeys"] == []
+    assert off_mac["hadNonTrustFailure"] is False
+
+    on_mac = _run_remembered_local(
+        kind = "model", name = "Qwen3-4B-MLX", is_mac = True
+    )
+    # Reached on a Mac, where the stubbed load throws and is recorded.
+    assert on_mac["hadNonTrustFailure"] is True
+
+
+# The same repo id in a second cache is a different copy on disk.
+SECOND_CACHE_ROWS = [
+    {
+        "id": "/hubA/models--Org--Foo-GGUF/snapshots/rev0",
+        "path": "/hubA/models--Org--Foo-GGUF/snapshots/rev0",
+        "model_id": "Org/Foo-GGUF",
+        "display_name": "Foo-GGUF",
+        "source": "custom",
+        "active_cache": False,
+        "model_format": "gguf",
+        "updated_at": 2000,
+    },
+    {
+        "id": "/hubB/models--Org--Foo-GGUF/snapshots/rev0",
+        "path": "/hubB/models--Org--Foo-GGUF/snapshots/rev0",
+        "model_id": "Org/Foo-GGUF",
+        "display_name": "Foo-GGUF",
+        "source": "custom",
+        "active_cache": False,
+        "model_format": "gguf",
+        "updated_at": 1000,
+    },
+]
+
+
+def test_only_the_cached_copy_is_aliased_not_a_same_named_repo_elsewhere():
+    """Both cached listings collapse copies by repo id, so a cached failure names
+    one cache. The registered row from that cache is skipped; the healthy copy in
+    the other cache must still be tried."""
+    out = _run_local_sweep(
+        SECOND_CACHE_ROWS,
+        failing = [],
+        preskipped = ["gguf:org/foo-gguf:q4_k_m"],
+        cached_repo_dirs = [
+            {"repoId": "Org/Foo-GGUF", "cachePath": "/hubA/models--Org--Foo-GGUF"},
+        ],
+    )
+
+    assert out["attempted"] == ["gguf|/hubB/models--Org--Foo-GGUF/snapshots/rev0|Q4_K_M"]
+    assert out["loaded"] is True
+
