@@ -651,9 +651,7 @@ def test_local_inventory_only_reports_gguf_or_no_format():
     allowlist of those names here silently matches nothing."""
     source = _source_path("studio/backend/routes/models.py").read_text()
     assignments = {
-        line.strip()
-        for line in source.splitlines()
-        if line.strip().startswith("model_format =")
+        line.strip() for line in source.splitlines() if line.strip().startswith("model_format =")
     }
     assert assignments, "no model_format assignments found; path moved?"
     for assignment in assignments:
@@ -665,8 +663,12 @@ def test_local_inventory_only_reports_gguf_or_no_format():
             or value.startswith('"gguf" if ')
             or value == "("  # multi-line _dir_model_format call
         ), assignment
-    for dead in ('model_format = "safetensors"', 'model_format = "adapter"',
-                 'model_format = "checkpoint"', 'model_format = "unknown"'):
+    for dead in (
+        'model_format = "safetensors"',
+        'model_format = "adapter"',
+        'model_format = "checkpoint"',
+        'model_format = "unknown"',
+    ):
         assert dead not in source
 
 
