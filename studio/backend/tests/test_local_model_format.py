@@ -199,4 +199,3 @@ def test_scan_models_dir_reports_mixed_for_a_mixed_child(tmp_path):
     assert rows["my-finetune"] == "mixed"
     assert rows["my-finetune-q4"] == "gguf"
     assert rows["my-finetune-full"] is None
-

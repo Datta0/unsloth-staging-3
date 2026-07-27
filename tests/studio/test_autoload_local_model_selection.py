@@ -748,9 +748,7 @@ def test_local_inventory_reports_only_its_own_format_vocabulary():
     allowlist of those names here silently matches nothing."""
     source = _source_path("studio/backend/routes/models.py").read_text()
     assignments = {
-        line.strip()
-        for line in source.splitlines()
-        if line.strip().startswith("model_format =")
+        line.strip() for line in source.splitlines() if line.strip().startswith("model_format =")
     }
     assert assignments, "no model_format assignments found; path moved?"
     allowed = {
@@ -762,9 +760,8 @@ def test_local_inventory_reports_only_its_own_format_vocabulary():
         "model_format = (",
     }
     for assignment in assignments:
-        assert (
-            assignment in allowed
-            or assignment.startswith("model_format = _dir_model_format(")
+        assert assignment in allowed or assignment.startswith(
+            "model_format = _dir_model_format("
         ), assignment
     for dead in ('"safetensors"', '"adapter"', '"checkpoint"', '"unknown"'):
         assert f"model_format = {dead}" not in source
