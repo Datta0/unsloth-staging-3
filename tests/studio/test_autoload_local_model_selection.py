@@ -1004,3 +1004,78 @@ def test_the_cached_safetensors_listing_carries_its_cache_path():
         '@router.delete("/delete-cached")',
     )
     assert '"cache_path": str(repo_info.repo_path),' in body
+
+
+def _run_cached_gguf_tier(*, fail_load: bool, fail_variants: bool = False):
+    """Run the REAL cached-GGUF tier over one repo and report what it recorded."""
+    src = ADAPTER.read_text()
+    key = _slice(src, "function autoLoadCandidateKey(", "\n}\n") + "\n}\n"
+    tier = _slice(
+        src,
+        "    // GGUF first: smallest-total-size repo",
+        "    // A registered scan folder is a deliberate",
+    )
+    return _run(
+        "type LastLocalModelKind = 'gguf' | 'model';\n"
+        f"{key}\n"
+        "const MAX_AUTO_LOAD_ATTEMPTS = 3;\n"
+        "let loadAttempts = 0;\n"
+        "let hadNonTrustFailure = false;\n"
+        "const skippedAutoLoadCandidates = new Set<string>();\n"
+        "const attempted: string[] = [];\n"
+        "function isAutoLoadableGgufVariant(_v: any) { return true; }\n"
+        f"const FAIL_VARIANTS = {json.dumps(fail_variants)};\n"
+        f"const FAIL_LOAD = {json.dumps(fail_load)};\n"
+        "async function listGgufVariants(_id: string, _b?: any, _c?: any) {\n"
+        "  if (FAIL_VARIANTS) { throw new Error('network'); }\n"
+        "  return { variants: [{ quant: 'Q4_K_M', downloaded: true, size_bytes: 4000 }] };\n"
+        "}\n"
+        "async function loadAutoLoadCandidate(candidate: any): Promise<boolean> {\n"
+        "  attempted.push(`${candidate.id}|${candidate.ggufVariant}`);\n"
+        "  loadAttempts += 1;\n"
+        "  if (FAIL_LOAD) { throw new Error('llama_model_load: error loading model'); }\n"
+        "  return true;\n"
+        "}\n"
+        "const ggufRepos = [{ repo_id: 'Org/Foo-GGUF', size_bytes: 10,\n"
+        "  cache_path: '/hub/models--Org--Foo-GGUF' }];\n"
+        "async function cachedGgufTier() {\n"
+        f"{tier}\n"
+        "  return { loaded: false, blockedByTrustRemoteCode: false };\n"
+        "}\n"
+        "const result = await cachedGgufTier();\n"
+        "console.log(JSON.stringify({\n"
+        "  loaded: result.loaded, attempted, loadAttempts, hadNonTrustFailure,\n"
+        "  skippedKeys: [...skippedAutoLoadCandidates],\n"
+        "}));\n"
+    )
+
+
+def test_a_thrown_cached_gguf_load_is_recorded_for_the_local_sweep():
+    """The cached tier runs first. When that repo's cache is a registered scan
+    folder the same snapshot reaches the sweep under its absolute path, so a
+    throw here has to leave a key the local row's repo-id alias can match."""
+    out = _run_cached_gguf_tier(fail_load = True)
+
+    assert out["attempted"] == ["Org/Foo-GGUF|Q4_K_M"]
+    assert out["skippedKeys"] == ["gguf:org/foo-gguf:q4_k_m"]
+    assert out["hadNonTrustFailure"] is True
+    assert out["loaded"] is False
+
+
+def test_a_failed_variants_lookup_does_not_blacklist_the_cached_repo():
+    """No load was attempted, so there is no quant to blame. The local row
+    enumerates variants by path and may still succeed."""
+    out = _run_cached_gguf_tier(fail_load = False, fail_variants = True)
+
+    assert out["attempted"] == []
+    assert out["skippedKeys"] == []
+    assert out["hadNonTrustFailure"] is True
+
+
+def test_a_successful_cached_gguf_load_records_nothing():
+    out = _run_cached_gguf_tier(fail_load = False)
+
+    assert out["loaded"] is True
+    assert out["skippedKeys"] == []
+    assert out["hadNonTrustFailure"] is False
+

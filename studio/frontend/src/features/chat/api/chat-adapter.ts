@@ -2165,6 +2165,8 @@ async function autoLoadSmallestModel(): Promise<{
       const sorted = [...ggufRepos].sort((a, b) => a.size_bytes - b.size_bytes);
       for (const repo of sorted) {
         if (loadAttempts >= MAX_AUTO_LOAD_ATTEMPTS) break;
+        // Hoisted so the catch can name the quant that was actually attempted.
+        let attemptedQuant: string | null = null;
         try {
           const variants = await listGgufVariants(repo.repo_id, undefined, {
             preferLocalCache: true,
@@ -2182,6 +2184,7 @@ async function autoLoadSmallestModel(): Promise<{
             ) {
               continue;
             }
+            attemptedQuant = variant.quant ?? null;
             if (
               await loadAutoLoadCandidate({
                 id: repo.repo_id,
@@ -2197,6 +2200,17 @@ async function autoLoadSmallestModel(): Promise<{
           }
         } catch {
           hadNonTrustFailure = true;
+          // When this repo's cache is a registered scan folder, the same snapshot
+          // arrives in the local sweep below under its absolute path. Record the
+          // repo-id key that row aliases to, or the identical model spends a
+          // second slot of the attempt budget. A failure in the variants lookup
+          // itself has no quant to blame and must not blacklist the repo: the
+          // local row enumerates variants by path and may well succeed.
+          if (attemptedQuant) {
+            skippedAutoLoadCandidates.add(
+              autoLoadCandidateKey("gguf", repo.repo_id, attemptedQuant),
+            );
+          }
           continue;
         }
       }
