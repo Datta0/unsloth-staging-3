@@ -8,6 +8,8 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager};
 
+const INSTALL_IN_PROGRESS_MARKER: &str = ".desktop-install-in-progress";
+
 // ── Types ──
 
 pub struct InstallProcess {
@@ -191,6 +193,83 @@ impl InstallFailureContext {
 
 fn is_elevation_request(code: i32, packages: &[String]) -> bool {
     code == 2 && !packages.is_empty()
+
+fn install_in_progress_marker_path() -> Result<PathBuf, String> {
+    let home = dirs::home_dir().ok_or("Could not determine home directory")?;
+    Ok(home
+        .join(".unsloth")
+        .join("studio")
+        .join(INSTALL_IN_PROGRESS_MARKER))
+}
+
+pub(crate) fn managed_install_in_progress() -> bool {
+    install_in_progress_marker_path()
+        .map(|path| path.is_file())
+        .unwrap_or(false)
+}
+
+/// Whether this process created the marker rather than finding one an earlier
+/// interrupted install left. Clearing someone else's drops the only signal that
+/// its venv is half-written. Process-wide because the marker is one file.
+static MARKER_CREATED_HERE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn create_install_in_progress_marker() -> Result<(), String> {
+    let path = install_in_progress_marker_path()?;
+    let created = create_install_in_progress_marker_at(&path)?;
+    MARKER_CREATED_HERE.store(created, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
+
+/// Clear only a marker this attempt created. Used where the venv was never
+/// touched: a failed spawn, and the elevation exits.
+fn clear_own_install_marker() {
+    if MARKER_CREATED_HERE.load(std::sync::atomic::Ordering::Relaxed) {
+        clear_install_marker_best_effort();
+    }
+}
+
+/// Ok(true) when this call created the file, Ok(false) when one was there.
+fn create_install_in_progress_marker_at(path: &Path) -> Result<bool, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("Invalid install marker path: {}", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|e| format!("Failed to create {}: {}", parent.display(), e))?;
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(format!("Failed to create {}: {}", path.display(), error)),
+    }
+}
+
+fn clear_install_in_progress_marker() -> Result<(), String> {
+    let path = install_in_progress_marker_path()?;
+    clear_install_in_progress_marker_at(&path)
+}
+
+/// Clear only where the script provably never touched the venv: it failed to
+/// spawn, or it asked for elevation, which install.sh decides (:1931) before it
+/// creates the venv (:2120). Later on any failure can leave pip part-way
+/// through, and the marker is the only signal. Never fatal: it costs a fast path.
+fn clear_install_marker_best_effort() {
+    if let Err(msg) = clear_install_in_progress_marker() {
+        warn!("[install] {}", msg);
+    }
+    MARKER_CREATED_HERE.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn clear_install_in_progress_marker_at(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Failed to remove {}: {}", path.display(), error)),
+    }
 }
 
 // ── Script Resolution ──
@@ -284,6 +363,10 @@ fn emit_complete(app: &AppHandle) {
 
 // ── Spawn ──
 
+/// A start rejected because one is already running, kept apart from a real
+/// spawn failure so the loser of the race leaves the winner's marker alone.
+const INSTALL_ALREADY_RUNNING: &str = "Installation is already running.";
+
 /// Spawns the install script in a process group.
 /// Returns (stdout, stderr) handles for streaming.
 /// The GroupChild is stored in state so stop_install() can kill the entire tree.
@@ -300,7 +383,7 @@ fn spawn_script(
 > {
     let mut install = state.lock().map_err(|e| e.to_string())?;
     if install.child.is_some() {
-        return Err("Installation is already running.".to_string());
+        return Err(INSTALL_ALREADY_RUNNING.to_string());
     }
     install.intentional_stop = false;
     install.needed_packages.clear();
@@ -620,9 +703,19 @@ fn run_install_with_event_mode(
         &format!("Using script: {}", script.display()),
     );
 
+    if let Err(msg) = create_install_in_progress_marker() {
+        warn!("[install] {}", msg);
+    }
+
     let (stdout, stderr) = match spawn_script(&script, &args, &state) {
         Ok(handles) => handles,
         Err(msg) => {
+            // Nothing ran, so nothing is half-installed. Unless the marker is
+            // not ours: another installer owns it, or an earlier interrupted
+            // one left it, and either way its signal is not ours to drop.
+            if msg != INSTALL_ALREADY_RUNNING {
+                clear_own_install_marker();
+            }
             diagnostics::finish_attempt(
                 &diagnostics,
                 &attempt,
@@ -652,6 +745,7 @@ fn run_install_with_event_mode(
 
     match result {
         Ok((status, _)) if status.success() => {
+            clear_install_marker_best_effort();
             diagnostics::finish_attempt(
                 &diagnostics,
                 &attempt,
@@ -710,6 +804,7 @@ fn run_install_with_event_mode(
             Err(msg)
         }
         Err(msg) => {
+            // Same: the wait failed but the script was already running.
             diagnostics::finish_attempt(&diagnostics, &attempt, None, false, Some(msg.clone()));
             clear_current_attempt(&state);
             if event_mode.emit_terminal_events() {
@@ -749,6 +844,8 @@ pub fn record_pending_elevation_canceled(
     let Some(attempt) = attempt else {
         return false;
     };
+    // The resumed run the elevation exit left the marker for is not happening.
+    clear_own_install_marker();
     diagnostics::finish_attempt(
         diagnostics,
         &attempt,
@@ -1035,6 +1132,8 @@ fn finish_elevation_failure(
     exit_status: Option<String>,
     message: String,
 ) {
+    // Terminal, like a cancelled prompt: the resumed run is not happening.
+    clear_own_install_marker();
     if let Some(attempt) = attempt {
         diagnostics::finish_attempt(
             diagnostics,
@@ -1070,6 +1169,31 @@ fn capped_output_text(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn install_marker_persists_until_explicit_success_cleanup() {
+        let directory = std::env::temp_dir().join(format!(
+            "unsloth-install-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let marker = directory.join(INSTALL_IN_PROGRESS_MARKER);
+
+        assert!(create_install_in_progress_marker_at(&marker).unwrap());
+        assert!(marker.is_file());
+
+        // A second attempt finds the first one's marker and does not own it.
+        assert!(!create_install_in_progress_marker_at(&marker).unwrap());
+        assert!(marker.is_file());
+
+        clear_install_in_progress_marker_at(&marker).unwrap();
+        assert!(!marker.exists());
+        clear_install_in_progress_marker_at(&marker).unwrap();
+        let _ = std::fs::remove_dir_all(directory);
+    }
 
     #[test]
     fn elevated_output_cap_is_utf8_boundary_safe() {
