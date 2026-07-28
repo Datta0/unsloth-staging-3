@@ -728,7 +728,7 @@ if [ "$1" = "studio" ] && [ "$2" = "desktop-runtime-check" ] && [ "$3" = "--json
   exit 0
 fi
 if [ "$1" = "studio" ] && [ "$2" = "desktop-capabilities" ] && [ "$3" = "--json" ]; then
-  printf '{"desktop_protocol_version":1,"desktop_manageability_version":1,"supports_api_only":true,"supports_provision_desktop_auth":true,"supports_desktop_backend_ownership":true,"version":"2026.5.3"}'
+  printf '{"desktop_protocol_version":1,"desktop_manageability_version":2,"supports_api_only":true,"supports_provision_desktop_auth":true,"supports_desktop_backend_ownership":true,"studio_install_ok":true,"version":"2026.5.3"}'
   exit 0
 fi
 exit 1
