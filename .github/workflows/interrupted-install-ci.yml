@@ -204,3 +204,66 @@ jobs:
             probe/
           retention-days: 7
           if-no-files-found: warn
+
+  # ── The gap a manifest cannot see ─────────────────────────────────────────
+  # #7492 (merged) answers "did the dependency pass finish" by walking
+  # studio/backend/requirements/studio.txt plus the install manifest. That file
+  # names fastapi, uvicorn and structlog -- it does NOT name starlette, which
+  # arrives transitively via fastapi and is imported at module scope in
+  # studio/backend/main.py:296. So a venv missing starlette satisfies every
+  # requirement line, carries a complete manifest, and still cannot boot.
+  #
+  # #7490's `desktop-runtime-check` imports the backend for real, so it is the only
+  # one of the two that can see this. This job decides whether #7490 is still worth
+  # landing now that #7492 is in, by measurement rather than assertion.
+  transitive-dep:
+    name: transitive dep pruned (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Linux system deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends cmake git build-essential libcurl4-openssl-dev
+
+      - name: Install completely (no interruption)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p logs
+          bash install.sh --tauri --local --no-torch < /dev/null 2>&1 | tee logs/install.log
+
+      - name: Confirm it is healthy first
+        run: |
+          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
+          python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe-before
+          v="$(python3 -c "import json;print(json.load(open('probe-before/verdict.json'))['verdict'])")"
+          if [ "$v" != "HEALTHY" ]; then
+            echo "::error::baseline install is not healthy (verdict=$v); the prune below would prove nothing"
+            exit 1
+          fi
+
+      - name: Prune one transitive dependency
+        run: python3 .github/scripts/prune_transitive_dep.py starlette
+
+      - name: The manifest says fine, the runtime says broken
+        run: |
+          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
+          python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe-after || true
+          python3 .github/scripts/assert_transitive_gap.py probe-after/verdict.json
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: interrupted-transitive-dep
+          path: |
+            logs/
+            probe-before/
+            probe-after/
+          retention-days: 7
+          if-no-files-found: warn
