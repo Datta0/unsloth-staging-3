@@ -193,6 +193,7 @@ impl InstallFailureContext {
 
 fn is_elevation_request(code: i32, packages: &[String]) -> bool {
     code == 2 && !packages.is_empty()
+}
 
 fn install_in_progress_marker_path() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or("Could not determine home directory")?;
