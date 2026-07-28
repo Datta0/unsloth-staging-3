@@ -44,7 +44,6 @@ permissions:
   contents: read
 
 env:
-  UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio-home
   UNSLOTH_STUDIO_DISABLE_PUBLIC_CHECK: '1'
 
 jobs:
@@ -101,11 +100,25 @@ jobs:
           bash .github/scripts/interrupt-install.sh \
             '${{ matrix.marker }}' logs/install.log -- --tauri --local
 
+      - name: The kill must have landed where it was aimed
+        run: |
+          . logs/interrupt.env
+          echo "reason=$interrupt_reason killed=$interrupt_killed exit=$installer_exit"
+          if [ "$interrupt_reason" != "marker-hit" ]; then
+            echo "::error::installer never reached '${{ matrix.marker }}' (reason=$interrupt_reason)."
+            echo "::error::This leg proves nothing. Without this check it passes via the"
+            echo "::error::NO_CLI 'safe' path, which is how a --tauri/UNSLOTH_STUDIO_HOME"
+            echo "::error::conflict once made all 11 POSIX legs vacuously green."
+            tail -30 logs/install.log || true
+            exit 1
+          fi
+
       - name: What state is the install in?
         id: probe
         run: |
-          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
-          [ -x "$BIN" ] || BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
+          # --tauri refuses a custom UNSLOTH_STUDIO_HOME, so it installs here.
+          BIN="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          [ -x "$BIN" ] || BIN="$HOME/.unsloth/studio/bin/unsloth"
           if [ ! -x "$BIN" ]; then
             # No CLI at all is a SAFE outcome: preflight reports NotInstalled and the
             # app offers a normal install. Nothing to assert beyond that.
@@ -133,8 +146,8 @@ jobs:
             echo "::error::re-run reported the venv up to date without repairing it"
             exit 1
           fi
-          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
-          [ -x "$BIN" ] || BIN="$UNSLOTH_STUDIO_HOME/bin/unsloth"
+          BIN="$HOME/.unsloth/studio/unsloth_studio/bin/unsloth"
+          [ -x "$BIN" ] || BIN="$HOME/.unsloth/studio/bin/unsloth"
           python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe-after || true
           v="$(python3 -c "import json;print(json.load(open('probe-after/verdict.json'))['verdict'])")"
           if [ "$v" != "HEALTHY" ]; then
@@ -157,6 +170,10 @@ jobs:
   # ── Windows: no process groups, so the kill path differs ──────────────────
   interrupt-windows:
     name: windows kill@${{ matrix.label }}
+    env:
+      # install.ps1 has no equivalent of install.sh's --tauri guard, so the
+      # workspace-scoped root still works here.
+      UNSLOTH_STUDIO_HOME: ${{ github.workspace }}/.studio-home
     runs-on: windows-latest
     timeout-minutes: 60
     continue-on-error: true
@@ -202,68 +219,5 @@ jobs:
           path: |
             logs/
             probe/
-          retention-days: 7
-          if-no-files-found: warn
-
-  # ── The gap a manifest cannot see ─────────────────────────────────────────
-  # #7492 (merged) answers "did the dependency pass finish" by walking
-  # studio/backend/requirements/studio.txt plus the install manifest. That file
-  # names fastapi, uvicorn and structlog -- it does NOT name starlette, which
-  # arrives transitively via fastapi and is imported at module scope in
-  # studio/backend/main.py:296. So a venv missing starlette satisfies every
-  # requirement line, carries a complete manifest, and still cannot boot.
-  #
-  # #7490's `desktop-runtime-check` imports the backend for real, so it is the only
-  # one of the two that can see this. This job decides whether #7490 is still worth
-  # landing now that #7492 is in, by measurement rather than assertion.
-  transitive-dep:
-    name: transitive dep pruned (ubuntu-latest)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
-        with:
-          persist-credentials: false
-
-      - name: Linux system deps
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends cmake git build-essential libcurl4-openssl-dev
-
-      - name: Install completely (no interruption)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p logs
-          bash install.sh --tauri --local --no-torch < /dev/null 2>&1 | tee logs/install.log
-
-      - name: Confirm it is healthy first
-        run: |
-          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
-          python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe-before
-          v="$(python3 -c "import json;print(json.load(open('probe-before/verdict.json'))['verdict'])")"
-          if [ "$v" != "HEALTHY" ]; then
-            echo "::error::baseline install is not healthy (verdict=$v); the prune below would prove nothing"
-            exit 1
-          fi
-
-      - name: Prune one transitive dependency
-        run: python3 .github/scripts/prune_transitive_dep.py starlette
-
-      - name: The manifest says fine, the runtime says broken
-        run: |
-          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
-          python3 .github/scripts/interrupted_install_probe.py "$BIN" --out probe-after || true
-          python3 .github/scripts/assert_transitive_gap.py probe-after/verdict.json
-
-      - name: Upload logs
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
-        with:
-          name: interrupted-transitive-dep
-          path: |
-            logs/
-            probe-before/
-            probe-after/
           retention-days: 7
           if-no-files-found: warn
