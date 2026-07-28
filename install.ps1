@@ -2438,6 +2438,21 @@ exit 0
             }
         } else {
             Write-TauriLog "STEP" "Installing PyTorch"
+            # Windows on ARM: torchaudio only. Counted against
+            # download.pytorch.org/whl/cpu: torch 42 win_arm64 wheels, torchvision 60,
+            # torchaudio 0 (PyTorch has shipped Arm-native Windows builds since April
+            # 2025). Aborting the whole install here would block a platform that mostly
+            # works, so drop the one unsatisfiable pin instead.
+            #
+            # Ask the interpreter uv will resolve for, not the PowerShell host: an x64
+            # CPython under emulation gets working win_amd64 wheels on an ARM64 box, and
+            # powershell.exe inherits PROCESSOR_ARCHITECTURE from its parent. An
+            # unreadable platform falls through to the normal path rather than changing
+            # a resolution that may well be satisfiable.
+            $VenvPlatform = ""
+            try {
+                $VenvPlatform = (& $VenvPython -c "import sysconfig; print(sysconfig.get_platform())" 2>$null | Out-String).Trim().ToLowerInvariant()
+            } catch { $VenvPlatform = "" }
             substep "installing PyTorch ($(Remove-IndexUrlCredentials $TorchIndexUrl))..."
             # Bound the companions to the capped torch on EVERY index, cu<digits>
             # families included: torchaudio 2.11 dropped its exact torch pin from
@@ -2445,7 +2460,13 @@ exit 0
             # resolve a mismatched 2.11.0 build. Mirrors install.sh.
             $_pinVisionSpec = "torchvision>=0.19,<0.26.0"
             $_pinAudioSpec = "torchaudio>=2.4,<2.11.0"
-            $torchInstallExit = Invoke-InstallCommandRetry -Label "install PyTorch" { uv pip install --python $VenvPython "torch>=2.4,<2.11.0" $_pinVisionSpec $_pinAudioSpec --default-index $TorchIndexUrl }
+            $_torchSpecs = @("torch>=2.4,<2.11.0", $_pinVisionSpec, $_pinAudioSpec)
+            if ($VenvPlatform -eq "win-arm64") {
+                substep "windows on arm: skipping torchaudio (upstream publishes no"
+                substep "win_arm64 wheel); torch and torchvision install normally."
+                $_torchSpecs = @("torch>=2.4,<2.11.0", $_pinVisionSpec)
+            }
+            $torchInstallExit = Invoke-InstallCommandRetry -Label "install PyTorch" { uv pip install --python $VenvPython @_torchSpecs --default-index $TorchIndexUrl }
             if ($torchInstallExit -ne 0) {
                 Write-Host "[ERROR] Failed to install PyTorch (exit code $torchInstallExit)" -ForegroundColor Red
                 return (Exit-InstallFailure "Failed to install PyTorch (exit code $torchInstallExit)" $torchInstallExit)
