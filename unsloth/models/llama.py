@@ -2338,6 +2338,14 @@ class FastLlamaModel:
                 raise RuntimeError(
                     "Unsloth: `unsloth_vllm_standby` is True, but  environment variable `UNSLOTH_VLLM_STANDBY` is not set to 1!"
                 )
+            if revision is not None:
+                # load_vllm takes no revision, so vLLM fetches the default branch. Pinning
+                # only the config and tokenizer would mix two refs in one model.
+                logger.warning_once(
+                    f"Unsloth: Ignoring revision = `{revision}` since vLLM loads weights from "
+                    "the default branch. Use `fast_inference = False` to load a pinned revision."
+                )
+                revision = None
 
         token = hf_login(token)
         if model_patcher is None:
@@ -2407,6 +2415,7 @@ class FastLlamaModel:
                     model_name,
                     token = token,
                     attn_implementation = "sdpa",
+                    revision = revision,
                 )
                 _checkpoint_quant = getattr(_checkpoint_config, "quantization_config", None)
                 if _checkpoint_quant is not None:
@@ -2416,6 +2425,7 @@ class FastLlamaModel:
                 model_name,
                 token = token,
                 attn_implementation = "sdpa",
+                revision = revision,
             )
         model_config.model_name = model_name
         model_max_seq_length = model_config.max_position_embeddings
@@ -2429,11 +2439,12 @@ class FastLlamaModel:
         preferred_attn_impl = resolve_attention_implementation(model_function, model_config)
 
         # Prefetch the repo (killable child) so the weight load is a cache hit. Runs after the
-        # AutoConfig/model-class check so an unsupported repo fails on its small config fetch. No
-        # revision: the load resolves model_name (maybe a remapped prequant repo) on its default branch.
+        # AutoConfig/model-class check so an unsupported repo fails on its small config fetch.
+        # Warm the same revision the load uses, or the repo downloads twice.
         _prefetched = maybe_prefetch_hf_snapshot(
             model_name,
             token = token,
+            revision = revision,
             cache_dir = kwargs.get("cache_dir"),
             local_files_only = kwargs.get("local_files_only", False),
             # Skip the warm only for a real vLLM load; a num_labels classification load still goes
@@ -2493,6 +2504,8 @@ class FastLlamaModel:
                 cache_dir = _tokenizer_cache_dir,
                 local_files_only = kwargs.get("local_files_only", False),
                 tokenizer_only = True,
+                # Matches the tokenizer load below, which only pins its own repo.
+                revision = revision if _tokenizer_repo == model_name else None,
             )
 
         has_rope_scaling = False
@@ -2626,6 +2639,7 @@ class FastLlamaModel:
                     token = token,
                     trust_remote_code = trust_remote_code,
                     attn_implementation = preferred_attn_impl,
+                    revision = revision,
                     **kwargs,
                 )
                 # Defensive: ensure the task head is in a floating dtype, guarding
@@ -2654,8 +2668,8 @@ class FastLlamaModel:
                     model_name,
                     local_files_only = kwargs.get("local_files_only", False),
                     token = token,
-                    # Weights load from the default branch (revision not forwarded), so read scales from there too.
-                    revision = None,
+                    # Read scales from the same revision as the weights.
+                    revision = revision,
                     subfolder = kwargs.get("subfolder"),
                     cache_dir = kwargs.get("cache_dir"),
                     variant = kwargs.get("variant"),
@@ -2674,6 +2688,7 @@ class FastLlamaModel:
                         token = token,
                         trust_remote_code = trust_remote_code,
                         attn_implementation = preferred_attn_impl,
+                        revision = revision,
                         **kwargs,
                     )
                 else:
@@ -2686,6 +2701,7 @@ class FastLlamaModel:
                         max_position_embeddings = max_position_embeddings,
                         trust_remote_code = trust_remote_code,
                         attn_implementation = preferred_attn_impl,
+                        revision = revision,
                         **kwargs,
                     )
                 # Attach dispatch hooks for bnb multi-device loads.
@@ -2704,8 +2720,8 @@ class FastLlamaModel:
                     model_name,
                     local_files_only = kwargs.get("local_files_only", False),
                     token = token,
-                    # Weights load from the default branch (revision not forwarded), so read scales from there too.
-                    revision = None,
+                    # Read scales from the same revision as the weights.
+                    revision = revision,
                     subfolder = kwargs.get("subfolder"),
                     cache_dir = kwargs.get("cache_dir"),
                     variant = kwargs.get("variant"),
@@ -2781,6 +2797,7 @@ class FastLlamaModel:
             token = token,
             trust_remote_code = trust_remote_code,
             fix_tokenizer = fix_tokenizer,
+            revision = revision if tokenizer_name == model_name else None,
             **_tokenizer_cache_kwargs,
         )
 

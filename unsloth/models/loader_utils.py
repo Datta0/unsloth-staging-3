@@ -1214,6 +1214,7 @@ def _resolve_hub_repo_local_dir(
     *,
     token = None,
     cache_dir = None,
+    revision = None,
     # Default closed: a "resolve local dir" helper must not download. False here
     # means five filenames each retried with backoff before it gives up.
     local_files_only = True,
@@ -1249,6 +1250,7 @@ def _resolve_hub_repo_local_dir(
                 token = token,
                 cache_dir = cache_dir,
                 local_files_only = local_files_only,
+                revision = revision,
             )
             if path and os.path.isfile(path):
                 return os.path.dirname(path)
@@ -1286,6 +1288,7 @@ def _hub_repo_or_local_path(
     cache_dir = None,
     local_files_only = False,
     filenames = None,
+    revision = None,
 ):
     """Prefer a cached snapshot path over a Hub repo id when offline or ``local_files_only``."""
     if isinstance(repo_id, str) and os.path.isdir(repo_id):
@@ -1298,6 +1301,7 @@ def _hub_repo_or_local_path(
         token = token,
         cache_dir = cache_dir,
         local_files_only = True,
+        revision = revision,
         filenames = filenames
         or (
             "tokenizer_config.json",
@@ -1318,6 +1322,7 @@ def _load_pretrained_tokenizer_fast(
     trust_remote_code = False,
     cache_dir = None,
     local_files_only = False,
+    revision = None,
 ):
     """Load ``PreTrainedTokenizerFast`` without Hub metadata probes when cached/offline.
 
@@ -1331,6 +1336,7 @@ def _load_pretrained_tokenizer_fast(
         token = token,
         cache_dir = cache_dir,
         local_files_only = lfo,
+        revision = revision,
         filenames = (
             "tokenizer_config.json",
             "tokenizer.json",
@@ -1344,6 +1350,7 @@ def _load_pretrained_tokenizer_fast(
         trust_remote_code = trust_remote_code,
         cache_dir = cache_dir,
         local_files_only = lfo,
+        revision = revision,
     )
 
 
