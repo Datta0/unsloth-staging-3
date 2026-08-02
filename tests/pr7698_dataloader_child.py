@@ -13,7 +13,15 @@ prints one line: OK | <ExceptionType>: <message>
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _HERE)
+# unsloth_zoo/__init__.py refuses to import unless it can see unsloth
+# (find_spec("unsloth") plus the UNSLOTH_IS_PRESENT env gate), so the repo root
+# has to be importable in this child too - it is not, by default, because
+# sys.path[0] is the script's own directory.
+sys.path.insert(1, os.path.dirname(_HERE))
+os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
+os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
 
 
 def main():
