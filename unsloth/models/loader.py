@@ -149,6 +149,23 @@ def _strip_unsloth_bnb_4bit_suffix(model_name: str) -> str:
     return s
 
 
+def _revision_for_resolved_repo(revision, model_name, old_model_name):
+    """Drop `revision` once the requested repo has been remapped to another one.
+
+    A revision names a branch/tag/SHA on the repo the caller asked for, but from_pretrained
+    may resolve model_name to a different repo (a pre-quantized mirror, an fp8 temp dir, a
+    ModelScope snapshot, a -bnb-4bit strip), where that ref does not exist.
+    """
+    if revision is None or model_name == old_model_name:
+        return revision
+    logger.warning_once(
+        f"Unsloth: Ignoring revision = `{revision}` since `{old_model_name}` resolved to "
+        f"`{model_name}`, which does not have that revision. "
+        "Pass `use_exact_model_name = True` to load your repo as-is."
+    )
+    return None
+
+
 def _config_get(
     config,
     field_name,
@@ -557,6 +574,10 @@ class FastLanguageModel(FastLlamaModel):
             from modelscope import snapshot_download
             model_name = snapshot_download(model_name)
 
+        # Gate before the probe below, or a pinned 4bit load fails against the mirror
+        # instead of warning. Kept separate: `revision` still names the adapter repo.
+        base_revision = _revision_for_resolved_repo(revision, model_name, old_model_name)
+
         # First check if it's a normal model via AutoConfig
         from huggingface_hub.utils import (
             disable_progress_bars,
@@ -579,7 +600,7 @@ class FastLanguageModel(FastLlamaModel):
             model_config = AutoConfig.from_pretrained(
                 model_name,
                 token = token,
-                revision = revision,
+                revision = base_revision,
                 trust_remote_code = trust_remote_code,
                 local_files_only = local_files_only,
             )
@@ -606,7 +627,7 @@ class FastLanguageModel(FastLlamaModel):
             peft_config = PeftConfig.from_pretrained(
                 model_name,
                 token = token,
-                revision = revision,
+                revision = base_revision,
                 trust_remote_code = trust_remote_code,
                 local_files_only = local_files_only,
             )
@@ -850,6 +871,11 @@ class FastLanguageModel(FastLlamaModel):
         if fast_inference:
             fast_inference, model_name = fast_inference_setup(model_name, model_config)
 
+        # model_name can move once more here. Skip for PEFT: model_name is then the base
+        # model, and `revision` names the adapter that PeftModel.from_pretrained loads below.
+        if not is_peft:
+            base_revision = _revision_for_resolved_repo(base_revision, model_name, old_model_name)
+
         load_in_4bit_kwargs = load_in_4bit
         load_in_8bit_kwargs = load_in_8bit
         if quantization_config is not None and not fast_inference:
@@ -876,7 +902,7 @@ class FastLanguageModel(FastLlamaModel):
             model_patcher = dispatch_model,
             tokenizer_name = tokenizer_name,
             trust_remote_code = trust_remote_code,
-            revision = revision if not is_peft else None,
+            revision = base_revision if not is_peft else None,
             fast_inference = fast_inference,
             gpu_memory_utilization = gpu_memory_utilization,
             float8_kv_cache = float8_kv_cache,
@@ -1276,6 +1302,10 @@ class FastModel(FastBaseModel):
             from modelscope import snapshot_download
             model_name = snapshot_download(model_name)
 
+        # Gate before the probe below, or a pinned 4bit load fails against the mirror
+        # instead of warning. Kept separate: `revision` still names the adapter repo.
+        base_revision = _revision_for_resolved_repo(revision, model_name, old_model_name)
+
         # First check if it's a normal model via AutoConfig
         from huggingface_hub.utils import (
             disable_progress_bars,
@@ -1309,7 +1339,7 @@ class FastModel(FastBaseModel):
                 token = token,
                 device_map = device_map,
                 trust_remote_code = trust_remote_code,
-                revision = revision,
+                revision = base_revision,
                 **kwargs,
             )
 
@@ -1319,7 +1349,7 @@ class FastModel(FastBaseModel):
                 model_config = AutoConfig.from_pretrained(
                     model_name,
                     token = token,
-                    revision = revision,
+                    revision = base_revision,
                     trust_remote_code = trust_remote_code,
                     local_files_only = local_files_only,
                 )
@@ -1352,7 +1382,7 @@ class FastModel(FastBaseModel):
             peft_config = PeftConfig.from_pretrained(
                 model_name,
                 token = token,
-                revision = revision,
+                revision = base_revision,
                 trust_remote_code = trust_remote_code,
                 local_files_only = local_files_only,
             )
@@ -1798,6 +1828,11 @@ class FastModel(FastBaseModel):
             load_in_4bit_kwargs = False
             load_in_8bit_kwargs = False
 
+        # FastBaseModel remaps again via fast_inference_setup. Skip for PEFT: model_name is
+        # then the base model, and `revision` names the adapter PeftModel loads below.
+        if not is_peft:
+            base_revision = _revision_for_resolved_repo(base_revision, model_name, old_model_name)
+
         model, tokenizer = FastBaseModel.from_pretrained(
             model_name = model_name,
             max_seq_length = max_seq_length,
@@ -1809,7 +1844,7 @@ class FastModel(FastBaseModel):
             token = token,
             device_map = device_map,
             trust_remote_code = trust_remote_code,
-            revision = revision if not is_peft else None,
+            revision = base_revision if not is_peft else None,
             model_types = model_types,
             tokenizer_name = tokenizer_name,
             auto_model = auto_model,
