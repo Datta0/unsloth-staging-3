@@ -23,6 +23,22 @@ sys.path.insert(1, os.path.dirname(_HERE))
 os.environ.setdefault("UNSLOTH_IS_PRESENT", "1")
 os.environ.setdefault("UNSLOTH_COMPILE_DISABLE", "1")
 
+# Same trick as tests/conftest.py: unsloth_zoo.device_type calls get_device_type()
+# at import time and raises on a GPU-less runner. Pre-load it under a mocked
+# is_available() so its @cache captures "cuda". Must run at module scope, because
+# a spawned DataLoader worker re-imports __main__ and needs the same treatment.
+try:
+    import torch as _torch
+    if not _torch.cuda.is_available():
+        _real_is_available = _torch.cuda.is_available
+        _torch.cuda.is_available = lambda: True
+        try:
+            import unsloth_zoo.device_type  # noqa: F401
+        finally:
+            _torch.cuda.is_available = _real_is_available
+except Exception:  # noqa: BLE001 - a real accelerator, or zoo not installed yet
+    pass
+
 
 def main():
     from torch.utils.data import DataLoader
