@@ -664,6 +664,7 @@ def _construct_vlm_processor_fallback(
     trust_remote_code,
     cache_dir = None,
     local_files_only = False,
+    revision = None,
 ):
     """Build a VLM processor manually when AutoProcessor.from_pretrained fails (some VLMs
     have unresolvable tokenizer_class entries): load the image processor + tokenizer
@@ -680,6 +681,7 @@ def _construct_vlm_processor_fallback(
             token = token,
             cache_dir = cache_dir,
             local_files_only = local_files_only,
+            revision = revision,
         )
         # Load image processor
         image_processor = AutoImageProcessor.from_pretrained(
@@ -688,6 +690,7 @@ def _construct_vlm_processor_fallback(
             trust_remote_code = trust_remote_code,
             cache_dir = cache_dir,
             local_files_only = local_files_only,
+            revision = revision,
         )
         # Load tokenizer via PreTrainedTokenizerFast (bypasses tokenizer_class check).
         # Resolve the cached snapshot first so transformers does not call model_info (#7481).
@@ -698,6 +701,7 @@ def _construct_vlm_processor_fallback(
             trust_remote_code = trust_remote_code,
             cache_dir = cache_dir,
             local_files_only = local_files_only,
+            revision = revision,
         )
         # Read tokenizer_config.json for special tokens: prefer the local file (offline
         # / local checkpoint dir), else hf_hub_download with local_files_only forwarded.
@@ -723,6 +727,7 @@ def _construct_vlm_processor_fallback(
                     "tokenizer_config.json",
                     token = token,
                     cache_dir = cache_dir,
+                    revision = revision,
                     local_files_only = local_files_only,
                 )
                 with open(config_path, "r", encoding = "utf-8") as f:
@@ -756,6 +761,7 @@ def _construct_vlm_processor_fallback(
                     trust_remote_code = trust_remote_code,
                     cache_dir = cache_dir,
                     local_files_only = local_files_only,
+                    revision = revision,
                 )
                 proc_class_name = PROCESSOR_MAPPING_NAMES.get(config.model_type)
             except Exception as _e:
@@ -862,6 +868,21 @@ class FastBaseModel:
         if os.environ.get("UNSLOTH_MODEL_NAME", "") == "":
             os.environ["UNSLOTH_MODEL_NAME"] = model_name.lower()
 
+        # Read revision from kwargs, not the signature: the weight load below forwards
+        # **kwargs, so binding it would drop it there. Pin its repo before any remap.
+        _revision = kwargs.get("revision")
+        _tokenizer_revision_arg = kwargs.pop("tokenizer_revision", None)
+        if _revision is not None and fast_inference and is_vLLM_available():
+            # load_vllm takes no revision, so vLLM fetches the default branch. Pinning only
+            # the config and tokenizer would mix two refs in one model.
+            logger.warning_once(
+                f"Unsloth: Ignoring revision = `{_revision}` since vLLM loads weights from "
+                "the default branch. Use `fast_inference = False` to load a pinned revision."
+            )
+            _revision = None
+            kwargs.pop("revision", None)
+        _revision_repo = model_name
+
         # Resolve text-only before the is_vlm / vLLM checks so is_vlm stays consistent;
         # skip the vision tower only for families with their own text decoder (Gemma 3). #5816
         if text_only and auto_config is None:
@@ -870,6 +891,7 @@ class FastBaseModel:
                 token = token,
                 trust_remote_code = trust_remote_code,
                 local_files_only = local_files_only,
+                revision = _revision,
             )
         if text_only and hasattr(auto_config, "vision_config"):
             parent_config = auto_config
@@ -1027,6 +1049,7 @@ class FastBaseModel:
                 token = token,
                 trust_remote_code = trust_remote_code,
                 local_files_only = local_files_only,
+                revision = _revision,
             )
         model_class = resolve_model_class(auto_model, auto_config)
         attn_impl = resolve_attention_implementation(
@@ -1108,6 +1131,7 @@ class FastBaseModel:
             and _tokenizer_repo != model_name
         )
         if _warm_tokenizer_repo:
+            # No revision: this only runs when the repo differs from the revision's repo.
             maybe_prefetch_hf_snapshot(
                 _tokenizer_repo,
                 token = token,
@@ -1182,6 +1206,7 @@ class FastBaseModel:
                     token = token,
                     trust_remote_code = trust_remote_code,
                     local_files_only = local_files_only,
+                    revision = _revision,
                 )
             if hasattr(auto_config, "quantization_config"):
                 from transformers.quantizers.auto import (
@@ -1236,6 +1261,7 @@ class FastBaseModel:
                 token = token,
                 trust_remote_code = trust_remote_code,
                 local_files_only = local_files_only,
+                revision = _revision,
             )
         _set_attn_impl(auto_config, config_attn_impl)
         model_config = auto_config
@@ -1433,6 +1459,11 @@ class FastBaseModel:
 
         # Counteract saved tokenizers
         tokenizer_name = model_name if tokenizer_name is None else tokenizer_name
+        # Resolved by the loader, which knows whether the tokenizer repo is the caller's
+        # (a PEFT adapter) or the resolved base model. Falls back for a direct call.
+        _tokenizer_revision = _tokenizer_revision_arg
+        if _tokenizer_revision is None and tokenizer_name == _revision_repo:
+            _tokenizer_revision = _revision
 
         # On the vLLM path the tokenizer warm was deferred (fast_inference_setup may remap model_name).
         # Warm the now-final tokenizer repo so the load below hits the cache (a cached/local repo is a no-op).
@@ -1440,7 +1471,8 @@ class FastBaseModel:
             maybe_prefetch_hf_snapshot(
                 tokenizer_name,
                 token = token,
-                revision = kwargs.get("revision"),
+                # Match the tokenizer load below, which only pins its own repo.
+                revision = _tokenizer_revision,
                 cache_dir = kwargs.get("cache_dir"),
                 local_files_only = kwargs.get("local_files_only", False),
                 tokenizer_only = True,
@@ -1485,6 +1517,7 @@ class FastBaseModel:
                         trust_remote_code = trust_remote_code,
                         cache_dir = kwargs.get("cache_dir"),
                         local_files_only = lfo,
+                        revision = _tokenizer_revision,
                     )
                 except Exception as _e:
                     _tok = None
@@ -1498,6 +1531,7 @@ class FastBaseModel:
                         trust_remote_code = trust_remote_code,
                         cache_dir = kwargs.get("cache_dir"),
                         local_files_only = lfo,
+                        revision = _tokenizer_revision,
                     )
                 except Exception as _e:
                     _err = _e
@@ -1528,6 +1562,7 @@ class FastBaseModel:
                         trust_remote_code,
                         cache_dir = kwargs.get("cache_dir"),
                         local_files_only = lfo,
+                        revision = _tokenizer_revision,
                     )
                 except Exception as _fe:
                     _fallback, _fb_err = None, _fe
@@ -1614,6 +1649,7 @@ class FastBaseModel:
                     trust_remote_code = trust_remote_code,
                     cache_dir = kwargs.get("cache_dir"),
                     local_files_only = local_files_only,
+                    revision = _tokenizer_revision,
                 )
                 model, _fallback_tok = patch_tokenizer(model, _fallback_tok)
                 # Re-attach as processor wrapper if original was a processor
@@ -1641,6 +1677,7 @@ class FastBaseModel:
                     token = token,
                     cache_dir = kwargs.get("cache_dir"),
                     local_files_only = lfo,
+                    revision = _tokenizer_revision,
                 )
                 try:
                     return _AutoTokenizer.from_pretrained(
@@ -1650,6 +1687,7 @@ class FastBaseModel:
                         trust_remote_code = trust_remote_code,
                         cache_dir = kwargs.get("cache_dir"),
                         local_files_only = lfo,
+                        revision = _tokenizer_revision,
                     )
                 except Exception:
                     return _load_pretrained_tokenizer_fast(
@@ -1659,6 +1697,7 @@ class FastBaseModel:
                         trust_remote_code = trust_remote_code,
                         cache_dir = kwargs.get("cache_dir"),
                         local_files_only = lfo,
+                        revision = _tokenizer_revision,
                     )
 
             _last_resort_err = None
