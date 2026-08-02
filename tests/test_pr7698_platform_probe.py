@@ -1,29 +1,30 @@
 """Platform probe for unslothai/unsloth PR #7698, run on real Windows / macOS / Linux.
 
 The PR adds a `threading.Lock` to `UnslothVisionDataCollator` and wraps the whole
-`__call__` in it. Three of the consequences are platform-dependent and cannot be
-settled on a Linux dev box:
+`__call__` in it. Several consequences are platform-dependent and cannot be settled
+on a Linux dev box:
 
-  * the multiprocessing start method a torch DataLoader will actually use
-    (`spawn` on Windows and macOS, `fork` on Linux before 3.14, `forkserver` from
-    3.14), which decides whether `collate_fn` has to be picklable at all;
+  * the multiprocessing start method a torch DataLoader actually uses (`spawn` on
+    Windows and macOS, `fork` on Linux before 3.14, `forkserver` from 3.14), which
+    decides whether `collate_fn` must be picklable at all;
   * whether the collator is picklable / deepcopyable / cloudpicklable there;
-  * whether `unsloth` even takes the torch path on Apple Silicon, or diverts to
-    the MLX placeholder.
+  * whether `unsloth` takes the torch path at all on Apple Silicon, or diverts to
+    the MLX placeholder collator.
 
-To get a before/after on the same runner, the pre-PR `__call__` is reconstructed
-as a sibling subclass of the same unsloth_zoo base. Only `unsloth_zoo` + torch are
-required, so macOS still reports real data when `unsloth` itself will not import
-(bitsandbytes has no arm64 wheel).
+To get a before/after on the same runner, both `__call__` bodies are reconstructed
+as sibling subclasses of the installed zoo base (`pr7698_collators.py`). Only
+`unsloth_zoo` + torch are needed, so macOS still reports real data when `unsloth`
+itself will not import.
 
-Diagnostics are printed unconditionally; only the properties that must hold are
-asserted.
+Diagnostics print unconditionally; only properties that must hold are asserted.
 """
 
 import copy
 import multiprocessing
+import os
 import pickle
 import platform
+import subprocess
 import sys
 import threading
 import time
@@ -32,88 +33,15 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 torch = pytest.importorskip("torch")
-vision_utils = pytest.importorskip("unsloth_zoo.vision_utils")
+pytest.importorskip("unsloth_zoo.vision_utils")
 
-ZooBase = vision_utils.UnslothVisionDataCollator
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import pr7698_collators as models  # noqa: E402
 
-def _noop_check(examples, raise_error = True, checked = None):
-    """Stand-in for unsloth.models.vision.check_dataset_for_missing_videos.
-
-    The real one is in `unsloth`, which may not import on every runner; the video
-    scan is irrelevant to what this file measures.
-    """
-    return []
-
-
-class PreFixCollator(ZooBase):
-    """unsloth/trainer.py as it is on main - unsynchronised, mutates self."""
-
-    __slots__ = ("_checked_video_paths",)
-
-    def __call__(self, examples):
-        formatting_func = self.formatting_func
-        if formatting_func is not None:
-            examples = [formatting_func(example) for example in examples]
-
-        _noop_check(examples, raise_error = True, checked = self._checked_video_paths)
-
-        if formatting_func is None:
-            return super().__call__(examples)
-
-        self.formatting_func = None
-        try:
-            return super().__call__(examples)
-        finally:
-            self.formatting_func = formatting_func
-
-
-class PrCollator(ZooBase):
-    """unsloth/trainer.py as PR #7698 makes it - whole call under a Lock."""
-
-    __slots__ = ("_checked_video_paths", "_formatting_lock")
-
-    def __call__(self, examples):
-        with self._formatting_lock:
-            formatting_func = self.formatting_func
-
-            if formatting_func is not None:
-                examples = [formatting_func(example) for example in examples]
-
-            _noop_check(examples, raise_error = True, checked = self._checked_video_paths)
-
-            if formatting_func is None:
-                return super().__call__(examples)
-
-            self.formatting_func = None
-            try:
-                return super().__call__(examples)
-            finally:
-                self.formatting_func = formatting_func
-
-
-def module_formatter(example):
-    """Module level, so it is not itself a pickling obstacle."""
-    return example
-
-
-def build(cls, formatting_func = None, with_zoo_lambda = True):
-    """Populate the slots the real __init__ would, without a model or processor."""
-    collator = cls.__new__(cls)
-    for slot in ZooBase.__slots__:
-        setattr(collator, slot, None)
-    collator.formatting_func = formatting_func
-    collator._checked_video_paths = set()
-    if "_formatting_lock" in cls.__slots__:
-        collator._formatting_lock = threading.Lock()
-    if with_zoo_lambda:
-        # unsloth_zoo/vision_utils.py:858-862 always assigns a local lambda here.
-        resize_dimension = 0
-        collator.size_func = lambda x: x.size[resize_dimension]
-    return collator
-
-
-# ─────────────────────────────────────────────────────────────────────────────
+ZooBase = models.ZooBase
+CHILD = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "pr7698_dataloader_child.py")
 
 
 def test_platform_report(capsys):
@@ -132,24 +60,35 @@ def test_platform_report(capsys):
             import unsloth
             print(f"  unsloth           : {unsloth.__version__} "
                   f"(DEVICE_TYPE={getattr(unsloth, 'DEVICE_TYPE', '?')})")
-            from unsloth.trainer import UnslothVisionDataCollator as Real
-            print(f"  real __slots__    : {Real.__slots__}")
-            print(f"  real is MLX stub  : "
-                  f"{Real.__module__ == 'unsloth' or not issubclass(Real, ZooBase)}")
         except Exception as e:  # noqa: BLE001
-            print(f"  unsloth           : NOT IMPORTABLE ({type(e).__name__}: {str(e)[:70]})")
+            print(f"  unsloth           : NOT IMPORTABLE "
+                  f"({type(e).__name__}: {str(e)[:70]})")
+            return
+        try:
+            from unsloth.trainer import UnslothVisionDataCollator as Real
+        except Exception as e:  # noqa: BLE001
+            print(f"  unsloth.trainer   : NOT IMPORTABLE "
+                  f"({type(e).__name__}: {str(e)[:70]})")
+            return
+        is_zoo_subclass = isinstance(Real, type) and issubclass(Real, ZooBase)
+        print(f"  real collator     : {Real.__module__}.{Real.__qualname__}")
+        print(f"  is the zoo subclass: {is_zoo_subclass} "
+              f"({'torch path' if is_zoo_subclass else 'MLX placeholder'})")
+        print(f"  real __slots__    : {getattr(Real, '__slots__', '<none>')}")
 
 
 def test_real_class_matches_the_reconstruction():
-    """If unsloth imports here, the PR's real class must have the shape this file models."""
+    """Where the torch path is live, the staged class must have the modelled shape."""
     unsloth_trainer = pytest.importorskip("unsloth.trainer")
     real = unsloth_trainer.UnslothVisionDataCollator
-    if not issubclass(real, ZooBase):
+    if not (isinstance(real, type) and issubclass(real, ZooBase)):
         pytest.skip("MLX placeholder collator on this platform, not the torch subclass")
-    assert "_formatting_lock" in real.__slots__, (
+    assert "_formatting_lock" in getattr(real, "__slots__", ()), (
         "the staged branch should contain PR #7698's lock slot"
     )
 
+
+# ─── the race ────────────────────────────────────────────────────────────────
 
 def _race_probe(cls, num_threads = 16, num_examples = 3):
     """Park a leader inside the base exactly inside the mutation window."""
@@ -179,7 +118,7 @@ def _race_probe(cls, num_threads = 16, num_examples = 3):
     original = ZooBase.__call__
     ZooBase.__call__ = fake_base
     try:
-        collator = build(cls, formatter)
+        collator = models.build(cls, formatter)
         work = lambda tid: collator([{"tag": (tid, i)} for i in range(num_examples)])
         with ThreadPoolExecutor(max_workers = num_threads) as pool:
             leader = pool.submit(work, 0)
@@ -196,16 +135,12 @@ def _race_probe(cls, num_threads = 16, num_examples = 3):
         ZooBase.__call__ = original
         release.set()
 
-    return {
-        "formatted": len(formatted),
-        "expected": num_threads * num_examples,
-        "base_saw_none": sum(x is None for x in base_saw),
-        "base_calls": len(base_saw),
-    }
+    return {"formatted": len(formatted), "expected": num_threads * num_examples,
+            "base_saw_none": sum(x is None for x in base_saw), "base_calls": len(base_saw)}
 
 
 def test_race_exists_before_the_pr(capsys):
-    result = _race_probe(PreFixCollator)
+    result = _race_probe(models.PreFixCollator)
     with capsys.disabled():
         print(f"\n  pre-PR  race probe: formatted {result['formatted']}/{result['expected']}")
     assert result["formatted"] < result["expected"], (
@@ -214,116 +149,94 @@ def test_race_exists_before_the_pr(capsys):
 
 
 def test_pr_fixes_the_race(capsys):
-    result = _race_probe(PrCollator)
+    result = _race_probe(models.PrCollator)
     with capsys.disabled():
         print(f"  PR      race probe: formatted {result['formatted']}/{result['expected']}")
     assert result["formatted"] == result["expected"]
     assert result["base_saw_none"] == result["base_calls"]
 
 
+# ─── serialization ───────────────────────────────────────────────────────────
+
 @pytest.mark.parametrize("with_zoo_lambda", [True, False],
                          ids = ["zoo_size_func_lambda", "picklable_size_func"])
 def test_serialization_before_and_after(capsys, with_zoo_lambda):
-    """Records, does not gate: what each serializer does on this OS, pre-PR vs PR."""
-    rows = []
-    for label, cls in (("pre-PR", PreFixCollator), ("PR", PrCollator)):
-        collator = build(cls, module_formatter, with_zoo_lambda = with_zoo_lambda)
-        if not with_zoo_lambda:
-            collator.size_func = max
+    """Records, does not gate.
+
+    The serialization regression is already established and is identical on every
+    OS, so gating three runners on it would just triplicate one finding and mask
+    anything genuinely platform-specific. Regressions are marked in the printout.
+    """
+    table = {}
+    for label, cls in models.VARIANTS.items():
+        collator = models.build(cls, models.module_formatter,
+                                with_zoo_lambda = with_zoo_lambda)
         outcomes = {}
-        for name, op in (
-            ("pickle", lambda c = collator: pickle.dumps(c)),
-            ("deepcopy", lambda c = collator: copy.deepcopy(c)),
-        ):
+        probes = [("pickle", lambda c: pickle.dumps(c)),
+                  ("deepcopy", lambda c: copy.deepcopy(c))]
+        try:
+            import cloudpickle
+            probes.append(("cloudpickle", lambda c: cloudpickle.loads(cloudpickle.dumps(c))))
+        except ImportError:
+            outcomes["cloudpickle"] = "not installed"
+        for name, op in probes:
             try:
-                op()
+                op(collator)
                 outcomes[name] = "ok"
             except Exception as e:  # noqa: BLE001
                 outcomes[name] = type(e).__name__
-        try:
-            import cloudpickle
-            try:
-                cloudpickle.loads(cloudpickle.dumps(collator))
-                outcomes["cloudpickle"] = "ok"
-            except Exception as e:  # noqa: BLE001
-                outcomes["cloudpickle"] = type(e).__name__
-        except ImportError:
-            outcomes["cloudpickle"] = "not installed"
-        rows.append((label, outcomes))
+        table[label] = outcomes
+
     with capsys.disabled():
-        print(f"\n  serialization ({'zoo lambda' if with_zoo_lambda else 'picklable size_func'}):")
-        for label, outcomes in rows:
+        print(f"\n  serialization "
+              f"({'zoo lambda' if with_zoo_lambda else 'picklable size_func'}):")
+        for label, outcomes in table.items():
             print(f"    {label:<7} " + "  ".join(f"{k}={v}" for k, v in outcomes.items()))
 
-
-class _PassThrough:
-    """Top level so spawn can pickle the wrapper itself."""
-
-    def __init__(self, collator):
-        self.collator = collator
-
-    def __call__(self, rows):
-        return self.collator(rows)
+    regressed = [k for k, v in table["pre-PR"].items()
+                 if v == "ok" and table["PR"].get(k) not in ("ok", "not installed")]
+    with capsys.disabled():
+        print(f"    -> REGRESSED BY THE PR on {platform.system()}: {regressed or 'nothing'}")
 
 
-@pytest.mark.parametrize("with_zoo_lambda", [True, False],
-                         ids = ["zoo_size_func_lambda", "picklable_size_func"])
-def test_dataloader_default_start_method(capsys, with_zoo_lambda):
-    """The decisive platform question: does a real DataLoader with workers survive?
+# ─── the real DataLoader, in a child with a __main__ guard ───────────────────
 
-    Uses whatever start method this OS defaults to, i.e. spawn on Windows/macOS.
+@pytest.mark.parametrize("size_mode", ["zoo_lambda", "picklable"])
+def test_dataloader_default_start_method(capsys, size_mode):
+    """Does a real DataLoader with workers survive this OS's default start method?
+
+    Runs in a child script: under `spawn` the workers re-import `__main__`, so
+    doing this inside pytest re-enters pytest in the child and fails for reasons
+    that have nothing to do with the collator.
     """
-    from torch.utils.data import DataLoader
-
-    rows_out = []
-    for label, cls in (("pre-PR", PreFixCollator), ("PR", PrCollator)):
-        collator = build(cls, module_formatter, with_zoo_lambda = with_zoo_lambda)
-        if not with_zoo_lambda:
-            collator.size_func = max
-        original = ZooBase.__call__
-        ZooBase.__call__ = lambda self, examples: {"n": len(examples)}
-        try:
-            loader = DataLoader(
-                [{"tag": i} for i in range(4)], batch_size = 2, num_workers = 2,
-                collate_fn = _PassThrough(collator),
-            )
-            for _ in loader:
-                pass
-            rows_out.append((label, "ok"))
-        except Exception as e:  # noqa: BLE001
-            rows_out.append((label, f"{type(e).__name__}: {str(e)[:60]}"))
-        finally:
-            ZooBase.__call__ = original
+    outcomes = {}
+    for label in models.VARIANTS:
+        proc = subprocess.run([sys.executable, CHILD, label, size_mode],
+                              capture_output = True, text = True, timeout = 300)
+        outcomes[label] = (proc.stdout.strip().splitlines() or ["<no output>"])[-1]
 
     with capsys.disabled():
         method = multiprocessing.get_start_method(allow_none = False)
-        print(f"\n  DataLoader(num_workers=2, start={method}, "
-              f"{'zoo lambda' if with_zoo_lambda else 'picklable size_func'}):")
-        for label, outcome in rows_out:
+        print(f"\n  DataLoader(num_workers=2, start={method}, {size_mode}):")
+        for label, outcome in outcomes.items():
             print(f"    {label:<7} {outcome}")
 
-    # The gate: the PR must not newly break a configuration that worked before it.
-    before, after = dict(rows_out)["pre-PR"], dict(rows_out)["PR"]
-    assert not (before == "ok" and after != "ok"), (
+    assert not (outcomes["pre-PR"] == "OK" and outcomes["PR"] != "OK"), (
         f"PR #7698 breaks DataLoader workers on {platform.system()} "
         f"(start method {multiprocessing.get_start_method(allow_none = False)}): "
-        f"pre-PR={before} PR={after}"
+        f"pre-PR={outcomes['pre-PR']} PR={outcomes['PR']}"
     )
 
 
-def test_reentrant_formatter(capsys):
-    """A formatter that re-enters the collator.
+# ─── reentrancy (recorded, not gated - it is a Lock property, not an OS one) ──
 
-    Records only: the outcome is a property of `threading.Lock`, not of the OS, so
-    gating three runners on it would just triplicate one finding. Guarded with a
-    daemon thread so a deadlock cannot keep the runner alive.
-    """
+def test_reentrant_formatter(capsys):
     outcomes = []
     original = ZooBase.__call__
     ZooBase.__call__ = lambda self, examples: examples
     try:
-        for label, cls in (("pre-PR", PreFixCollator), ("PR", PrCollator)):
-            collator = build(cls, None)
+        for label, cls in models.VARIANTS.items():
+            collator = models.build(cls, None)
             depth = {"n": 0}
 
             def recursive(example, _c = collator, _d = depth):
@@ -334,20 +247,16 @@ def test_reentrant_formatter(capsys):
 
             collator.formatting_func = recursive
             done = threading.Event()
-            errors = []
 
-            def run():
+            def run(_c = collator, _done = done):
                 try:
-                    collator([{"outer": True}])
-                except Exception as e:  # noqa: BLE001
-                    errors.append(e)
+                    _c([{"outer": True}])
                 finally:
-                    done.set()
+                    _done.set()
 
             # daemon, so a deadlocked thread cannot keep the runner alive
             threading.Thread(target = run, daemon = True).start()
-            finished = done.wait(20)
-            outcomes.append((label, "completed" if finished else "DEADLOCK (20s)"))
+            outcomes.append((label, "completed" if done.wait(20) else "DEADLOCK (20s)"))
     finally:
         ZooBase.__call__ = original
 
