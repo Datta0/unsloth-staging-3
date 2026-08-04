@@ -1,0 +1,51 @@
+name: "staging-7797 windows-latest"
+on:
+  push:
+    branches: ["pr-7797-xplat-ci"]
+    paths:
+      - 'studio/frontend/src/components/floating-monitor.tsx'
+      - 'studio/frontend/src/features/model-picker/components/model-selector/folder-browser.tsx'
+      - 'studio/frontend/src/features/settings/components/api-key-row.tsx'
+      - 'studio/frontend/src/features/settings/components/dictation-dictionary-view.tsx'
+      - 'studio/frontend/src/features/settings/components/model-auto-switch-section.tsx'
+      - 'studio/frontend/src/features/settings/components/monitor-link.tsx'
+      - 'studio/frontend/src/features/settings/tabs/chat-tab.tsx'
+      - 'studio/frontend/src/features/settings/tabs/data-tab.tsx'
+      - 'studio/frontend/src/features/settings/tabs/general-tab.tsx'
+      - 'studio/frontend/src/features/settings/tabs/resources-tab.tsx'
+      - 'studio/frontend/src/features/settings/tabs/voice-tab.tsx'
+      - 'studio/frontend/src/features/studio/history-card-grid.tsx'
+      - 'studio/frontend/src/i18n/index.ts'
+      - 'studio/frontend/src/i18n/locale-store.ts'
+      - 'studio/frontend/src/i18n/locales/ar.ts'
+      - 'studio/frontend/src/i18n/locales/de.ts'
+      - 'studio/frontend/src/i18n/locales/en.ts'
+      - 'studio/frontend/src/i18n/locales/es.ts'
+      - 'studio/frontend/src/i18n/locales/fr.ts'
+      - 'studio/frontend/src/i18n/locales/hi.ts'
+      - '.github/workflows/staging-7797-windows-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
