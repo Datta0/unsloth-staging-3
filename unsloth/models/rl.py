@@ -756,9 +756,7 @@ def _patch_trl_rl_trainers(trainer_file = "grpo_trainer"):
     try:
         return _patch_trl_rl_trainers_impl(trainer_file)
     except Exception as e:
-        logger.info(
-            f"Unsloth: Could not patch trl.trainer.{trainer_file}: " f"{type(e).__name__}: {e}"
-        )
+        logger.info(f"Unsloth: Could not patch trl.trainer.{trainer_file}: {type(e).__name__}: {e}")
         return
 
 
@@ -2076,7 +2074,7 @@ def patch_functions(RLTrainer, trainer_file, RLTrainer_name, all_imports, import
                 sampling_params = re.sub(r"[\,][\s]{0,}\,", ",", sampling_params)
 
                 new_vllm_part = (
-                    f"\n{' ' * 8}if {args}.use_vllm:\n{sampling_params}" f"\n{' ' * 8}else:\n"
+                    f"\n{' ' * 8}if {args}.use_vllm:\n{sampling_params}\n{' ' * 8}else:\n"
                 )
 
         if trl_version >= Version("0.18.0"):
