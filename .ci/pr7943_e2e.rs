@@ -45,8 +45,9 @@ fn powershell_script_path(path: &Path) -> PathBuf {
     };
 
     // Only the verbatim form addresses a path past MAX_PATH; stripping it there
-    // would trade an authorization error for a "path too long" one.
-    if normalized.len() > 260 {
+    // would trade an authorization error for a "path too long" one. MAX_PATH
+    // counts the terminating NUL, so 259 units is the longest legacy path.
+    if normalized.len() >= 260 {
         return path.to_path_buf();
     }
 
