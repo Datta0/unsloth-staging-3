@@ -7,68 +7,93 @@
 use std::path::{Path, PathBuf};
 
 // ===========================================================================
-// The PR implementation, copied byte-for-byte from studio/src-tauri/src/install.rs
+// Copied verbatim from studio/src-tauri/src/install.rs at this commit.
 // ===========================================================================
 #[cfg(windows)]
 fn powershell_script_path(path: &Path) -> PathBuf {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    let verbatim_unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
-    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    // Everything after `\\?\` reaches the object manager, which is case insensitive.
+    fn is(unit: Option<&u16>, ascii: u8) -> bool {
+        unit.is_some_and(|value| *value < 128 && (*value as u8).eq_ignore_ascii_case(&ascii))
+    }
 
-    let normalized = if wide.starts_with(&verbatim_unc) {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    if !wide.starts_with(&verbatim) {
+        return path.to_path_buf();
+    }
+    let rest = &wide[verbatim.len()..];
+
+    let is_drive = rest.first().is_some_and(|value| {
+        (b'A' as u16..=b'Z' as u16).contains(value) || (b'a' as u16..=b'z' as u16).contains(value)
+    }) && rest.get(1) == Some(&(b':' as u16))
+        && rest.get(2) == Some(&(b'\\' as u16));
+
+    let normalized = if is(rest.first(), b'U')
+        && is(rest.get(1), b'N')
+        && is(rest.get(2), b'C')
+        && rest.get(3) == Some(&(b'\\' as u16))
+    {
         let mut value: Vec<u16> = r"\\".encode_utf16().collect();
-        value.extend_from_slice(&wide[verbatim_unc.len()..]);
+        value.extend_from_slice(&rest[4..]);
         value
+    } else if is_drive {
+        rest.to_vec()
     } else {
-        let drive = wide.get(verbatim.len()).copied();
-        let is_ascii_drive = drive.is_some_and(|value| {
-            (b'A' as u16..=b'Z' as u16).contains(&value)
-                || (b'a' as u16..=b'z' as u16).contains(&value)
-        });
-        if wide.starts_with(&verbatim)
-            && is_ascii_drive
-            && wide.get(verbatim.len() + 1) == Some(&(b':' as u16))
-            && wide.get(verbatim.len() + 2) == Some(&(b'\\' as u16))
-        {
-            wide[verbatim.len()..].to_vec()
-        } else {
-            return path.to_path_buf();
-        }
+        return path.to_path_buf();
     };
+
+    // Only the verbatim form addresses a path past MAX_PATH; stripping it there
+    // would trade an authorization error for a "path too long" one.
+    if normalized.len() > 260 {
+        return path.to_path_buf();
+    }
 
     PathBuf::from(OsString::from_wide(&normalized))
 }
 
-// OS-independent port of the identical arithmetic, for Linux/macOS legs.
 #[cfg(not(windows))]
 fn powershell_script_path(path: &Path) -> PathBuf {
-    let wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
-    let verbatim_unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
-    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
 
-    let normalized = if wide.starts_with(&verbatim_unc) {
+    // Everything after `\\?\` reaches the object manager, which is case insensitive.
+    fn is(unit: Option<&u16>, ascii: u8) -> bool {
+        unit.is_some_and(|value| *value < 128 && (*value as u8).eq_ignore_ascii_case(&ascii))
+    }
+
+    let wide: Vec<u16> = path.to_string_lossy().encode_utf16().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    if !wide.starts_with(&verbatim) {
+        return path.to_path_buf();
+    }
+    let rest = &wide[verbatim.len()..];
+
+    let is_drive = rest.first().is_some_and(|value| {
+        (b'A' as u16..=b'Z' as u16).contains(value) || (b'a' as u16..=b'z' as u16).contains(value)
+    }) && rest.get(1) == Some(&(b':' as u16))
+        && rest.get(2) == Some(&(b'\\' as u16));
+
+    let normalized = if is(rest.first(), b'U')
+        && is(rest.get(1), b'N')
+        && is(rest.get(2), b'C')
+        && rest.get(3) == Some(&(b'\\' as u16))
+    {
         let mut value: Vec<u16> = r"\\".encode_utf16().collect();
-        value.extend_from_slice(&wide[verbatim_unc.len()..]);
+        value.extend_from_slice(&rest[4..]);
         value
+    } else if is_drive {
+        rest.to_vec()
     } else {
-        let drive = wide.get(verbatim.len()).copied();
-        let is_ascii_drive = drive.is_some_and(|value| {
-            (b'A' as u16..=b'Z' as u16).contains(&value)
-                || (b'a' as u16..=b'z' as u16).contains(&value)
-        });
-        if wide.starts_with(&verbatim)
-            && is_ascii_drive
-            && wide.get(verbatim.len() + 1) == Some(&(b':' as u16))
-            && wide.get(verbatim.len() + 2) == Some(&(b'\\' as u16))
-        {
-            wide[verbatim.len()..].to_vec()
-        } else {
-            return path.to_path_buf();
-        }
+        return path.to_path_buf();
     };
+
+    // Only the verbatim form addresses a path past MAX_PATH; stripping it there
+    // would trade an authorization error for a "path too long" one.
+    if normalized.len() > 260 {
+        return path.to_path_buf();
+    }
+
     PathBuf::from(String::from_utf16_lossy(&normalized))
 }
 
@@ -138,7 +163,8 @@ fn main() {
         if !ok { missed += 1; }
         println!("  {tok:<5} -> {:<42} {}", got, if ok { "normalized" } else { "LEFT VERBATIM" });
     }
-    println!("  {missed}/8 spellings left unnormalized");
+    println!("  {missed}/8 spellings left unnormalized (expected 0)");
+    fails += missed;
 
     println!("\n== Invariants over a generated corpus ==");
     let prefixes = [r"\\?\", r"\\.\", r"\\", "", r"\", r"\\?", r"\?\"];
@@ -166,8 +192,14 @@ fn main() {
         let fill = total.saturating_sub(base.len() + 12);
         let inp = format!(r"{base}{}\install.ps1", "a".repeat(fill));
         let out = norm(&inp);
+        let over = out.chars().count() > 260;
         println!("  in={:<4} out={:<4} de-verbatimized={:<5} out>MAX_PATH={}",
-                 inp.chars().count(), out.chars().count(), out != inp, out.chars().count() > 260);
+                 inp.chars().count(), out.chars().count(), out != inp, over);
+        // A stripped path must never end up longer than MAX_PATH.
+        if over && out != inp {
+            println!("  FAIL: de-verbatimized past MAX_PATH");
+            fails += 1;
+        }
     }
 
     // Real filesystem probes: only meaningful on Windows.

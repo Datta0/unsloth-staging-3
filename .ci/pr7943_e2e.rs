@@ -13,30 +13,42 @@ fn powershell_script_path(path: &Path) -> PathBuf {
     use std::ffi::OsString;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
 
-    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    let verbatim_unc: Vec<u16> = r"\\?\UNC\".encode_utf16().collect();
-    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    // Everything after `\\?\` reaches the object manager, which is case insensitive.
+    fn is(unit: Option<&u16>, ascii: u8) -> bool {
+        unit.is_some_and(|value| *value < 128 && (*value as u8).eq_ignore_ascii_case(&ascii))
+    }
 
-    let normalized = if wide.starts_with(&verbatim_unc) {
+    let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let verbatim: Vec<u16> = r"\\?\".encode_utf16().collect();
+    if !wide.starts_with(&verbatim) {
+        return path.to_path_buf();
+    }
+    let rest = &wide[verbatim.len()..];
+
+    let is_drive = rest.first().is_some_and(|value| {
+        (b'A' as u16..=b'Z' as u16).contains(value) || (b'a' as u16..=b'z' as u16).contains(value)
+    }) && rest.get(1) == Some(&(b':' as u16))
+        && rest.get(2) == Some(&(b'\\' as u16));
+
+    let normalized = if is(rest.first(), b'U')
+        && is(rest.get(1), b'N')
+        && is(rest.get(2), b'C')
+        && rest.get(3) == Some(&(b'\\' as u16))
+    {
         let mut value: Vec<u16> = r"\\".encode_utf16().collect();
-        value.extend_from_slice(&wide[verbatim_unc.len()..]);
+        value.extend_from_slice(&rest[4..]);
         value
+    } else if is_drive {
+        rest.to_vec()
     } else {
-        let drive = wide.get(verbatim.len()).copied();
-        let is_ascii_drive = drive.is_some_and(|value| {
-            (b'A' as u16..=b'Z' as u16).contains(&value)
-                || (b'a' as u16..=b'z' as u16).contains(&value)
-        });
-        if wide.starts_with(&verbatim)
-            && is_ascii_drive
-            && wide.get(verbatim.len() + 1) == Some(&(b':' as u16))
-            && wide.get(verbatim.len() + 2) == Some(&(b'\\' as u16))
-        {
-            wide[verbatim.len()..].to_vec()
-        } else {
-            return path.to_path_buf();
-        }
+        return path.to_path_buf();
     };
+
+    // Only the verbatim form addresses a path past MAX_PATH; stripping it there
+    // would trade an authorization error for a "path too long" one.
+    if normalized.len() > 260 {
+        return path.to_path_buf();
+    }
 
     PathBuf::from(OsString::from_wide(&normalized))
 }
