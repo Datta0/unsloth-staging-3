@@ -74,28 +74,53 @@ def part_a() -> None:
     child_py = REPO / "_pr7932_child_a.py"
     child_py.write_text(CHILD_A, encoding = "utf-8")
 
-    kwargs: dict = {}
-    create_no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    if create_no_window:
-        kwargs["creationflags"] = create_no_window
-    si = subprocess.STARTUPINFO()
-    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-    si.wShowWindow = subprocess.SW_HIDE
-    kwargs["startupinfo"] = si
+    def _si_hide():
+        si = subprocess.STARTUPINFO()
+        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        si.wShowWindow = subprocess.SW_HIDE
+        return si
 
-    # Deliberately NO stdout=/stderr=/stdin= -- this is studio.py:1599 verbatim, so
-    # close_fds defaults to True and CreateProcess gets bInheritHandles=FALSE.
-    emit("  parent: Popen(child, creationflags=CREATE_NO_WINDOW, startupinfo=SW_HIDE)")
-    emit("          no stdout=/stderr=/stdin= -> close_fds=True -> bInheritHandles=FALSE")
-    proc = subprocess.Popen([sys.executable, str(child_py), str(report)], **kwargs)
-    proc.wait(timeout = 120)
-    emit(f"  child exit code: {proc.returncode}")
-    if report.is_file():
-        emit("  child reported:")
-        for line in report.read_text(encoding = "utf-8").splitlines():
-            emit(f"      {line}")
-    else:
-        emit("  child produced no report file")
+    CNW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    DETACHED = getattr(subprocess, "DETACHED_PROCESS", 0)
+    pythonw = Path(sys.executable).with_name("pythonw.exe")
+
+    # Which launch shape actually leaves the interpreter with no std streams?
+    cases = [
+        ("CREATE_NO_WINDOW + SW_HIDE (studio.py:1599 verbatim)",
+         sys.executable, {"creationflags": CNW, "startupinfo": _si_hide()}),
+        ("CREATE_NO_WINDOW only",
+         sys.executable, {"creationflags": CNW}),
+        ("DETACHED_PROCESS",
+         sys.executable, {"creationflags": DETACHED}),
+        ("DETACHED_PROCESS + CREATE_NO_WINDOW",
+         sys.executable, {"creationflags": DETACHED | CNW}),
+        ("pythonw.exe (GUI subsystem), no flags",
+         str(pythonw) if pythonw.is_file() else None, {}),
+        ("pythonw.exe + CREATE_NO_WINDOW",
+         str(pythonw) if pythonw.is_file() else None, {"creationflags": CNW}),
+    ]
+
+    for label, exe, kwargs in cases:
+        emit(f"  --- {label}")
+        if exe is None:
+            emit("      SKIPPED: pythonw.exe not present next to this interpreter")
+            continue
+        if report.is_file():
+            report.unlink()
+        # Deliberately NO stdout=/stderr=/stdin=, so close_fds stays True
+        # (bInheritHandles=FALSE), exactly as the real launcher does.
+        try:
+            proc = subprocess.Popen([exe, str(child_py), str(report)], **kwargs)
+            proc.wait(timeout = 120)
+            emit(f"      child exit code: {proc.returncode}")
+        except Exception as exc:
+            emit(f"      launch failed: {type(exc).__name__}: {exc}")
+            continue
+        if report.is_file():
+            for line in report.read_text(encoding = "utf-8").splitlines():
+                emit(f"      {line}")
+        else:
+            emit("      child produced no report file")
     emit()
 
 
