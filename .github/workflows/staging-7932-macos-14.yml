@@ -4,6 +4,8 @@ on:
     branches: ["pr-7932-xplat-ci"]
     paths:
       - 'studio/backend/run.py'
+      - 'studio/backend/tests/test_server_disk_logging*.py'
+      - 'tests/staging_pr7932_stdio_probe.py'
       - '.github/workflows/staging-7932-macos-14.yml'
   workflow_dispatch:
 concurrency:
@@ -30,3 +32,8 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
       - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/studio/test_tee_stream_none_guard.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
+      - name: "PR 7932 -- no-console stdio probe (reports, never gates)"
+        run: python -u tests/staging_pr7932_stdio_probe.py
+      - name: "PR 7932 -- REAL behavioural suite for _TeeStream"
+        working-directory: studio/backend
+        run: python -m pytest tests/test_server_disk_logging.py tests/test_server_disk_logging_outstream.py -q --tb=short
