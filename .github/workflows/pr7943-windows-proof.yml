@@ -1,0 +1,305 @@
+name: PR7943 proof
+
+# Definitive validation of PR #7943 (Windows PowerShell verbatim resource path).
+# Three questions, answered on real runners rather than by reasoning:
+#   1. Does Windows PowerShell 5.1 under RemoteSigned really reject a \\?\ script path?
+#   2. Does the path Tauri hands install.rs actually carry the \\?\ prefix?
+#   3. Does the PR's normalization compile + pass on Windows, and change nothing elsewhere?
+
+on:
+  push:
+    branches: ['pr-7943-**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Q1 ── the authorization behaviour itself, isolated from Rust entirely ──
+  authmanager-repro:
+    name: PS 5.1 RemoteSigned vs verbatim path
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: A/B the exact command shape install.rs uses
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          if (-not (Test-Path $ps51)) { throw "Windows PowerShell 5.1 not found at $ps51" }
+          "PS 5.1 version: " + (& $ps51 -NoProfile -Command '$PSVersionTable.PSVersion.ToString()')
+
+          # Mirror the real install dir shape from the field report: spaces AND parentheses.
+          $dir = Join-Path $env:LOCALAPPDATA 'Unsloth Studio (Desktop)'
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $probe = Join-Path $dir 'probe.ps1'
+          Set-Content -LiteralPath $probe -Value 'Write-Output "SCRIPT_RAN_OK"' -Encoding ASCII
+
+          $ordinary = $probe
+          $verbatim = "\\?\" + $probe
+
+          function Invoke-Probe {
+            param([string]$Label, [string]$ScriptPath, [string]$Policy)
+            $a = @('-NoLogo','-NoProfile','-NonInteractive','-ExecutionPolicy',$Policy,'-File',$ScriptPath)
+            $out = & $ps51 @a 2>&1 | Out-String
+            $ran  = $out -match 'SCRIPT_RAN_OK'
+            $auth = $out -match 'AuthorizationManager|UnauthorizedAccess'
+            Write-Host ("  {0,-38} ran={1,-5} authError={2,-5} :: {3}" -f `
+              $Label, $ran, $auth, (($out.Trim() -replace "`r?`n", ' | ')))
+            [pscustomobject]@{ Label=$Label; Ran=$ran; Auth=$auth }
+          }
+
+          $results = @()
+          Write-Host "===== UNSIGNED, no mark-of-the-web, local file ====="
+          $results += Invoke-Probe 'unsigned ordinary + RemoteSigned' $ordinary 'RemoteSigned'
+          $results += Invoke-Probe 'unsigned verbatim + RemoteSigned' $verbatim 'RemoteSigned'
+          $results += Invoke-Probe 'unsigned ordinary + Bypass'       $ordinary 'Bypass'
+          $results += Invoke-Probe 'unsigned verbatim + Bypass'       $verbatim 'Bypass'
+
+          Write-Host "`n===== streams on the probe (field report showed only :`$DATA) ====="
+          Get-Item -LiteralPath $probe -Stream * | Select-Object Stream, Length |
+            Format-Table | Out-String | Write-Host
+
+          # ---- the field report's exact situation: VALIDLY SIGNED, no MOTW ----
+          Write-Host "`n===== SIGNED (trusted publisher), no mark-of-the-web ====="
+          $cert = New-SelfSignedCertificate -Subject 'CN=PR7943 Test Signer' `
+                    -Type CodeSigningCert -CertStoreLocation Cert:\CurrentUser\My
+          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new('Root','CurrentUser')
+          $store.Open('ReadWrite'); $store.Add($cert); $store.Close()
+          $pub = [System.Security.Cryptography.X509Certificates.X509Store]::new('TrustedPublisher','CurrentUser')
+          $pub.Open('ReadWrite'); $pub.Add($cert); $pub.Close()
+
+          $signed = Join-Path $dir 'signed_probe.ps1'
+          Set-Content -LiteralPath $signed -Value 'Write-Output "SCRIPT_RAN_OK"' -Encoding ASCII
+          Set-AuthenticodeSignature -FilePath $signed -Certificate $cert | Out-Null
+          $sig = Get-AuthenticodeSignature -FilePath $signed
+          Write-Host "  signature status = $($sig.Status)  signer = $($sig.SignerCertificate.Subject)"
+          $results += Invoke-Probe 'SIGNED ordinary + RemoteSigned' $signed 'RemoteSigned'
+          $results += Invoke-Probe 'SIGNED verbatim + RemoteSigned' ("\\?\" + $signed) 'RemoteSigned'
+          $results += Invoke-Probe 'SIGNED ordinary + AllSigned'    $signed 'AllSigned'
+          $results += Invoke-Probe 'SIGNED verbatim + AllSigned'    ("\\?\" + $signed) 'AllSigned'
+
+          Write-Host "`n===== SIGNED + explicit Zone.Identifier (mark-of-the-web) ====="
+          Set-Content -Path $signed -Stream 'Zone.Identifier' -Value "[ZoneTransfer]`r`nZoneId=3"
+          $results += Invoke-Probe 'SIGNED+MOTW ordinary + RemoteSigned' $signed 'RemoteSigned'
+          $results += Invoke-Probe 'SIGNED+MOTW verbatim + RemoteSigned' ("\\?\" + $signed) 'RemoteSigned'
+          Clear-Content -Path $signed -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue
+
+          Write-Host "`n===== UNSIGNED + Zone.Identifier ====="
+          Set-Content -Path $probe -Stream 'Zone.Identifier' -Value "[ZoneTransfer]`r`nZoneId=3"
+          $results += Invoke-Probe 'unsigned+MOTW ordinary + RemoteSigned' $ordinary 'RemoteSigned'
+          $results += Invoke-Probe 'unsigned+MOTW verbatim + RemoteSigned' $verbatim 'RemoteSigned'
+          Clear-Content -Path $probe -Stream 'Zone.Identifier' -ErrorAction SilentlyContinue
+
+          Write-Host "`n===== repo install.ps1 (unsigned), invalid arg so it exits early ====="
+          $real = Join-Path $dir 'install.ps1'
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE 'install.ps1') -Destination $real -Force
+          foreach ($p in @($real, ("\\?\" + $real))) {
+            $lbl = if ($p.StartsWith('\\?\')) { 'verbatim' } else { 'ordinary' }
+            $out = & $ps51 -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File $p '--package' '###invalid###' 2>&1 | Out-String
+            $auth = $out -match 'AuthorizationManager|UnauthorizedAccess'
+            $started = $out -match 'contains invalid characters'
+            Write-Host "  repo install.ps1 ($lbl): authError=$auth scriptStarted=$started"
+          }
+
+          # ---- THE FIELD REPORT, EXACTLY ----
+          # The genuine signed install.ps1 lifted out of the real 0.1.521-beta
+          # Windows installer, at the real install directory, with no MOTW.
+          Write-Host "`n===== REAL SIGNED install.ps1 from Unsloth-Desktop-0_1_521_beta-Windows.exe ====="
+          $rel = Join-Path $dir 'install.ps1'
+          Copy-Item -LiteralPath (Join-Path $env:GITHUB_WORKSPACE '.ci/real_signed_install.ps1') -Destination $rel -Force
+          $rsig = Get-AuthenticodeSignature -FilePath $rel
+          Write-Host "  Status        : $($rsig.Status)"
+          Write-Host "  StatusMessage : $($rsig.StatusMessage)"
+          Write-Host "  Signer        : $($rsig.SignerCertificate.Subject)"
+          Write-Host "  Issuer        : $($rsig.SignerCertificate.Issuer)"
+          Write-Host "  NotAfter      : $($rsig.SignerCertificate.NotAfter)"
+          Write-Host "  Streams       : $((Get-Item -LiteralPath $rel -Stream * | Select-Object -Expand Stream) -join ', ')"
+          $relResults = @()
+          foreach ($p in @($rel, ("\\?\" + $rel))) {
+            $lbl = if ($p.StartsWith('\\?\')) { 'verbatim' } else { 'ordinary' }
+            $out = & $ps51 -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned -File $p '--package' '###invalid###' 2>&1 | Out-String
+            $auth = $out -match 'AuthorizationManager|UnauthorizedAccess'
+            $started = $out -match 'contains invalid characters'
+            Write-Host "  SIGNED RELEASE ($lbl): authError=$auth scriptStarted=$started"
+            Write-Host "    -> " + (($out.Trim() -replace "`r?`n", ' | ') -replace '^(.{0,500}).*$','$1')
+            $relResults += [pscustomobject]@{ Label=$lbl; Ran=$started; Auth=$auth }
+          }
+          $ro = $relResults | Where-Object { $_.Label -eq 'ordinary' }
+          $rv = $relResults | Where-Object { $_.Label -eq 'verbatim' }
+          if ($ro.Ran -and -not $rv.Ran) {
+            Write-Host "  ==> FIELD REPORT REPRODUCED with the genuine signed release script."
+          } elseif ($ro.Ran -and $rv.Ran) {
+            Write-Host "  ==> NOT reproduced with the signed release script: both spellings ran."
+          } else {
+            Write-Host "  ==> Inconclusive: the ordinary spelling did not run either."
+          }
+
+          Write-Host "`n===== RESULT MATRIX ====="
+          $results | Format-Table Label, Ran, Auth -AutoSize | Out-String | Write-Host
+
+          Write-Host "===== VERDICT ====="
+          $sv = $results | Where-Object { $_.Label -eq 'SIGNED verbatim + RemoteSigned' }
+          $so = $results | Where-Object { $_.Label -eq 'SIGNED ordinary + RemoteSigned' }
+          Write-Host "SIGNED verbatim + RemoteSigned  ran=$($sv.Ran) authError=$($sv.Auth)"
+          Write-Host "SIGNED ordinary + RemoteSigned  ran=$($so.Ran) authError=$($so.Auth)"
+          if ($so.Ran -and -not $sv.Ran) {
+            Write-Host "CONFIRMED (signed case = the field report): the \\?\ spelling alone breaks RemoteSigned even for a validly signed script with no MOTW. PR #7943 addresses the real cause."
+          } elseif ($so.Ran -and $sv.Ran) {
+            Write-Host "SIGNED CASE NOT REPRODUCED: a valid signature rescues the verbatim spelling, so the field report has another cause."
+          } else {
+            Write-Host "INCONCLUSIVE for the signed case."
+          }
+
+      # End-to-end: take the path Tauri really produces, run it through the PR's
+      # normalizer, and hand both spellings to PS 5.1. This is the actual before/after.
+      - uses: dtolnay/rust-toolchain@stable
+      - name: End-to-end before/after using the PR's own function
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/e2e/src"
+          cp .ci/pr7943_e2e.rs "$RUNNER_TEMP/e2e/src/main.rs"
+          cd "$RUNNER_TEMP/e2e"
+          cat > Cargo.toml <<'EOF'
+          [package]
+          name = "e2e"
+          version = "0.1.0"
+          edition = "2021"
+          EOF
+          cargo run --quiet | tee "$RUNNER_TEMP/e2e_paths.txt"
+
+      - name: Feed both spellings to PS 5.1
+        shell: pwsh
+        run: |
+          $ps51 = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          $lines = Get-Content "$env:RUNNER_TEMP\e2e_paths.txt"
+          $before = ($lines | Where-Object { $_ -like 'TAURI_LIKE_PATH=*' }) -replace '^TAURI_LIKE_PATH=',''
+          $after  = ($lines | Where-Object { $_ -like 'AFTER_PR_PATH=*' })  -replace '^AFTER_PR_PATH=',''
+          Write-Host "BEFORE PR (what install.rs passed): $before"
+          Write-Host "AFTER  PR (what install.rs passes): $after"
+          foreach ($p in @(@('BEFORE',$before), @('AFTER',$after))) {
+            $out = & $ps51 -NoLogo -NoProfile -NonInteractive -ExecutionPolicy RemoteSigned `
+                     -File $p[1] '--package' '###invalid###' 2>&1 | Out-String
+            $auth = $out -match 'AuthorizationManager|UnauthorizedAccess'
+            $started = $out -match 'contains invalid characters'
+            Write-Host "  $($p[0]): authError=$auth scriptActuallyStarted=$started"
+          }
+
+  # ── Q2 ── does Tauri's resource path actually arrive verbatim? ──
+  tauri-path-reachability:
+    name: Tauri resource path prefix (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Replicate tauri-utils starting_binary -> resource_dir
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/probe/src"
+          cd "$RUNNER_TEMP/probe"
+          cat > Cargo.toml <<'EOF'
+          [package]
+          name = "probe"
+          version = "0.1.0"
+          edition = "2021"
+          [dependencies]
+          tauri-utils = "2"
+          EOF
+          cat > src/main.rs <<'EOF'
+          // tauri-utils 2.x: platform::current_exe() -> STARTING_BINARY
+          //   -> starting_binary.rs: dangerous_path.canonicalize()
+          //   -> platform::resource_dir() returns that exe's parent on Windows.
+          // So whatever canonicalize() produces is what install.rs receives.
+          fn main() {
+              let raw = std::env::current_exe().unwrap();
+              println!("current_exe()            = {:?}", raw);
+              let canon = std::fs::canonicalize(&raw).unwrap();
+              println!("canonicalize(current_exe)= {:?}", canon);
+              let parent = canon.parent().unwrap().to_path_buf();
+              println!("resource_dir equivalent  = {:?}", parent);
+              let script = parent.join("install.ps1");
+              println!("script path install.rs sees = {:?}", script);
+              let disp = script.display().to_string();
+              println!("VERBATIM_PREFIX_PRESENT  = {}", disp.starts_with(r"\\?\"));
+              // and what tauri-utils itself reports
+              match tauri_utils::platform::current_exe() {
+                  Ok(p) => println!("tauri_utils::platform::current_exe() = {:?} verbatim={}",
+                                    p, p.display().to_string().starts_with(r"\\?\")),
+                  Err(e) => println!("tauri_utils current_exe error: {e}"),
+              }
+          }
+          EOF
+          cargo run --quiet
+
+  # ── Q3 ── the PR's own test, on every OS, plus an exhaustive corpus ──
+  rust-tests:
+    name: cargo test studio/src-tauri (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-22.04, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: studio/src-tauri -> target
+
+      - name: Linux native deps for Tauri / WebKit2GTK
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev libappindicator3-dev \
+            librsvg2-dev libxdo-dev libssl-dev patchelf
+
+      - name: Frontend build (tauri build script needs dist/)
+        working-directory: studio/frontend
+        run: npm ci --no-fund --no-audit && npm run build
+
+      - name: Rust unit tests
+        working-directory: studio/src-tauri
+        run: cargo test --no-fail-fast
+
+      - name: Show that the windows-only test actually ran (Windows only)
+        if: runner.os == 'Windows'
+        working-directory: studio/src-tauri
+        run: cargo test powershell_script_path -- --nocapture --exact install::tests::powershell_script_path_normalizes_verbatim_filesystem_paths
+
+  # ── Q3b ── exhaustive edge-case corpus against the real std::path on Windows ──
+  exhaustive-corpus:
+    name: Exhaustive path corpus (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run corpus
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/corpus/src"
+          cp .ci/pr7943_corpus.rs "$RUNNER_TEMP/corpus/src/main.rs"
+          cd "$RUNNER_TEMP/corpus"
+          cat > Cargo.toml <<'EOF'
+          [package]
+          name = "corpus"
+          version = "0.1.0"
+          edition = "2021"
+          EOF
+          cargo run --quiet --release
