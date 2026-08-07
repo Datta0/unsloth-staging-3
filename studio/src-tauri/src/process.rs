@@ -1610,3 +1610,199 @@ mod exit_status_after_stdout_closed_tests {
         }
     }
 }
+
+// Behavioural proof for the AppImage Python-env scrub. The security suite
+// asserts the call sites exist textually; this drives a REAL venv interpreter
+// under the exact environment AppImageKit's stock AppRun exports, so a scrub
+// that is present but ineffective still fails.
+//
+// AppImageKit's AppRun -- what Tauri's own AppImage bundler installs via
+// linuxdeploy -- exports PYTHONHOME=$APPDIR/usr/ unconditionally. The managed
+// backend entry point is a venv console script, and PYTHONHOME overrides the
+// prefix a venv derives from pyvenv.cfg, so the interpreter dies before it
+// runs a single frame with "Failed to import encodings module".
+#[cfg(test)]
+#[cfg(target_os = "linux")]
+mod appimage_python_env_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    // PYTHONHOME / APPIMAGE are process-global, and cargo runs tests on
+    // parallel threads. Serialise every test that mutates them.
+    static ENV_GUARD: Mutex<()> = Mutex::new(());
+
+    const REPORT: &str =
+        "import os; print('PYTHONHOME=' + os.environ.get('PYTHONHOME', '<unset>')); \
+         print('PYTHONPATH=' + os.environ.get('PYTHONPATH', '<unset>'))";
+
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("unsloth-appimage-env-{tag}-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A real venv, standing in for ~/.unsloth/studio/unsloth_studio.
+    fn make_venv(dir: &Path) -> PathBuf {
+        let venv = dir.join("unsloth_studio");
+        let status = Command::new("python3")
+            .args(["-m", "venv", venv.to_str().unwrap()])
+            .status()
+            .expect("python3 -m venv must be runnable on this runner");
+        assert!(status.success(), "failed to create the test venv");
+        let python = venv.join("bin").join("python");
+        assert!(python.is_file(), "venv produced no bin/python");
+        python
+    }
+
+    struct EnvVars {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvVars {
+        fn set(pairs: &[(&'static str, Option<&str>)]) -> Self {
+            let saved = pairs
+                .iter()
+                .map(|(name, _)| (*name, std::env::var_os(name)))
+                .collect();
+            for (name, value) in pairs {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvVars {
+        fn drop(&mut self) {
+            for (name, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(name, value),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+    }
+
+    /// The AppDir path AppImageKit's AppRun points PYTHONHOME at: no stdlib.
+    fn fake_appdir_usr(dir: &Path) -> String {
+        let usr = dir.join("AppDir").join("usr");
+        std::fs::create_dir_all(&usr).unwrap();
+        format!("{}/", usr.display())
+    }
+
+    /// Negative control: this is the reported crash. Without the scrub, an
+    /// inherited PYTHONHOME kills the venv interpreter before frame zero.
+    #[test]
+    fn inherited_pythonhome_kills_the_managed_interpreter() {
+        let _lock = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch_dir("control");
+        let python = make_venv(&dir);
+        let pythonhome = fake_appdir_usr(&dir);
+        let _env = EnvVars::set(&[
+            ("PYTHONHOME", Some(pythonhome.as_str())),
+            ("APPIMAGE", Some("/tmp/Unsloth.AppImage")),
+        ]);
+
+        // Deliberately NOT scrubbed: reproduce the failure being fixed.
+        let output = Command::new(&python)
+            .args(["-c", REPORT])
+            .output()
+            .expect("spawn must succeed; the interpreter fails after exec");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "expected the interpreter to die, got: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            stderr.contains("Failed to import encodings module"),
+            "expected the reported fatal error, got: {stderr}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fix: with APPIMAGE set, the scrub drops PYTHONHOME / PYTHONPATH and
+    /// the same interpreter starts cleanly.
+    #[test]
+    fn scrub_lets_the_managed_interpreter_start_under_appimage() {
+        let _lock = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch_dir("scrubbed");
+        let python = make_venv(&dir);
+        let pythonhome = fake_appdir_usr(&dir);
+        let _env = EnvVars::set(&[
+            ("PYTHONHOME", Some(pythonhome.as_str())),
+            ("PYTHONPATH", Some("/nonexistent/pyshared")),
+            ("APPIMAGE", Some("/tmp/Unsloth.AppImage")),
+        ]);
+
+        let mut cmd = Command::new(&python);
+        cmd.args(["-c", REPORT]);
+        crate::process::scrub_appimage_python_env(&mut cmd);
+        let output = cmd.output().expect("spawn failed");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "interpreter still failed after the scrub: {stderr}"
+        );
+        assert!(
+            stdout.contains("PYTHONHOME=<unset>"),
+            "PYTHONHOME reached the child: {stdout}"
+        );
+        assert!(
+            stdout.contains("PYTHONPATH=<unset>"),
+            "PYTHONPATH reached the child: {stdout}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tokio spawn sites (install probe, auth provisioning) scrub the same
+    /// pair. Asserted through the builder, which is all tokio exposes here.
+    #[test]
+    fn tokio_scrub_removes_the_same_variables_under_appimage() {
+        let _lock = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::set(&[("APPIMAGE", Some("/tmp/Unsloth.AppImage"))]);
+
+        let mut cmd = tokio::process::Command::new("python3");
+        crate::process::scrub_appimage_python_env_tokio(&mut cmd);
+
+        let std_cmd = cmd.as_std();
+        for name in ["PYTHONHOME", "PYTHONPATH"] {
+            assert!(
+                std_cmd
+                    .get_envs()
+                    .any(|(key, value)| key == std::ffi::OsStr::new(name) && value.is_none()),
+                "{name} was not scrubbed from the tokio command"
+            );
+        }
+    }
+
+    /// Documents the gate: outside an AppImage the environment is untouched,
+    /// so a developer running the app from a shell keeps their own PYTHONPATH.
+    #[test]
+    fn scrub_is_a_no_op_outside_an_appimage() {
+        let _lock = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::set(&[("APPIMAGE", None)]);
+
+        let mut cmd = Command::new("python3");
+        crate::process::scrub_appimage_python_env(&mut cmd);
+
+        assert_eq!(
+            cmd.get_envs().count(),
+            0,
+            "the scrub must not touch the environment outside an AppImage"
+        );
+    }
+}
