@@ -129,6 +129,90 @@ missing=$(
   ldd "$binary" 2>/dev/null |
     sed -n 's/^[[:space:]]*\([^[:space:]]*\)[[:space:]]*=>[[:space:]]*not found.*$/\1/p'
 )
+
+# The tray crate loads AppIndicator with dlopen, so it does not appear in the
+# executable's ldd output. Search the same host locations the loader normally
+# uses, including an inherited LD_LIBRARY_PATH.
+#
+# libappindicator-sys prefers the versioned sonames and falls back to the
+# unversioned ones, so a host that only exposes those still starts fine. This
+# guard has to accept every name that loader accepts, or it refuses to launch
+# on a host the tray would have worked on. The order matches the loader's.
+appindicator_names="libayatana-appindicator3.so.1 libappindicator3.so.1"
+appindicator_names="$appindicator_names libayatana-appindicator3.so libappindicator3.so"
+
+appindicator_is_usable() {
+  [ -r "$1" ] || return 1
+  # The regular dependency guard above already treats an unavailable ldd as an
+  # inconclusive check. Do the same for this dynamically loaded dependency:
+  # the loader, not ldd, determines whether a readable candidate can load.
+  command -v ldd >/dev/null 2>&1 || return 0
+  appindicator_ldd=$(ldd "$1" 2>&1) || return 1
+  ! printf '%s\n' "$appindicator_ldd" | grep -q 'not found'
+}
+
+find_appindicator() {
+  if [ "${LD_LIBRARY_PATH+x}" = x ]; then
+    # The loader accepts ':' and ';' separators. An empty component is the
+    # current directory. Appending a separator keeps a trailing empty
+    # component visible while extracting each directory.
+    library_path="${LD_LIBRARY_PATH}:"
+    while [ -n "$library_path" ]; do
+      library_dir=${library_path%%[:;]*}
+      library_path=${library_path#*[:;]}
+      [ -n "$library_dir" ] || library_dir=.
+      for library_name in $appindicator_names; do
+        candidate="$library_dir/$library_name"
+        if appindicator_is_usable "$candidate"; then
+          printf '%s\n' "$candidate"
+          return 0
+        fi
+      done
+    done
+  fi
+
+  if command -v ldconfig >/dev/null 2>&1; then
+    cached_paths=$(
+      ldconfig -p 2>/dev/null |
+        awk -v names="$appindicator_names" '
+          BEGIN { split(names, listed, " "); for (i in listed) wanted[listed[i]] = 1 }
+          wanted[$1] { print $NF }
+        '
+    )
+    for cached_path in $cached_paths; do
+      if appindicator_is_usable "$cached_path"; then
+        printf '%s\n' "$cached_path"
+        return 0
+      fi
+    done
+  fi
+
+  for library_name in $appindicator_names; do
+    for candidate in \
+      /lib/"$library_name" \
+      /lib/*-linux-gnu/"$library_name" \
+      /lib64/"$library_name" \
+      /usr/lib/"$library_name" \
+      /usr/lib/*-linux-gnu/"$library_name" \
+      /usr/lib64/"$library_name" \
+      /usr/local/lib/"$library_name"; do
+      if appindicator_is_usable "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+if ! find_appindicator >/dev/null; then
+  if [ -n "$missing" ]; then
+    missing="$missing
+"
+  fi
+  missing="${missing}libayatana-appindicator3.so.1 or libappindicator3.so.1"
+fi
+
 if [ -n "$missing" ]; then
   message="Unsloth cannot start because required Linux libraries are missing:
 
@@ -167,7 +251,8 @@ fi
 )
 assert_thin_appdir "$verify_dir/squashfs-root"
 
-if grep -q 'LD_LIBRARY_PATH' "$verify_dir/squashfs-root/AppRun"; then
+if grep -Eq '(^|[[:space:]])(export[[:space:]]+)?LD_LIBRARY_PATH=' \
+  "$verify_dir/squashfs-root/AppRun"; then
   echo "Thin AppImage must not override the host library search path." >&2
   exit 1
 fi
