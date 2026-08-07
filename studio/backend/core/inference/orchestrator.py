@@ -694,6 +694,7 @@ class InferenceOrchestrator:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
         presence_penalty: float = 0.0,
     ) -> dict:
         """Build the 'generate' command shared by the locked and dispatched paths."""
@@ -722,6 +723,8 @@ class InferenceOrchestrator:
             cmd["reasoning_effort"] = reasoning_effort
         if preserve_thinking is not None:
             cmd["preserve_thinking"] = preserve_thinking
+        if continue_final_message:
+            cmd["continue_final_message"] = True
         return cmd
 
     def _consume_token_stream(
@@ -925,6 +928,7 @@ class InferenceOrchestrator:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
         stats_holder: Optional[dict] = None,
         presence_penalty: float = 0.0,
     ) -> Generator[str, None, None]:
@@ -986,6 +990,7 @@ class InferenceOrchestrator:
             enable_thinking = enable_thinking,
             reasoning_effort = reasoning_effort,
             preserve_thinking = preserve_thinking,
+            continue_final_message = continue_final_message,
         )
 
         # Create the mailbox BEFORE sending, rechecking _unload_pending under
@@ -1608,6 +1613,7 @@ class InferenceOrchestrator:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
         stats_holder: Optional[dict] = None,
         presence_penalty: float = 0.0,
     ) -> Generator[str, None, None]:
@@ -1638,6 +1644,7 @@ class InferenceOrchestrator:
             enable_thinking = enable_thinking,
             reasoning_effort = reasoning_effort,
             preserve_thinking = preserve_thinking,
+            continue_final_message = continue_final_message,
             stats_holder = stats_holder,
             presence_penalty = presence_penalty,
         )
@@ -1657,6 +1664,7 @@ class InferenceOrchestrator:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
         max_tool_iterations: int = 25,
         auto_heal_tool_calls: bool = True,
         nudge_tool_calls: Optional[bool] = None,
@@ -1704,6 +1712,9 @@ class InferenceOrchestrator:
                 enable_thinking = enable_thinking,
                 reasoning_effort = reasoning_effort,
                 preserve_thinking = preserve_thinking,
+                # Self-limiting: after a tool call the conversation ends with a
+                # tool result, so later turns render as ordinary new turns.
+                continue_final_message = continue_final_message,
                 # last turn wins, like the GGUF tool loop
                 stats_holder = stats_holder,
                 presence_penalty = presence_penalty,
@@ -1774,6 +1785,7 @@ class InferenceOrchestrator:
             bypass_permissions = bypass_permissions,
             permission_mode = permission_mode,
             reasoning_prefilled = reasoning_prefilled,
+            continue_final_message = continue_final_message,
         )
 
     def generate_with_adapter_control(
@@ -1826,6 +1838,7 @@ class InferenceOrchestrator:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
         stats_holder: Optional[dict] = None,
         presence_penalty: float = 0.0,
     ) -> Generator[str, None, None]:
@@ -1882,6 +1895,7 @@ class InferenceOrchestrator:
                 enable_thinking = enable_thinking,
                 reasoning_effort = reasoning_effort,
                 preserve_thinking = preserve_thinking,
+                continue_final_message = continue_final_message,
             )
 
             # Claim the worker BEFORE sending, so a Stop on some OTHER chat -- still queued on the

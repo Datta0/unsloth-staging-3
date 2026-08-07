@@ -883,6 +883,7 @@ class InferenceBackend:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
         max_tool_iterations: int = 25,
         auto_heal_tool_calls: bool = True,
         nudge_tool_calls: Optional[bool] = None,
@@ -925,6 +926,9 @@ class InferenceBackend:
                 enable_thinking = enable_thinking,
                 reasoning_effort = reasoning_effort,
                 preserve_thinking = preserve_thinking,
+                # Self-limiting: after a tool call the conversation ends with a
+                # tool result, so later turns render as ordinary new turns.
+                continue_final_message = continue_final_message,
                 presence_penalty = presence_penalty,
             )
 
@@ -968,6 +972,7 @@ class InferenceBackend:
             thread_id = thread_id,
             rag_scope = rag_scope,
             reasoning_prefilled = reasoning_prefilled,
+            continue_final_message = continue_final_message,
         )
 
     def generate_chat_response(
@@ -986,6 +991,7 @@ class InferenceBackend:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
         presence_penalty: float = 0.0,
     ) -> Generator[str, None, None]:
         """Generate response for text or vision models (lock held by background thread).
@@ -1010,6 +1016,7 @@ class InferenceBackend:
             enable_thinking = enable_thinking,
             reasoning_effort = reasoning_effort,
             preserve_thinking = preserve_thinking,
+            continue_final_message = continue_final_message,
             presence_penalty = presence_penalty,
         )
 
@@ -1030,6 +1037,7 @@ class InferenceBackend:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
         presence_penalty: float = 0.0,
     ) -> Generator[str, None, None]:
         """Inner generation logic, called by generate_chat_response and
@@ -1070,6 +1078,7 @@ class InferenceBackend:
                     repetition_penalty,
                     cancel_event = cancel_event,
                     presence_penalty = presence_penalty,
+                    continue_final_message = continue_final_message,
                 )
                 return
             else:
@@ -1145,6 +1154,7 @@ class InferenceBackend:
                 enable_thinking = enable_thinking,
                 reasoning_effort = reasoning_effort,
                 preserve_thinking = preserve_thinking,
+                continue_final_message = continue_final_message,
             )
 
             # If tools were requested but the (possibly overridden) template ignored
@@ -1163,6 +1173,7 @@ class InferenceBackend:
                 enable_thinking = enable_thinking,
                 reasoning_effort = reasoning_effort,
                 preserve_thinking = preserve_thinking,
+                continue_final_message = continue_final_message,
                 apply_fn = self._apply_chat_template_for_generation,
                 hf_token = model_info.get("hf_token"),
                 return_metadata = True,
@@ -1175,7 +1186,9 @@ class InferenceBackend:
         except Exception as e:
             logger.error(f"Error applying chat template: {e}")
             # Fall back to manual formatting
-            formatted_prompt = self.format_chat_prompt(messages, system_prompt)
+            formatted_prompt = self.format_chat_prompt(
+                messages, system_prompt, continue_final_message = continue_final_message
+            )
             reasoning_channel_markers = None
             reasoning_channel_markers_resolved = True
 
@@ -1208,6 +1221,7 @@ class InferenceBackend:
         repetition_penalty,
         cancel_event = None,
         presence_penalty: float = 0.0,
+        continue_final_message: bool = False,
     ) -> Generator[str, None, None]:
         """Handle vision model generation with true token-by-token streaming."""
         model_info = self.models[self.active_model_name]
@@ -1217,12 +1231,16 @@ class InferenceBackend:
         # for some models. Safe unwrap for tokenize-only ops.
         raw_tokenizer = getattr(processor, "tokenizer", processor)
 
-        # Extract user message
-        user_message = ""
-        if messages and messages[-1]["role"] == "user":
-            import re
-            user_message = content_to_text(messages[-1]["content"])
-            user_message = re.sub(r"<img[^>]*>", "", user_message).strip()
+        # Extract user message. Scans back, so a continuation (which ends on the
+        # assistant partial) still prompts from the turn that asked the question.
+        from core.inference.chat_template_helpers import (
+            last_user_text,
+            render_prompt_with_boundary,
+            trailing_assistant_text,
+        )
+
+        user_message = last_user_text(messages)
+        continue_partial = trailing_assistant_text(messages) if continue_final_message else None
 
         if not user_message:
             user_message = "Describe this image." if image else "Hello"
@@ -1247,6 +1265,15 @@ class InferenceBackend:
             else:
                 vision_messages = [user_msg]
 
+            # Resume the partial answer instead of opening a new turn.
+            if continue_partial:
+                vision_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": continue_partial}],
+                    }
+                )
+
             # Processor's own template skips the choke point (#7066). Rebind user_msg
             # so the no-system retry keeps the copy. Profiled from the processor, so a
             # vision request is gated on the loaded model exactly as the text path is.
@@ -1255,22 +1282,24 @@ class InferenceBackend:
             vision_messages = neutralize_control_markup_in_messages(
                 vision_messages, None, markup_for_tokenizer(processor)
             )
-            user_msg = vision_messages[-1]
+            user_msg = next(m for m in reversed(vision_messages) if m.get("role") == "user")
+
+            def _render_vision(msgs):
+                # Partial taken from the swept msgs, not the raw pre-sweep capture.
+                return render_prompt_with_boundary(
+                    processor, msgs, continue_final_message = bool(continue_partial)
+                )
 
             try:
-                input_text = processor.apply_chat_template(
-                    vision_messages, add_generation_prompt = True, tokenize = False
-                )
+                input_text = _render_vision(vision_messages)
             except Exception as e:
                 if system_prompt:
                     logger.warning(
                         f"Vision processor for '{self.active_model_name}' may not support "
                         f"system messages; retrying without. Original error: {e}"
                     )
-                    vision_messages = [user_msg]
-                    input_text = processor.apply_chat_template(
-                        vision_messages, add_generation_prompt = True, tokenize = False
-                    )
+                    vision_messages = [m for m in vision_messages if m.get("role") != "system"]
+                    input_text = _render_vision(vision_messages)
                 else:
                     raise
             inputs = processor(
@@ -1282,7 +1311,9 @@ class InferenceBackend:
             prompt_text = input_text
         else:
             # Text-only path for a vision model
-            formatted_prompt = self.format_chat_prompt(messages, system_prompt)
+            formatted_prompt = self.format_chat_prompt(
+                messages, system_prompt, continue_final_message = continue_final_message
+            )
             inputs = raw_tokenizer(formatted_prompt, return_tensors = "pt").to(model.device)
             prompt_text = formatted_prompt
 
@@ -2086,6 +2117,7 @@ class InferenceBackend:
         enable_thinking: Optional[bool] = None,
         reasoning_effort: Optional[str] = None,
         preserve_thinking: Optional[bool] = None,
+        continue_final_message: bool = False,
     ) -> str:
         """Render the chat prompt, peeling kwargs the template doesn't
         understand. Delegates to the dependency-light helper module so the
@@ -2102,12 +2134,14 @@ class InferenceBackend:
             enable_thinking = enable_thinking,
             reasoning_effort = reasoning_effort,
             preserve_thinking = preserve_thinking,
+            continue_final_message = continue_final_message,
         )
 
     def format_chat_prompt(
         self,
         messages: list,
         system_prompt: str = None,
+        continue_final_message: bool = False,
     ) -> str:
         if not self.active_model_name or self.active_model_name not in self.models:
             logger.error("No active model available")
@@ -2149,14 +2183,21 @@ class InferenceBackend:
                 elif role == "system":
                     continue
 
-        if chat_messages and chat_messages[-1]["role"] == "assistant":
+        # A continuation resumes that turn, so dropping it would restart the answer.
+        _continuing = continue_final_message and bool(
+            chat_messages and chat_messages[-1]["role"] == "assistant"
+        )
+        if not _continuing and chat_messages and chat_messages[-1]["role"] == "assistant":
             logger.debug("Removing final assistant message to ensure proper alternation")
             chat_messages.pop()
 
         # Direct tokenizer render bypasses the choke point, and the user sub above
         # leaves system_prompt and replayed assistant text raw. Profiled off this same
         # tokenizer, so the sweep matches what the text path would do (#7066).
-        from core.inference.chat_template_helpers import markup_for_tokenizer
+        from core.inference.chat_template_helpers import (
+            markup_for_tokenizer,
+            render_prompt_with_boundary,
+        )
 
         chat_messages = neutralize_control_markup_in_messages(
             chat_messages, None, markup_for_tokenizer(tokenizer)
@@ -2167,8 +2208,8 @@ class InferenceBackend:
             logger.info(f"  {i}: {msg['role']} - {msg['content'][:50]}...")
 
         try:
-            formatted_prompt = tokenizer.apply_chat_template(
-                chat_messages, tokenize = False, add_generation_prompt = True
+            formatted_prompt = render_prompt_with_boundary(
+                tokenizer, chat_messages, continue_final_message = _continuing
             )
             logger.info(f"Successfully applied tokenizer's native chat template")
             return formatted_prompt
@@ -2184,19 +2225,24 @@ class InferenceBackend:
                 f"""Failed with messages: {[f"{m['role']}: {m['content'][:30]}..." for m in chat_messages]}"""
             )
 
+        # Every manual formatter closes the assistant turn and opens a new one, so a
+        # continuation renders without the partial and resumes from its text instead.
+        partial = chat_messages[-1]["content"] if _continuing else None
+        manual_messages = chat_messages[:-1] if _continuing else chat_messages
+
         if chat_template_info.get("has_template", False):
             logger.info("Falling back to manual template formatting based on detected patterns")
             template_type = chat_template_info.get("format_type", "generic")
             manual_prompt = self._format_chat_manual(
-                chat_messages,
+                manual_messages,
                 template_type,
                 chat_template_info.get("special_tokens", {}),
             )
             logger.info(f"Manual template result: {manual_prompt[:200]}...")
-            return manual_prompt
         else:
             logger.info("Using generic chat formatting for base model")
-            return self._format_generic_template(chat_messages, {})
+            manual_prompt = self._format_generic_template(manual_messages, {})
+        return f"{manual_prompt}{partial}" if partial else manual_prompt
 
     def _format_chat_manual(self, messages: list, template_type: str, special_tokens: dict) -> str:
         """Manual chat-formatting fallback when the tokenizer template fails.

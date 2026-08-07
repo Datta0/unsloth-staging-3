@@ -2299,6 +2299,103 @@ def markup_for_tokenizer(
     return profile
 
 
+def trailing_assistant_text(messages: list) -> Optional[str]:
+    """Plain text of a trailing assistant turn, else None.
+
+    Only plain text can be resumed: tool calls and image parts have no resume point.
+    """
+    if not messages:
+        return None
+    last = messages[-1]
+    if not isinstance(last, dict) or last.get("role") != "assistant":
+        return None
+    if last.get("tool_calls"):
+        return None
+    content = last.get("content")
+    if isinstance(content, str):
+        return content
+    # Continuable only when every part is text.
+    if isinstance(content, list):
+        texts = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") != "text":
+                return None
+            texts.append(str(part.get("text") or ""))
+        return "".join(texts)
+    return None
+
+
+def last_user_text(messages: list) -> str:
+    """Text of the newest user turn, with any ``<img>`` markup stripped.
+
+    The vision path builds its prompt from that turn, so it must scan back rather
+    than read ``messages[-1]``: a continuation ends on the assistant partial. Stops
+    at the newest user turn even when it is empty (an image-only message), so an
+    older question is never resurrected as the prompt for a new image.
+    """
+    from core.inference.message_content import content_to_text
+
+    for message in reversed(messages or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        return re.sub(r"<img[^>]*>", "", content_to_text(message.get("content"))).strip()
+    return ""
+
+
+def append_assistant_turn(
+    conversation: list,
+    assistant_msg: dict,
+    *,
+    continue_final_message: bool = False,
+) -> None:
+    """Append a generated assistant turn to *conversation*.
+
+    A continuation leaves the resumed partial as the trailing assistant turn, so a
+    plain append produces two consecutive assistant messages and templates that
+    enforce role alternation reject the next render. The partial and what the model
+    just added are one turn, so they are merged. Self-limiting: after a tool result
+    the conversation no longer ends with a plain assistant turn.
+    """
+    # Same acceptance rule as the prompt boundary, so a partial sent as text parts
+    # merges too instead of appending a second assistant turn.
+    prev_text = trailing_assistant_text(conversation) if continue_final_message else None
+    if prev_text is not None and isinstance(assistant_msg.get("content"), str):
+        assistant_msg["content"] = f"{prev_text}{assistant_msg['content']}"
+        conversation[-1] = assistant_msg
+        return
+    conversation.append(assistant_msg)
+
+
+def render_prompt_with_boundary(
+    processor,
+    messages: list,
+    continue_final_message: bool = False,
+) -> str:
+    """Render *messages* through a renderer's own chat template.
+
+    With *continue_final_message* the prompt ends inside the trailing assistant turn,
+    so the model resumes it. Processors predating the kwarg get a manual splice, whose
+    text comes from *messages* rather than a separate copy: the caller sweeps these for
+    control markup, and a raw partial could otherwise close the turn or open another
+    role instead of being resumed as text (#7066).
+    """
+    partial = trailing_assistant_text(messages) if continue_final_message else None
+    if not partial:
+        return processor.apply_chat_template(messages, add_generation_prompt = True, tokenize = False)
+    try:
+        return processor.apply_chat_template(
+            messages,
+            add_generation_prompt = False,
+            continue_final_message = True,
+            tokenize = False,
+        )
+    except TypeError:
+        prefix = processor.apply_chat_template(
+            messages[:-1], add_generation_prompt = True, tokenize = False
+        )
+        return f"{prefix}{partial}"
+
+
 def apply_chat_template_for_generation(
     tokenizer,
     messages: list,
@@ -2307,10 +2404,14 @@ def apply_chat_template_for_generation(
     enable_thinking: Optional[bool] = None,
     reasoning_effort: Optional[str] = None,
     preserve_thinking: Optional[bool] = None,
+    continue_final_message: bool = False,
 ) -> str:
     """Render the chat prompt. Try richest kwargs first; drop one
     group at a time on TypeError. Jinja / missing-variable errors
-    propagate."""
+    propagate.
+
+    With *continue_final_message* the prompt ends inside the trailing assistant turn,
+    so the model resumes the partial response instead of restarting it."""
     # Shared choke point for the transformers and MLX backends (#7066). Gated on the
     # loaded model's own markers, so text naming another family's sentinel is left alone.
     _markup = markup_for_tokenizer(tokenizer, tools)
@@ -2357,14 +2458,26 @@ def apply_chat_template_for_generation(
             _fallback_markup = markup_for_tokenizer(tokenizer, None)
         return neutralize_control_markup_in_messages(msgs, None, _fallback_markup)
 
-    def _render(msgs: list) -> str:
+    # Anything not continuable renders as an ordinary new turn. An empty partial has no
+    # resume point either, so it is excluded here too, matching the route guard and
+    # render_prompt_with_boundary.
+    _continue_text = trailing_assistant_text(messages) if continue_final_message else None
+    _continuing = bool(_continue_text)
+    _boundary_kwargs = (
+        {"add_generation_prompt": False, "continue_final_message": True}
+        if _continuing
+        else {"add_generation_prompt": True}
+    )
+
+    def _render(msgs: list, boundary: Optional[dict] = None) -> str:
+        boundary = _boundary_kwargs if boundary is None else boundary
         last_exc: Optional[Exception] = None
         for kwargs in attempts:
             try:
                 return tokenizer.apply_chat_template(
                     _swept_for(kwargs, msgs),
                     tokenize = False,
-                    add_generation_prompt = True,
+                    **boundary,
                     **kwargs,
                 )
             except TypeError as e:
@@ -2377,8 +2490,24 @@ def apply_chat_template_for_generation(
             raise last_exc
         raise RuntimeError("apply_chat_template_for_generation: no attempt produced a result")
 
+    def _render_continuation_manually(msgs: list) -> str:
+        """For tokenizers predating ``continue_final_message`` (TypeError above).
+
+        Renders the history before the partial turn, then appends the partial raw.
+        """
+        prefix = _render(list(msgs[:-1]), {"add_generation_prompt": True})
+        return f"{prefix}{_continue_text}"
+
+    def _render_with_fallback(msgs: list) -> str:
+        try:
+            return _render(msgs)
+        except TypeError:
+            if not _continuing:
+                raise
+            return _render_continuation_manually(msgs)
+
     try:
-        return _render(messages)
+        return _render_with_fallback(messages)
     except Exception:
         # Retry with repairs applied cumulatively. Originals render first, so
         # working templates stay byte-identical.
@@ -2391,7 +2520,7 @@ def apply_chat_template_for_generation(
             candidates.append(split)
         for candidate in candidates:
             try:
-                return _render(candidate)
+                return _render_with_fallback(candidate)
             except Exception:
                 continue
         raise
@@ -2445,6 +2574,7 @@ def render_native_template(
     enable_thinking: Optional[bool] = None,
     reasoning_effort: Optional[str] = None,
     preserve_thinking: Optional[bool] = None,
+    continue_final_message: bool = False,
     apply_fn = None,
     hf_token: Optional[str] = None,
     return_metadata: bool = False,
@@ -2505,6 +2635,7 @@ def render_native_template(
             enable_thinking = enable_thinking,
             reasoning_effort = reasoning_effort,
             preserve_thinking = preserve_thinking,
+            continue_final_message = continue_final_message,
         )
         no_tools = apply_fn(
             render_tokenizer,
@@ -2513,6 +2644,7 @@ def render_native_template(
             enable_thinking = enable_thinking,
             reasoning_effort = reasoning_effort,
             preserve_thinking = preserve_thinking,
+            continue_final_message = continue_final_message,
         )
     except Exception as exc:
         logger.warning(
@@ -2553,6 +2685,7 @@ def render_with_native_template_fallback(
     enable_thinking: Optional[bool] = None,
     reasoning_effort: Optional[str] = None,
     preserve_thinking: Optional[bool] = None,
+    continue_final_message: bool = False,
     apply_fn = None,
     hf_token: Optional[str] = None,
     return_metadata: bool = False,
@@ -2608,6 +2741,7 @@ def render_with_native_template_fallback(
             enable_thinking = enable_thinking,
             reasoning_effort = reasoning_effort,
             preserve_thinking = preserve_thinking,
+            continue_final_message = continue_final_message,
         )
     except Exception as exc:
         logger.warning(
@@ -2626,6 +2760,7 @@ def render_with_native_template_fallback(
         enable_thinking = enable_thinking,
         reasoning_effort = reasoning_effort,
         preserve_thinking = preserve_thinking,
+        continue_final_message = continue_final_message,
         apply_fn = apply_fn,
         hf_token = hf_token,
         return_metadata = return_metadata,
