@@ -38,6 +38,261 @@ use tauri_plugin_window_state::{AppHandleExt, StateFlags};
 /// Exactly one runs cleanup; the others block, so the process never exits mid-reap.
 static TERMINATION_CLEANUP: Once = Once::new();
 
+/// Started by the OS login autostart entry, so the frontend keeps the window hidden in the tray.
+#[tauri::command]
+fn was_launched_hidden() -> bool {
+    std::env::args().any(|arg| arg == "--hidden")
+}
+
+#[tauri::command]
+fn reveal_main_window(app: tauri::AppHandle) {
+    show_main_window(&app);
+}
+
+#[tauri::command]
+fn get_launch_at_login(app: tauri::AppHandle) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    // is_enabled only checks the entry file exists, so a DE-disabled entry would read as on.
+    if cfg!(target_os = "linux") && linux_autostart_disabled(&app) {
+        return Ok(false);
+    }
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+fn set_launch_at_login(app: tauri::AppHandle, enabled: bool) -> Result<bool, String> {
+    use tauri_plugin_autostart::ManagerExt;
+    let autolaunch = app.autolaunch();
+    let result = if enabled {
+        autolaunch.enable()
+    } else {
+        autolaunch.disable()
+    };
+    result.map_err(|error| error.to_string())?;
+    if enabled {
+        harden_autostart_entry(&app);
+    }
+    autolaunch
+        .is_enabled()
+        .map_err(|error| error.to_string())
+}
+
+fn harden_autostart_entry(app: &tauri::AppHandle) {
+    if cfg!(target_os = "linux") {
+        guard_linux_autostart_entry(app);
+    }
+    #[cfg(windows)]
+    quote_windows_run_value(app);
+    #[cfg(target_os = "macos")]
+    rewrite_macos_launch_agent(app);
+}
+
+/// auto-launch writes the Run value unquoted, so Windows parses a path with a space
+/// ("C:\Users\Jane Doe\...") into the wrong executable. None when already quoted.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn quoted_windows_run_command(value: &str) -> Option<String> {
+    if value.starts_with('"') {
+        return None;
+    }
+    let (path, args) = match value.strip_suffix(" --hidden") {
+        Some(path) => (path, " --hidden"),
+        None => (value, ""),
+    };
+    Some(format!("\"{path}\"{args}"))
+}
+
+#[cfg(windows)]
+fn quote_windows_run_value(app: &tauri::AppHandle) {
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE};
+    use winreg::RegKey;
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let Ok(run) = hkcu.open_subkey_with_flags(
+        r"Software\Microsoft\Windows\CurrentVersion\Run",
+        KEY_QUERY_VALUE | KEY_SET_VALUE,
+    ) else {
+        return;
+    };
+    let name = &app.package_info().name;
+    let Ok(value) = run.get_value::<String, _>(name) else {
+        return;
+    };
+    if let Some(quoted) = quoted_windows_run_command(&value) {
+        let _ = run.set_value(name, &quoted);
+    }
+}
+
+/// Exec is whitespace-delimited, so a binary path holding reserved characters is quoted, with
+/// `"`, `` ` ``, `$` and `\` escaped inside the quotes. A literal `%` starts a field code, so it
+/// becomes `%%` regardless of quoting.
+fn exec_quoted(binary: &str) -> String {
+    let binary = binary.replace('%', "%%");
+    const RESERVED: &str = " \t\n\"'\\><~|&;$*?#()`";
+    if !binary.chars().any(|c| RESERVED.contains(c)) {
+        return binary;
+    }
+    let mut quoted = String::with_capacity(binary.len() + 2);
+    quoted.push('"');
+    for c in binary.chars() {
+        // The string escape rule runs before the quoting rule, so the escaping backslash must
+        // itself be escaped; a single one is invalid and launchers drop the whole Exec.
+        match c {
+            '"' | '`' | '$' => {
+                quoted.push_str("\\\\");
+                quoted.push(c);
+            }
+            '\\' => quoted.push_str("\\\\\\\\"),
+            _ => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
+/// auto-launch writes the Exec binary unquoted with no TryExec. Quote it (spaces word-split) and
+/// add TryExec: launchers skip an entry whose TryExec binary is missing, so a removed install goes
+/// inert without postrm touching user homes. TryExec is a plain string field and stays unquoted.
+fn hardened_autostart_entry(entry: &str) -> Option<String> {
+    if entry.lines().any(|line| line.starts_with("TryExec=")) {
+        return None;
+    }
+    let exec = entry.lines().find_map(|line| line.strip_prefix("Exec="))?;
+    let (binary, args) = match exec.strip_suffix(" --hidden") {
+        Some(binary) => (binary, " --hidden"),
+        None => (exec, ""),
+    };
+    let hardened = entry
+        .lines()
+        .map(|line| {
+            if line.starts_with("Exec=") {
+                format!("Exec={}{}", exec_quoted(binary), args)
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // TryExec skips the quoting rule but is still a string, so backslashes still escape.
+    Some(format!(
+        "{hardened}\nTryExec={}",
+        binary.replace('\\', "\\\\")
+    ))
+}
+
+fn linux_autostart_entry_path(app: &tauri::AppHandle) -> Option<std::path::PathBuf> {
+    // auto-launch hardcodes ~/.config regardless of XDG_CONFIG_HOME; mirror it or we miss the file.
+    Some(
+        dirs::home_dir()?
+            .join(".config")
+            .join("autostart")
+            .join(format!("{}.desktop", app.package_info().name)),
+    )
+}
+
+/// DE startup UIs disable an entry via Hidden=true or X-GNOME-Autostart-enabled=false, not deletion.
+fn autostart_entry_disabled(entry: &str) -> bool {
+    entry.lines().any(|line| {
+        matches!(
+            line.trim(),
+            "Hidden=true" | "X-GNOME-Autostart-enabled=false"
+        )
+    })
+}
+
+fn linux_autostart_disabled(app: &tauri::AppHandle) -> bool {
+    linux_autostart_entry_path(app)
+        .and_then(|path| fs::read_to_string(path).ok())
+        .is_some_and(|entry| autostart_entry_disabled(&entry))
+}
+
+fn guard_linux_autostart_entry(app: &tauri::AppHandle) {
+    let Some(path) = linux_autostart_entry_path(app) else {
+        return;
+    };
+    let Ok(entry) = fs::read_to_string(&path) else {
+        return;
+    };
+    if let Some(hardened) = hardened_autostart_entry(&entry) {
+        let _ = fs::write(&path, hardened);
+    }
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn xml_escaped(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// auto-launch interpolates the executable path into plist XML unescaped, so a path with & or <
+/// writes a malformed LaunchAgent. Same structure as the plugin's template, with strings escaped.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn macos_launch_agent_plist(label: &str, binary: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+         <plist version=\"1.0\">\n\
+         <dict>\n  \
+         <key>Label</key>\n  \
+         <string>{}</string>\n  \
+         <key>ProgramArguments</key>\n  \
+         <array>\n    \
+         <string>{}</string>\n    \
+         <string>--hidden</string>\n  \
+         </array>\n  \
+         <key>RunAtLoad</key>\n  \
+         <true/>\n\
+         </dict>\n\
+         </plist>",
+        xml_escaped(label),
+        xml_escaped(binary),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn rewrite_macos_launch_agent(app: &tauri::AppHandle) {
+    let Some(home_dir) = dirs::home_dir() else {
+        return;
+    };
+    let name = &app.package_info().name;
+    let path = home_dir
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{name}.plist"));
+    if !path.exists() {
+        return;
+    }
+    let Ok(binary) = std::env::current_exe() else {
+        return;
+    };
+    let plist = macos_launch_agent_plist(name, &binary.display().to_string());
+    let _ = fs::write(&path, plist);
+}
+
+/// A moved or re-downloaded AppImage leaves the entry pointing at the old path while `is_enabled`
+/// only checks the file exists, so rewrite the entry to the current executable on every startup.
+fn reconcile_autostart_entry(app: &tauri::AppHandle) {
+    use tauri_plugin_autostart::ManagerExt;
+    // A dev run would repoint the entry at target/debug.
+    if cfg!(debug_assertions) {
+        return;
+    }
+    // enable() would rewrite the file without the user's DE-set disabled marker.
+    if cfg!(target_os = "linux") && linux_autostart_disabled(app) {
+        return;
+    }
+    let autolaunch = app.autolaunch();
+    if !autolaunch.is_enabled().unwrap_or(false) {
+        return;
+    }
+    if autolaunch.enable().is_ok() {
+        harden_autostart_entry(app);
+    }
+}
+
 #[tauri::command]
 fn has_saved_window_state(app: tauri::AppHandle) -> bool {
     let Ok(dir) = app.path().app_config_dir() else {
@@ -368,6 +623,9 @@ fn setup_unix_termination_signals(app: &tauri::App) -> Result<(), Box<dyn std::e
 }
 
 fn show_main_window(app: &tauri::AppHandle) {
+    // Hidden login starts run as an accessory app (no Dock icon); restore the regular policy.
+    #[cfg(target_os = "macos")]
+    let _ = app.set_activation_policy(tauri::ActivationPolicy::Regular);
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.show();
         let _ = window.unminimize();
@@ -482,6 +740,10 @@ fn main() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            Some(vec!["--hidden"]),
+        ))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -543,8 +805,17 @@ fn main() {
             native_intents::reveal_path_token,
             native_intents::open_path_token,
             has_saved_window_state,
+            was_launched_hidden,
+            reveal_main_window,
+            get_launch_at_login,
+            set_launch_at_login,
         ])
         .setup(|app| {
+            #[cfg(target_os = "macos")]
+            if was_launched_hidden() {
+                app.set_activation_policy(tauri::ActivationPolicy::Accessory);
+            }
+            reconcile_autostart_entry(app.handle());
             #[cfg(any(target_os = "linux", all(debug_assertions, windows)))]
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
@@ -630,6 +901,121 @@ mod tests {
             begin_quit().is_some(),
             "a panicking quit must release the guard"
         );
+    }
+
+    #[test]
+    fn autostart_hardening_appends_the_exec_binary_without_args() {
+        let entry = "[Desktop Entry]\nType=Application\nExec=/usr/bin/unsloth-studio --hidden\nTerminal=false";
+        let hardened = hardened_autostart_entry(entry).expect("guard must be added");
+        assert!(hardened.starts_with(entry));
+        assert!(hardened.ends_with("\nTryExec=/usr/bin/unsloth-studio"));
+    }
+
+    #[test]
+    fn autostart_hardening_quotes_a_binary_path_with_spaces() {
+        let entry = "[Desktop Entry]\nExec=/home/n/My Apps/Unsloth.AppImage --hidden\nTerminal=false";
+        let hardened = hardened_autostart_entry(entry).expect("guard must be added");
+        assert!(hardened.contains("Exec=\"/home/n/My Apps/Unsloth.AppImage\" --hidden\n"));
+        // TryExec is a plain string field, so the path stays unquoted.
+        assert!(hardened.ends_with("\nTryExec=/home/n/My Apps/Unsloth.AppImage"));
+    }
+
+    #[test]
+    fn autostart_hardening_escapes_exec_reserved_characters() {
+        let entry = "[Desktop Entry]\nExec=/opt/a\"b$c/app --hidden";
+        let hardened = hardened_autostart_entry(entry).expect("guard must be added");
+        // Doubled: the string escape rule is undone before the quoting rule.
+        assert!(hardened.contains(r#"Exec="/opt/a\\"b\\$c/app" --hidden"#));
+    }
+
+    /// A single escaping backslash is an invalid escape, so launchers discard the whole Exec.
+    #[test]
+    fn autostart_hardening_doubles_the_escaping_backslash() {
+        let entry = "[Desktop Entry]\nExec=/opt/a b`c$d/app --hidden";
+        let hardened = hardened_autostart_entry(entry).expect("guard must be added");
+        assert!(hardened.contains(r#"Exec="/opt/a b\\`c\\$d/app" --hidden"#));
+    }
+
+    #[test]
+    fn autostart_hardening_escapes_a_literal_backslash_in_both_fields() {
+        let entry = "[Desktop Entry]\nExec=/opt/a b\\c/app --hidden";
+        let hardened = hardened_autostart_entry(entry).expect("guard must be added");
+        // Four in Exec (string rule then quoting rule), two in the plain TryExec.
+        assert!(hardened.contains(r#"Exec="/opt/a b\\\\c/app" --hidden"#));
+        assert!(hardened.ends_with(r"TryExec=/opt/a b\\c/app"));
+    }
+
+    #[test]
+    fn autostart_hardening_is_idempotent() {
+        let entry = "[Desktop Entry]\nExec=/a --hidden\nTryExec=/a";
+        assert!(hardened_autostart_entry(entry).is_none());
+    }
+
+    #[test]
+    fn autostart_hardening_needs_an_exec_line() {
+        assert!(hardened_autostart_entry("[Desktop Entry]\nType=Application").is_none());
+    }
+
+    #[test]
+    fn exec_quoting_escapes_percent_field_codes() {
+        let entry = "[Desktop Entry]\nExec=/home/n/Unsloth%20Studio.AppImage --hidden";
+        let hardened = hardened_autostart_entry(entry).expect("guard must be added");
+        assert!(hardened.contains("Exec=/home/n/Unsloth%%20Studio.AppImage --hidden\n"));
+        // TryExec is a plain string field, so the raw path stays.
+        assert!(hardened.ends_with("\nTryExec=/home/n/Unsloth%20Studio.AppImage"));
+    }
+
+    #[test]
+    fn autostart_disabled_markers_are_detected() {
+        assert!(autostart_entry_disabled("[Desktop Entry]\nHidden=true"));
+        assert!(autostart_entry_disabled(
+            "[Desktop Entry]\nX-GNOME-Autostart-enabled=false"
+        ));
+        assert!(!autostart_entry_disabled("[Desktop Entry]\nExec=/a --hidden"));
+    }
+
+    #[test]
+    fn macos_plist_escapes_xml_metacharacters() {
+        let plist = macos_launch_agent_plist(
+            "Unsloth",
+            "/Applications/AI & ML/Unsloth.app/Contents/MacOS/unsloth-studio",
+        );
+        assert!(plist.contains(
+            "<string>/Applications/AI &amp; ML/Unsloth.app/Contents/MacOS/unsloth-studio</string>"
+        ));
+        assert!(plist.contains("<string>--hidden</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+    }
+
+    #[test]
+    fn windows_run_command_quotes_a_spaced_path() {
+        let quoted =
+            quoted_windows_run_command(r"C:\Users\Jane Doe\AppData\Local\Unsloth\Unsloth.exe --hidden");
+        assert_eq!(
+            quoted.as_deref(),
+            Some(r#""C:\Users\Jane Doe\AppData\Local\Unsloth\Unsloth.exe" --hidden"#),
+        );
+    }
+
+    #[test]
+    fn windows_run_command_leaves_quoted_values_alone() {
+        assert!(quoted_windows_run_command(r#""C:\Unsloth\Unsloth.exe" --hidden"#).is_none());
+    }
+
+    #[test]
+    fn windows_run_command_quotes_a_bare_path() {
+        assert_eq!(
+            quoted_windows_run_command(r"C:\Unsloth\Unsloth.exe").as_deref(),
+            Some(r#""C:\Unsloth\Unsloth.exe""#),
+        );
+    }
+
+    #[test]
+    fn autostart_hardening_keeps_foreign_args_untouched() {
+        let entry = "[Desktop Entry]\nExec=/plain/app";
+        let hardened = hardened_autostart_entry(entry).expect("guard must be added");
+        assert!(hardened.contains("Exec=/plain/app\n"));
+        assert!(hardened.ends_with("\nTryExec=/plain/app"));
     }
 
     fn renderer_activity(state: &RendererActivityState) -> (bool, bool) {
