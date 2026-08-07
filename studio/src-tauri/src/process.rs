@@ -1747,10 +1747,10 @@ mod appimage_python_env_tests {
             ("APPIMAGE", Some("/tmp/Unsloth.AppImage")),
         ]);
 
-        let mut cmd = Command::new(&python);
-        cmd.args(["-c", REPORT]);
-        crate::process::scrub_appimage_python_env(&mut cmd);
-        let output = cmd.output().expect("spawn failed");
+        let mut spawn = Command::new(&python);
+        spawn.args(["-c", REPORT]);
+        crate::process::scrub_appimage_python_env(&mut spawn);
+        let output = spawn.output().expect("spawn failed");
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1798,11 +1798,11 @@ mod appimage_python_env_tests {
         let _lock = ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::set(&[("APPIMAGE", None)]);
 
-        let mut cmd = Command::new("python3");
-        crate::process::scrub_appimage_python_env(&mut cmd);
+        let mut spawn = Command::new("python3");
+        crate::process::scrub_appimage_python_env(&mut spawn);
 
         assert_eq!(
-            cmd.get_envs().count(),
+            spawn.get_envs().count(),
             0,
             "the scrub must not touch the environment outside an AppImage"
         );
