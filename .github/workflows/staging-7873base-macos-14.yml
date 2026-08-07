@@ -1,21 +1,7 @@
-name: "staging-7873 macos-14"
+name: "staging-7873base macos-14"
 on:
   push:
-    branches: ["pr-7873-xplat-ci"]
-    paths:
-      - 'studio/backend/hub/schemas/inventory.py'
-      - 'studio/backend/hub/services/models/gguf_variants.py'
-      - 'studio/backend/hub/tests/test_model_services.py'
-      - 'studio/backend/hub/utils/gguf.py'
-      - 'studio/backend/hub/utils/inventory_scan.py'
-      - 'studio/backend/models/models.py'
-      - 'studio/backend/routes/models.py'
-      - 'studio/backend/tests/test_cached_gguf_routes.py'
-      - 'studio/backend/tests/test_gguf_variants_local_resolution.py'
-      - 'studio/backend/tests/test_remote_access_settings.py'
-      - 'studio/backend/tests/test_secure_tunnel_gate.py'
-      - 'studio/backend/utils/models/model_config.py'
-      - '.github/workflows/staging-7873-macos-14.yml'
+    branches: ["pr-7873-base-ci"]
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
