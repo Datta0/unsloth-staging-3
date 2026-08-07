@@ -49,8 +49,14 @@ jobs:
             echo "::error::expected the interpreter to fail under PYTHONHOME"
             exit 1
           fi
-          printf '%s\n' "$out" | grep -q 'Failed to import encodings module' \
+          # CPython words the headline differently across versions
+          # ("Failed to import encodings module" vs "init_fs_encoding: failed
+          # to get the Python codec of the filesystem encoding"); the cause
+          # line and the core-initialized state are the stable part.
+          printf '%s\n' "$out" | grep -q "No module named 'encodings'" \
             || { echo "::error::did not reproduce the reported fatal error"; exit 1; }
+          printf '%s\n' "$out" | grep -q 'Python runtime state: core initialized' \
+            || { echo "::error::interpreter failed for some other reason"; exit 1; }
           echo "Reproduced the reported crash from PYTHONHOME alone."
 
   rust-scrub-behaviour:
@@ -103,8 +109,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install pytest
-        run: python3 -m pip install --upgrade pytest
+      - name: Install test dependencies
+        run: python3 -m pip install --upgrade pytest pyyaml
 
       - name: Release AppImage packaging suite
         run: python3 -m pytest -q tests/security/test_release_desktop_appimage.py

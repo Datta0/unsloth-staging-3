@@ -1723,8 +1723,10 @@ mod appimage_python_env_tests {
             "expected the interpreter to die, got: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+        // CPython varies the headline by version; the cause line is stable.
         assert!(
-            stderr.contains("Failed to import encodings module"),
+            stderr.contains("No module named 'encodings'")
+                && stderr.contains("Python runtime state: core initialized"),
             "expected the reported fatal error, got: {stderr}"
         );
 
