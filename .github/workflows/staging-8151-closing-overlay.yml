@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved.
+
+# Renders the desktop closing overlay in a real browser and uploads the shots.
+# No Studio install and no backend: the built frontend is served statically and
+# tests/studio/_tauri_webview_shim.js stands in for the Tauri runtime, so the
+# whole job is node + chromium.
+
+name: "PR-8151 closing overlay"
+
+on:
+  push:
+    branches: [pr-8151-overlay-shot-ci]
+    paths:
+      - 'studio/frontend/**'
+      - 'tests/studio/playwright_desktop_closing_overlay.py'
+      - 'tests/studio/_tauri_webview_shim.js'
+      - '.github/workflows/staging-8151-closing-overlay.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  closing-overlay:
+    name: Closing overlay (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: studio/frontend/package-lock.json
+
+      - name: Build the frontend
+        working-directory: studio/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Install Playwright Chromium
+        run: |
+          python -m pip install 'playwright>=1.45'
+          python -m playwright install --with-deps chromium
+
+      - name: Render the closing overlay
+        env:
+          PW_ART_DIR: logs/closing-overlay
+        run: python tests/studio/playwright_desktop_closing_overlay.py
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: closing-overlay-shots
+          path: logs/closing-overlay
+          if-no-files-found: error
