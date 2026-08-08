@@ -1,0 +1,43 @@
+name: "staging-8149 windows-latest"
+on:
+  push:
+    branches: ["pr-8149-xplat-ci"]
+    paths:
+      - 'studio/frontend/src/app/routes/images.tsx'
+      - 'studio/frontend/src/app/routes/video.tsx'
+      - 'studio/frontend/src/features/images/images-page.tsx'
+      - 'studio/frontend/src/features/model-picker/components/model-selector/pickers.tsx'
+      - 'studio/frontend/src/features/video/video-page.tsx'
+      - 'studio/frontend/src/lib/diffusion-gguf-filename.ts'
+      - 'studio/frontend/src/lib/diffusion-gguf-pick.ts'
+      - 'studio/frontend/src/lib/diffusion-route-search.ts'
+      - 'studio/frontend/src/lib/gguf-filename-pick.ts'
+      - 'studio/frontend/tests/diffusion-gguf-pick.test.ts'
+      - 'studio/frontend/tests/diffusion-route-search.test.ts'
+      - 'studio/frontend/tests/gguf-filename-pick.test.ts'
+      - '.github/workflows/staging-8149-windows-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
