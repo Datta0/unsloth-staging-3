@@ -412,6 +412,7 @@ def _run_llama_phase(
     set_progress,
     force_cpu: bool = False,
     llama_backend: Optional[str] = None,
+    rocm_gfx: Optional[str] = None,
 ) -> dict:
     """The llama phase of a chained update: put the backend into a maintenance
     state, run the installer for the latest prebuilt, then refresh caches so the
@@ -474,10 +475,16 @@ def _run_llama_phase(
         logger.info("llama update: installing", cmd = " ".join(cmd))
         env = dict(os.environ, UNSLOTH_PROGRESS_PERCENT_STEP = "5")
         # Preserve a Vulkan install across updates: detect_host on a CUDA/ROCm box would
-        # otherwise re-route and silently replace it. Re-assert via setup's env/CLI flags.
-        if llama_backend == "vulkan" or (asset and "vulkan" in asset.lower()):
+        # otherwise replace it. An "auto" marker reruns hardware detection instead.
+        if llama_backend == "vulkan":
             env["UNSLOTH_FORCE_VULKAN"] = "1"
             env["UNSLOTH_LLAMA_CPP_BACKEND"] = "vulkan"
+        # A Vulkan asset name carries no arch, so the marker is the only record of
+        # the gfx an automatic AMD route was decided on. Advisory, not an override:
+        # the installer applies it only when this host's own probe finds none, so a
+        # replaced GPU still wins.
+        if rocm_gfx:
+            env["UNSLOTH_ROCM_GFX_REMEMBERED"] = rocm_gfx
         _flow.stream_installer(
             cmd,
             env,
@@ -611,7 +618,14 @@ def _plan_llama_phase() -> dict:
         asset = marker.get("asset")
         force_cpu = bool(marker.get("force_cpu"))
         llama_backend = marker.get("llama_backend")
-        if llama_backend == "vulkan" or (asset and "vulkan" in str(asset).lower()):
+        rocm_gfx = marker.get("rocm_gfx")
+        # Markers written before #7188 lack llama_backend, so an explicit
+        # Vulkan selection cannot be distinguished from the earlier automatic
+        # Intel route. Preserve the existing bundle rather than silently
+        # switching backends. Newer automatic Intel installs carry the key
+        # with a null value and rerun detection to remain eligible for CPU
+        # recovery.
+        if "llama_backend" not in marker and asset and "vulkan" in str(asset).lower():
             llama_backend = "vulkan"
         # Install exactly the release the banner offered: the installer's own
         # "latest" is commit-date ordered and can lag the published_at pick
@@ -657,6 +671,7 @@ def _plan_llama_phase() -> dict:
         # Source builds carry no forced-CPU marker, so nothing to preserve here.
         force_cpu = False
         llama_backend = None
+        rocm_gfx = None
         # No pin: source-build detection resolves via --resolve-prebuilt latest,
         # the same resolver the unpinned apply uses, so the two already agree.
         pin_release_tag = None
@@ -680,6 +695,7 @@ def _plan_llama_phase() -> dict:
             "from_tag": from_tag,
             "force_cpu": force_cpu,
             "llama_backend": llama_backend,
+            "rocm_gfx": rocm_gfx,
         }
     }
 
@@ -733,6 +749,7 @@ def start_update() -> dict:
                         set_progress,
                         force_cpu = llama_spec.get("force_cpu", False),
                         llama_backend = llama_spec.get("llama_backend"),
+                        rocm_gfx = llama_spec.get("rocm_gfx"),
                     )
                 )
                 if llama_spec
