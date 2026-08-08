@@ -5032,14 +5032,28 @@ def test_generate_resets_the_step_cache_before_every_chunk(fake_runtime, tmp_pat
 
 
 class _FakeSibling:
-    def __init__(self, rfilename, size):
+    def __init__(
+        self,
+        rfilename,
+        size,
+        lfs = None,
+        blob_id = None,
+    ):
         self.rfilename = rfilename
         self.size = size
+        # Both shapes the hub has used, so a test can pin which one the code reads.
+        self.lfs = lfs
+        self.blob_id = blob_id
 
 
 class _FakeInfo:
-    def __init__(self, siblings):
+    def __init__(
+        self,
+        siblings,
+        sha = "cafe1234",
+    ):
         self.siblings = siblings
+        self.sha = sha
 
 
 GB = 1024**3
@@ -5421,3 +5435,314 @@ def test_a_superseding_load_fences_queued_generations_too(fake_runtime, tmp_path
 
     assert seen == [1]
     assert backend._teardown_waiters == 0
+
+
+def test_download_plan_omits_a_gguf_that_is_already_cached(monkeypatch):
+    # #8001: emitted with no cache check, so an already-downloaded denoiser joined the staged
+    # total. The reporter saw a cached 13 GB Q4_K_M plus 16.8 GB of companions as one ~30 GB
+    # "Downloading model...", which reads as re-downloading the model.
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    monkeypatch.setattr(
+        "core.inference.diffusion._hub_file_cached",
+        lambda repo_id, filename, revision = None, blob_id = None: True,
+    )
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+
+    # Only the companions remain: the denoiser is on disk and costs nothing to "stage".
+    assert [e["repo_id"] for e in plan["entries"]] == ["unsloth/FLUX.1-dev"]
+    base = plan["entries"][0]
+    # The headline must agree with the entries, or the panel shows bytes nothing accounts for.
+    assert plan["total_bytes"] == base["bytes"]
+    assert plan["total_bytes"] < 7 * GB
+
+
+def test_the_cached_gguf_check_follows_the_loaders_root_selection(monkeypatch):
+    # hf_hub_download_with_xet_fallback(reuse_other_cache_root=True) asks the LIVE root first and
+    # unpinned, and any hit there wins; only a total miss sends it to the import-time root, which it
+    # then routes the download through. So the ROOT is chosen by the unpinned probe, and a pinned
+    # copy in a root the loader never selects saves nothing (case 2).
+    # Within the chosen root a stale refs/main does NOT mean a download: hf_hub_download HEADs the
+    # repo, resolves main to the server's commit hash, and returns the pointer for THAT hash if it
+    # exists ("pointer already exists -> immediate return" in huggingface_hub/file_download.py).
+    # The pinned sha here is what model_info just reported, i.e. that same current main, so a
+    # pinned hit in the chosen root is sufficient (cases 3 and 5).
+    from core.inference import diffusion as diff
+
+    live = "/live-root"
+    monkeypatch.setattr("core.inference.diffusion.hub_cache_dir", lambda: live)
+
+    def _probe(cache_map):
+        def probe(
+            repo_id,
+            filename,
+            cache_dir = None,
+            revision = None,
+            repo_type = None,
+        ):
+            return cache_map.get((cache_dir, revision))
+
+        return probe
+
+    # 1. Live root pinned AND unpinned resolve to the same blob: the load reads it, nothing moves.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        _probe({(live, "sha1"): "/blobs/a", (live, None): "/blobs/a"}),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is True
+
+    # 2. Only the OTHER root has the pinned sha. The live root's stale refs/main wins in the
+    #    loader, so omitting the job would hide the download it is about to do.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        _probe({(None, "sha1"): "/blobs/a", (live, None): "/blobs/stale"}),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is False
+
+    # 3. Live root HAS the pinned sha while refs/main still points at an older snapshot. The load
+    #    HEADs main, resolves it to that same sha, finds the pointer and returns without
+    #    transferring, so the stale local ref costs nothing and this is cached.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        _probe({(live, "sha1"): "/blobs/a", (live, None): "/blobs/stale"}),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is True
+
+    # 4. The cache folder was changed: the live root has nothing at all, and the import-time root
+    #    holds the current file. The helper falls back to that root and routes the download through
+    #    it, so the load transfers no bytes and the plan must not advertise the checkpoint.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        _probe({(None, "sha1"): "/old/blobs/a", (None, None): "/old/blobs/a"}),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is True
+
+    # 5. Live root empty and the OTHER root holds the sha behind a stale ref: same as case 3, one
+    #    root over. The fallback selects that root and the HEAD resolves main to the sha already
+    #    there, so nothing transfers.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        _probe({(None, "sha1"): "/old/blobs/a", (None, None): "/old/blobs/stale"}),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is True
+
+    # 6. The chosen root does not hold the pinned sha at all. The HEAD resolves main to a snapshot
+    #    that is not there, so the checkpoint really is fetched and the job must stay.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        _probe({(live, None): "/blobs/stale"}),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is False
+
+    # 7. Neither root answers unpinned, because the file was fetched by explicit commit and that
+    #    never writes refs/main. The helper only leaves the live root on a HIT elsewhere, so the
+    #    load stays there, HEADs main, and finds the pinned pointer already sitting in it.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        _probe({(live, "sha1"): "/blobs/a"}),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is True
+
+    # 8. Same shape, but the pinned snapshot is only in the OTHER root. With no unpinned hit to
+    #    redirect it the load stays in the live root and really does fetch.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        _probe({(None, "sha1"): "/old/blobs/a"}),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is False
+
+    # Not-cached on error only re-adds an entry that fetches nothing; the other way hides a
+    # real download.
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("cache unreadable")),
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "sha1") is False
+
+
+def test_a_metadata_only_republish_does_not_re_advertise_the_gguf(monkeypatch, tmp_path):
+    """A README edit moves the repo sha and leaves the checkpoint blob alone.
+
+    The pinned pointer for the new commit does not exist yet, so a pinned-miss verdict would put
+    the whole multi-GB checkpoint back on the plan. hf_hub_download finds blobs/<etag> already
+    present and only creates the symlink ("Blob exists but pointer must be (safely) created",
+    huggingface_hub/file_download.py), transferring nothing, so the blob id decides.
+    """
+    from core.inference import diffusion as diff
+
+    live = str(tmp_path)
+    monkeypatch.setattr("core.inference.diffusion.hub_cache_dir", lambda: live)
+
+    blobs = tmp_path / "blobs"
+    blobs.mkdir()
+    content = "d9a1e25e0751e0d889893ad6494e0f0f1c4245c8e1afe248ee93b5641ac69066"
+    (blobs / content).write_bytes(b"gguf")
+    snapshot = tmp_path / "snapshots" / "old-sha"
+    snapshot.mkdir(parents = True)
+    pointer = snapshot / "x.gguf"
+    pointer.symlink_to(blobs / content)
+
+    def probe(
+        repo_id,
+        filename,
+        cache_dir = None,
+        revision = None,
+        repo_type = None,
+    ):
+        # Unpinned resolves to the pre-republish snapshot; the new sha has no pointer yet.
+        if cache_dir == live and revision is None:
+            return str(pointer)
+        return None
+
+    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", probe)
+
+    assert (
+        diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "new-sha", blob_id = content)
+        is True
+    )
+    # A genuinely republished checkpoint has a different blob, and that download is real.
+    assert (
+        diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "new-sha", blob_id = "other")
+        is False
+    )
+    # Without a blob id there is nothing to compare, so the job stays, as every unknown does here.
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x.gguf", revision = "new-sha") is False
+
+
+def test_the_plan_pins_the_cache_probe_to_the_revision_model_info_reported(monkeypatch):
+    # The revalidation is only worth anything if the sha actually reaches the probe: pinning to a
+    # sha nobody passes is the same as not pinning at all.
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [_FakeSibling("flux1-dev-Q4_K_M.gguf", 7 * GB)],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        "core.inference.diffusion._hub_file_cached",
+        lambda repo_id, filename, revision = None, blob_id = None: seen.append(revision) or True,
+    )
+
+    DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+    assert seen == ["cafe1234"]
+
+
+def test_the_plan_reads_a_dict_shaped_lfs_entry(monkeypatch):
+    # `RepoSibling.lfs` has had two shapes. huggingface_hub builds a `BlobLfsInfo` dataclass on
+    # the pinned 0.36.2 -- checked against the live API -- but older releases type it as a plain
+    # dict, and a `getattr(lfs, "sha256")` on one of those falls through to `blob_id`. That is the
+    # git object id, not the sha256 the cache names its blobs with, so the probe misses on every
+    # file and a metadata-only republish re-downloads a GGUF that never changed.
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/FLUX.1-dev-GGUF": [
+                _FakeSibling(
+                    "flux1-dev-Q4_K_M.gguf",
+                    7 * GB,
+                    lfs = {"sha256": "d" * 64},
+                    blob_id = "not-the-content-id",
+                ),
+            ],
+            "black-forest-labs/FLUX.1-dev": _FLUX_BASE_SIBLINGS,
+        },
+    )
+    monkeypatch.setattr(
+        "core.inference.diffusion._resolve_base_repo",
+        lambda *a, **k: "black-forest-labs/FLUX.1-dev",
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    seen = []
+    monkeypatch.setattr(
+        "core.inference.diffusion._hub_file_cached",
+        lambda repo_id, filename, revision = None, blob_id = None: seen.append(blob_id) or True,
+    )
+
+    DiffusionBackend().download_plan(
+        "unsloth/FLUX.1-dev-GGUF", gguf_filename = "flux1-dev-Q4_K_M.gguf"
+    )
+    assert seen == ["d" * 64], "the git object id reached the probe instead of the content sha"
+
+
+def test_an_unknown_revision_never_counts_as_cached(monkeypatch):
+    # try_to_load_from_cache follows the LOCAL refs/main and never touches the network, so an
+    # unpinned hit also matches a snapshot taken before the repo republished the file. The load's
+    # own hf_hub_download revalidates and would pull the new checkpoint inline, outside the
+    # manager's progress, cancellation and disk preflight. No sha means no skipping.
+    from core.inference import diffusion as diff
+
+    called = []
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        lambda *a, **k: called.append(k) or "/blobs/abc",
+    )
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x-Q4_K_M.gguf") is False
+    assert diff._hub_file_cached("unsloth/X-GGUF", "x-Q4_K_M.gguf", revision = "") is False
+    # The probe is not even reached, so a stale cache cannot answer for a revision we do not know.
+    assert called == []
+
+
+def test_a_shared_checkpoint_and_base_repo_keep_separate_byte_counts(monkeypatch):
+    # An explicit base_repo equal to repo_id makes both roles name the SAME repo. Sizing them in a
+    # repo-keyed map let the base total overwrite the checkpoint total, so dropping a cached
+    # checkpoint subtracted the COMPANION bytes and left total_bytes disagreeing with the one
+    # entry that remained.
+    _fake_hf_api(
+        monkeypatch,
+        {
+            "unsloth/Combo": [
+                _FakeSibling("combo-Q4_K_M.gguf", 7 * GB),
+                _FakeSibling("vae/diffusion_pytorch_model.safetensors", 1 * GB),
+                _FakeSibling("model_index.json", 1024),
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        DiffusionBackend, "_dense_quant_prefetch_needed", lambda self, fam, kwargs: False
+    )
+    _no_cache(monkeypatch)
+    monkeypatch.setattr(
+        "core.inference.diffusion._hub_file_cached",
+        lambda repo_id, filename, revision = None, blob_id = None: True,
+    )
+
+    plan = DiffusionBackend().download_plan(
+        "unsloth/Combo", gguf_filename = "combo-Q4_K_M.gguf", base_repo = "unsloth/Combo"
+    )
+
+    # The invariant that matters to the panel: the headline is the sum of what it lists.
+    assert plan["total_bytes"] == sum(int(e["bytes"]) for e in plan["entries"])
+    # And the companions, not the checkpoint, are what is left to fetch.
+    assert [e["gguf_filename"] for e in plan["entries"]] == [None]
+    assert 0 < plan["total_bytes"] < 7 * GB
