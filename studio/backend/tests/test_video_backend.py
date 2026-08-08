@@ -7,6 +7,7 @@ the signature-gated kwargs actually exercise, sys.modules stubs so no real ML
 stack loads."""
 
 import contextlib
+from pathlib import Path
 import sys
 import threading
 import time
@@ -1882,6 +1883,74 @@ def _plan_api(monkeypatch, repos):
             return _PlanInfo(repos[repo_id])
 
     monkeypatch.setattr("huggingface_hub.HfApi", lambda *a, **k: _Api())
+    # These tests describe their cache state explicitly; never let a developer's real Studio
+    # cache make an entry disappear from an otherwise hermetic plan.
+    from core.inference.diffusion import DiffusionBackend
+
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_hub_file_is_cached",
+        staticmethod(lambda repo_id, filename, revision = None, expected_size = None, **kwargs: False),
+    )
+
+
+def _plan_cache(monkeypatch, cached):
+    """Force the plan's cache verdict for every file."""
+    from core.inference.diffusion import DiffusionBackend
+    monkeypatch.setattr(
+        DiffusionBackend,
+        "_hub_file_is_cached",
+        staticmethod(
+            lambda repo_id, filename, revision = None, expected_size = None, **kwargs: cached(filename)
+        ),
+    )
+
+
+def test_download_plan_omits_cached_video_files_but_keeps_the_footprint(monkeypatch):
+    # The Video page plans every hub pick, so an unfiltered plan would re-stage a model that is
+    # already on disk. required_bytes stays the full footprint either way.
+    _plan_api(
+        monkeypatch,
+        {
+            "unsloth/LTX-2.3-GGUF": _LTX23_REPO_SIBLINGS,
+            "Lightricks/LTX-2": _LTX_BASE_SIBLINGS,
+        },
+    )
+    _plan_cache(monkeypatch, lambda name: name.endswith(".gguf"))
+
+    plan = VideoBackend().download_plan(
+        "unsloth/LTX-2.3-GGUF",
+        gguf_filename = "ltx-2.3-22b-distilled.gguf",
+        family_override = "ltx-2",
+    )
+
+    staged = {f for e in plan["entries"] for f in e["files"]}
+    assert "ltx-2.3-22b-distilled.gguf" not in staged, "a cached checkpoint must not restage"
+    assert staged, "its uncached companions still have to be fetched"
+    assert plan["checkpoint_bytes"] > 0
+    assert plan["total_bytes"] == sum(e["bytes"] for e in plan["entries"])
+    assert plan["required_bytes"] == plan["total_bytes"] + plan["checkpoint_bytes"]
+
+
+def test_download_plan_is_empty_when_the_whole_video_pick_is_cached(monkeypatch):
+    _plan_api(
+        monkeypatch,
+        {
+            "unsloth/LTX-2.3-GGUF": _LTX23_REPO_SIBLINGS,
+            "Lightricks/LTX-2": _LTX_BASE_SIBLINGS,
+        },
+    )
+    _plan_cache(monkeypatch, lambda name: True)
+
+    plan = VideoBackend().download_plan(
+        "unsloth/LTX-2.3-GGUF",
+        gguf_filename = "ltx-2.3-22b-distilled.gguf",
+        family_override = "ltx-2",
+    )
+
+    assert plan["entries"] == [] and plan["total_bytes"] == 0
+    # Nothing to fetch, but the load still needs every one of those bytes on disk.
+    assert plan["required_bytes"] > 0
 
 
 def test_download_plan_narrows_an_ltx23_pick_and_stages_its_extras(monkeypatch):
@@ -2039,6 +2108,7 @@ def test_fetch_te_prequant_only_reports_what_it_downloaded(monkeypatch):
         filename,
         token,
         cancel_event = None,
+        **kwargs,
     ):
         raise OSError("404")
 
@@ -2047,7 +2117,7 @@ def test_fetch_te_prequant_only_reports_what_it_downloaded(monkeypatch):
 
     monkeypatch.setattr(
         "utils.hf_xet_fallback.hf_hub_download_with_xet_fallback",
-        lambda repo, filename, token, cancel_event = None: "/tmp/precast.pt",
+        lambda repo, filename, token, cancel_event = None, **kwargs: "/tmp/precast.pt",
     )
     assert backend._fetch_te_prequant({"text_encoder": source}, None) == ("text_encoder",)
     # A local path override is the injection's business (allowlist), and nothing is fetched for it.
@@ -2319,3 +2389,25 @@ def test_attention_trim_skipped_for_static_shape_and_off_tiers(fake_runtime, mon
         assert status["loaded"] is True, mode
         assert calls == [], mode
         assert "hunyuan_attn_trim" not in status["speed_optims"], mode
+
+
+def test_every_video_fetch_resolves_both_cache_roots():
+    """The plan probe accepts a file cached under EITHER root (Studio's cache folder is a
+    setting, so a pre-move download sits under huggingface_hub's import-time root) and stages
+    neither. So every fetch on the load path has to resolve both roots as well, or the file the
+    planner skipped is re-pulled inside the load, outside the manager's progress, cancel and disk
+    preflight -- and fails outright offline. The diffusion and sd.cpp fetches already opt in."""
+    # Every module on the video load path, not just video.py: the LTX-2.3 extras loader lives in
+    # video_ltx2.py and shipped without the opt-in while the plan already skipped its files.
+    root = Path(__file__).resolve().parents[1] / "core/inference"
+    for name in ("video.py", "video_ltx2.py"):
+        src = (root / name).read_text()
+        # The bare `from ... import name` has no trailing paren, so this counts call sites only.
+        calls = src.count("hf_hub_download_with_xet_fallback(")
+        if calls == 0:
+            continue
+        optins = src.count("reuse_other_cache_root = True")
+        assert optins == calls, (
+            f"{name}: {calls - optins} of {calls} video fetches resolve only the active cache "
+            "root, so the planner's both-roots probe can drop a file the load cannot then find"
+        )
