@@ -577,6 +577,9 @@ class VideoBackend:
                         kwargs["gguf_filename"],
                         kwargs.get("hf_token"),
                         cancel_event = cancel_event,
+                        # The plan counts a file cached under EITHER root and stages neither, so the
+                        # load has to resolve through both or it re-pulls what the planner skipped.
+                        reuse_other_cache_root = True,
                     )
                 )
             # An LTX-2.3 checkpoint supplies the VAEs/vocoder/connectors, so the base pull shrinks to scheduler + TE + tokenizer; recompute the estimate.
@@ -827,29 +830,54 @@ class VideoBackend:
         # Keyed by repo so a 2.3 pick's checkpoint and extras stay ONE scoped job; two entries would collide on the job key.
         entries: dict[str, dict[str, Any]] = {}
         total = 0
+        checkpoint_bytes = 0
+        planned: dict[str, set[str]] = {}
 
         def add(
             repo: str,
             files: list[tuple[str, int]],
             gguf: Optional[str] = None,
+            revision: Optional[str] = None,
+            checkpoint: bool = False,
         ) -> int:
-            if not files:
-                return 0
-            entry = entries.setdefault(
-                repo, {"repo_id": repo, "files": [], "bytes": 0, "gguf_filename": None}
-            )
-            seen = set(entry["files"])
-            added = 0
+            """Count every required file, but stage only the ones the loader cannot already
+            resolve. The page now plans EVERY hub pick, so an unfiltered entry would re-stage
+            a model that is fully on disk. Returns the full size, cached or not.
+
+            ``checkpoint`` marks the entry holding the SELECTED model so the panel can label it
+            without re-deriving the answer from the repo id, which the plan itself may have
+            rewritten. Same envelope key the image planners emit, so one page-side map serves both."""
+            from core.inference.diffusion import DiffusionBackend
+
+            seen = planned.setdefault(repo, set())
+            required = 0
             for name, size in files:
                 if name in seen:
                     continue
                 seen.add(name)
+                required += int(size)
+                if DiffusionBackend._hub_file_is_cached(repo, name, revision, int(size)):
+                    continue
+                entry = entries.setdefault(
+                    repo,
+                    {
+                        "repo_id": repo,
+                        "files": [],
+                        "bytes": 0,
+                        "gguf_filename": None,
+                        "checkpoint": False,
+                    },
+                )
                 entry["files"].append(name)
                 entry["bytes"] += int(size)
-                added += int(size)
-            if gguf:
-                entry["gguf_filename"] = gguf
-            return added
+            if gguf and repo in entries:
+                entries[repo]["gguf_filename"] = gguf
+            # Only ever raised, never cleared: a repo that holds both the checkpoint and companion
+            # files (a 2.3 pick whose extras live in the checkpoint repo) is keyed once, so a later
+            # companion add would otherwise unflag the entry the earlier checkpoint add marked.
+            if checkpoint and repo in entries:
+                entries[repo]["checkpoint"] = True
+            return required
 
         try:
             api = HfApi(token = hf_token or None)
@@ -860,7 +888,14 @@ class VideoBackend:
                     for s in (info.siblings or [])
                     if s.rfilename == gguf_filename
                 ]
-                total += add(repo_id, sizes, gguf = gguf_filename)
+                checkpoint_bytes = sum(size for _name, size in sizes)
+                total += add(
+                    repo_id,
+                    sizes,
+                    gguf = gguf_filename,
+                    revision = getattr(info, "sha", None),
+                    checkpoint = True,
+                )
                 if ltx23:
                     # The 2.3 assembly reads these companion files at load; without them here they would be pulled inline, outside the panel's disk preflight.
                     from .video_ltx2 import ltx23_extras_files, LTX23_EXTRAS_REPO
@@ -878,6 +913,7 @@ class VideoBackend:
                             for s in (extras_info.siblings or [])
                             if s.rfilename in wanted
                         ],
+                        revision = getattr(extras_info, "sha", None),
                     )
             # Pre-cast encoders first: only a checkpoint that really resolves earns the right to drop the dense shards.
             te_sources = self._te_prequant_sources(fam, text_encoder_quant)
@@ -894,11 +930,22 @@ class VideoBackend:
                         ltx23 = ltx23,
                         skip_te_components = tuple(te_files),
                     ),
+                    revision = getattr(info, "sha", None),
+                    # A pipeline pick has no single file: the base IS the selected model (base =
+                    # repo_id above). Under a GGUF pick the base is a companion, so it stays unflagged.
+                    checkpoint = kind == "pipeline",
                 )
         except Exception as exc:  # noqa: BLE001 -- an unavailable plan falls back to the inline pull
             logger.warning("video.download_plan_failed: %s", exc)
-            return {"entries": [], "total_bytes": 0}
-        return {"entries": list(entries.values()), "total_bytes": total}
+            return {"entries": [], "total_bytes": 0, "required_bytes": 0, "checkpoint_bytes": 0}
+        return {
+            "entries": list(entries.values()),
+            # Remaining vs the full footprint: cache state changes what is left to fetch, never
+            # what the load needs on disk.
+            "total_bytes": sum(entry["bytes"] for entry in entries.values()),
+            "required_bytes": total,
+            "checkpoint_bytes": int(checkpoint_bytes),
+        }
 
     @staticmethod
     def _pick_looks_like_ltx23(
@@ -947,6 +994,8 @@ class VideoBackend:
                     source.filename,
                     hf_token,
                     cancel_event = cancel,
+                    # Pre-quant encoders are planned with the same both-roots probe.
+                    reuse_other_cache_root = True,
                 )
             except Exception as exc:  # noqa: BLE001 -- no pre-cast file just means the dense encoder
                 if cancel.is_set():
@@ -1000,7 +1049,14 @@ class VideoBackend:
                 if cancel.is_set():
                     raise RuntimeError(VIDEO_CANCELLED_MSG)
                 local = Path(
-                    hf_hub_download_with_xet_fallback(base, name, hf_token, cancel_event = cancel)
+                    hf_hub_download_with_xet_fallback(
+                        base,
+                        name,
+                        hf_token,
+                        cancel_event = cancel,
+                        # Same reason as the checkpoint: the plan already treats either root as cached.
+                        reuse_other_cache_root = True,
+                    )
                 )
                 if name == "model_index.json":
                     snapshot_root = local.parent
@@ -1593,7 +1649,15 @@ class VideoBackend:
             return root
         from utils.hf_xet_fallback import hf_hub_download_with_xet_fallback
 
-        return Path(hf_hub_download_with_xet_fallback(repo_id, gguf_filename or "", hf_token))
+        return Path(
+            hf_hub_download_with_xet_fallback(
+                repo_id,
+                gguf_filename or "",
+                hf_token,
+                # Matches the planner's both-roots cache probe, as the diffusion fetches already do.
+                reuse_other_cache_root = True,
+            )
+        )
 
     # ── generation ───────────────────────────────────────────────────────────
 

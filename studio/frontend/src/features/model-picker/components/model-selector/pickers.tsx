@@ -72,6 +72,7 @@ import {
   Download01Icon,
   Flag01Icon,
   Folder02Icon,
+  HelpCircleIcon,
   PinIcon,
   RemoveCircleIcon,
   Search01Icon,
@@ -151,6 +152,7 @@ import type {
   ExternalModelOption,
   LoraModelOption,
   ModelOption,
+  ModelDownloadFootprintResolver,
   ModelSelectorChangeMeta,
 } from "./types";
 import {
@@ -549,6 +551,61 @@ function SizeText({ value }: { value: string }) {
   );
 }
 
+/** Keep the row's size treatment consistent with every other model. Diffusion
+ * GGUFs get one small explanation affordance because their checkpoint is only
+ * part of what the loader must keep on disk. The icon is decorative: the
+ * explanation hangs off the row button, the one focusable element here. */
+export function GgufDownloadFootprint({
+  checkpointBytes,
+  companionBytes,
+}: {
+  checkpointBytes: number;
+  companionBytes: number;
+}) {
+  const totalBytes = checkpointBytes + companionBytes;
+  // Whole-GB rounding is too lossy for a sum: "2.6 GB + 8.2 GB = 11 GB"
+  // looks contradictory. Keep one decimal for the aggregate through GB/TB.
+  const totalLabel =
+    totalBytes >= 1_000_000_000 && totalBytes < 1_000_000_000_000
+      ? `${(totalBytes / 1_000_000_000).toFixed(1)} GB`
+      : totalBytes >= 1_000_000_000_000
+        ? `${(totalBytes / 1_000_000_000_000).toFixed(1)} TB`
+        : formatBytes(totalBytes);
+  return (
+    <span
+      data-model-download-footprint={true}
+      className="flex items-center gap-1 whitespace-nowrap text-foreground/80"
+    >
+      <SizeText value={totalLabel} />
+      <span
+        data-model-download-footprint-help={true}
+        aria-hidden={true}
+        className="flex size-3.5 shrink-0 items-center justify-center text-muted-foreground/70"
+      >
+        <HugeiconsIcon icon={HelpCircleIcon} className="size-3" strokeWidth={1.8} />
+      </span>
+    </span>
+  );
+}
+
+/** The checkpoint-versus-assets breakdown behind that aggregate. */
+export function GgufDownloadFootprintExplanation({
+  checkpointBytes,
+  companionBytes,
+}: {
+  checkpointBytes: number;
+  companionBytes: number;
+}) {
+  return (
+    <>
+      <span className="font-medium">Full required size</span>
+      <span className="ml-1 text-muted-foreground">
+        {formatBytes(checkpointBytes)} model + {formatBytes(companionBytes)} required assets
+      </span>
+    </>
+  );
+}
+
 /** The one quant a row loads, as a compact mono chip. */
 function QuantChip({ label }: { label: string }) {
   return (
@@ -910,7 +967,13 @@ function isValidGgufVariant(variant: unknown): variant is GgufVariantDetail {
     Number.isFinite(candidate.size_bytes) &&
     candidate.size_bytes >= 0 &&
     (candidate.downloaded === undefined ||
-      typeof candidate.downloaded === "boolean")
+      typeof candidate.downloaded === "boolean") &&
+    // Carried through so each row can look up its own dependency group's
+    // footprint. Absent or null on an older backend, which groups the repo as
+    // one, so it must never reject the row.
+    (candidate.dependency_key === undefined ||
+      candidate.dependency_key === null ||
+      typeof candidate.dependency_key === "string")
   );
 }
 
@@ -1086,6 +1149,7 @@ function GgufVariantExpander({
   loadId,
   cachePath,
   onSelect,
+  resolveDownloadFootprint,
   gpuGb,
   systemRamGb,
   budgetKnown = false,
@@ -1106,6 +1170,7 @@ function GgufVariantExpander({
   /** Cache directory this downloaded row represents, if any. */
   cachePath?: string | null;
   onSelect: (id: string, meta: ModelSelectorChangeMeta) => void;
+  resolveDownloadFootprint?: ModelDownloadFootprintResolver;
   gpuGb?: number;
   systemRamGb?: number;
   budgetKnown?: boolean;
@@ -1319,6 +1384,104 @@ function GgufVariantExpander({
     });
   }, [sortedVariants, showAllQuantizations, onDevice]);
 
+  // A diffusion GGUF is not self-contained: the loader also needs a text
+  // encoder, VAE, tokenizer and configs. That companion set is NOT
+  // repository-wide, so one representative's footprint cannot speak for the
+  // whole listing: a neutral repo can hold GGUFs of different families with
+  // different base repos, and FLUX.2-klein picks a different text encoder for
+  // its 9B checkpoints than for its 4B ones. Both are folded into the
+  // backend's dependency_key, so grouping by it is what keeps a non
+  // representative row from advertising a GB-wrong total. One request per
+  // distinct key: the ordinary repo has exactly one, which is the cost this
+  // representative scheme exists to protect.
+  const footprintVariants = useMemo(() => {
+    const byKey = new Map<string, GgufVariantDetail>();
+    for (const variant of displayVariants ?? []) {
+      // An unkeyed repo (older backend, or no family resolved) collapses to one
+      // group, which is exactly the previous repo-wide behavior.
+      const key = variant.dependency_key ?? "";
+      const current = byKey.get(key);
+      if (current === undefined) {
+        byKey.set(key, variant);
+        continue;
+      }
+      // The recommended quant is the representative of its own group when it
+      // has one; otherwise the group's first row stands.
+      if (
+        current.quant !== effectiveRecommended &&
+        variant.quant === effectiveRecommended
+      ) {
+        byKey.set(key, variant);
+      }
+    }
+    return Array.from(byKey.values());
+  }, [displayVariants, effectiveRecommended]);
+  const [companionBytesByKey, setCompanionBytesByKey] = useState<
+    Map<string, number>
+  >(() => new Map());
+  useEffect(() => {
+    let cancelled = false;
+    setCompanionBytesByKey(new Map());
+    // A local path is resolved too: only the CHECKPOINT is on disk. Its text encoder, VAE,
+    // tokenizer and configs still come from the remote base, which is the larger half of the
+    // footprint, so suppressing the request understated a local row by many gigabytes.
+    if (!resolveDownloadFootprint) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    for (const footprintVariant of footprintVariants) {
+      const dependencyKey = footprintVariant.dependency_key ?? "";
+      const expectedBytes = ggufVariantExpectedBytes(footprintVariant);
+      void resolveDownloadFootprint(repoId, {
+        // Same source the row itself reports, so the plan describes the pick that would run.
+        source: sourceOverride ?? (isLocalPath ? "local" : "hub"),
+        isLora: false,
+        ggufVariant: footprintVariant.quant,
+        ggufFilename: footprintVariant.filename,
+        isDownloaded: footprintVariant.downloaded,
+        expectedBytes,
+        isGguf: true,
+      })
+        .then((footprint) => {
+          if (cancelled || !footprint) return;
+          // A local checkpoint is not part of required_bytes at all, so nothing may be
+          // subtracted for it: the whole figure IS the remote companion set. Only a hub pick
+          // carries its checkpoint inside the total, and expectedBytes stands in when the
+          // planner could not size it.
+          const checkpoint = isLocalPath
+            ? 0
+            : footprint.checkpointBytes > 0
+              ? footprint.checkpointBytes
+              : expectedBytes;
+          const companion = footprint.requiredBytes - checkpoint;
+          if (Number.isFinite(companion) && companion > 0) {
+            // A fresh Map per resolution: React compares state by identity, and
+            // the groups resolve independently, so a mutation would drop the
+            // rows whose request landed first.
+            setCompanionBytesByKey((previous) => {
+              const next = new Map(previous);
+              next.set(dependencyKey, companion);
+              return next;
+            });
+          }
+        })
+        .catch(() => {
+          // The checkpoint size remains useful when an older backend or a Hub
+          // metadata failure cannot provide the companion footprint.
+        });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    footprintVariants,
+    isLocalPath,
+    repoId,
+    resolveDownloadFootprint,
+    sourceOverride,
+  ]);
+
   const variantOptionKeys = useMemo(
     () =>
       (displayVariants ?? []).map((variant) =>
@@ -1399,73 +1562,101 @@ function GgufVariantExpander({
         const oom = fit === "oom";
         const tight = fit === "tight";
         const expectedBytes = ggufVariantExpectedBytes(v);
+        // This row's own dependency group, never the listing's: see the
+        // footprintVariants comment above.
+        const companionBytes =
+          companionBytesByKey.get(v.dependency_key ?? "") ?? null;
         // A folder has no download to resume; a quant short a shard has no files to load.
         const unusableLocal = isLocalPath && v.partial === true;
         const keyBase = `${repoId}:${v.filename}`;
         const variantOptionKey = makeModelOptionKey("gguf-variant", keyBase);
+        const rowButton = (
+          <button
+            type="button"
+            {...variantList.getOptionProps(variantOptionKey, false)}
+            disabled={unusableLocal}
+            onClick={() =>
+              handleVariantClick(
+                v.quant,
+                v.filename,
+                v.downloaded,
+                expectedBytes,
+              )
+            }
+            className={cn(
+              "flex min-w-0 flex-1 items-center justify-between gap-2 rounded-full py-1 pl-2 pr-1.5 text-left text-sm transition-colors hover:bg-[#ececec] focus-visible:bg-[#ececec] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring dark:hover:bg-[var(--sidebar-accent)] dark:focus-visible:bg-[var(--sidebar-accent)]",
+              unusableLocal &&
+                "cursor-default opacity-50 hover:bg-transparent dark:hover:bg-transparent",
+            )}
+          >
+            <span className="min-w-0 flex-1 truncate font-mono text-xs">
+              <span
+                className={cn(oom && "!text-gray-500 dark:!text-gray-400")}
+              >
+                {v.quant}
+              </span>
+              {unusableLocal ? (
+                <span className="ml-1.5 text-ui-9 font-sans font-medium text-amber-700 dark:text-amber-300">
+                  incomplete
+                </span>
+              ) : v.downloaded ? (
+                <>
+                  <span className="ml-1.5 text-ui-9 font-sans font-medium text-green-600/90 dark:text-green-400/80">
+                    downloaded
+                  </span>
+                  {v.update_available ? (
+                    <span className="ml-1.5 text-ui-9 font-sans font-medium text-amber-700 dark:text-amber-300">
+                      update available
+                    </span>
+                  ) : null}
+                </>
+              ) : v.quant === effectiveRecommended ? (
+                <span className="ml-1.5 text-ui-9 font-sans font-medium text-primary/70">
+                  recommended
+                </span>
+              ) : null}
+            </span>
+            <span className="flex items-center gap-1.5 shrink-0">
+              {oom && (
+                <span className="text-ui-9 font-medium !text-red-700 !bg-red-50 dark:!text-red-300 dark:!bg-red-500/15 px-1.5 py-0.5 rounded">
+                  OOM
+                </span>
+              )}
+              {tight && (
+                <span className="text-ui-9 font-medium !text-amber-400">
+                  TIGHT
+                </span>
+              )}
+              <span className="font-mono text-ui-10 text-muted-foreground tabular-nums">
+                {companionBytes === null ? (
+                  <SizeText value={formatBytes(v.size_bytes)} />
+                ) : (
+                  <GgufDownloadFootprint
+                    checkpointBytes={v.size_bytes}
+                    companionBytes={companionBytes}
+                  />
+                )}
+              </span>
+            </span>
+          </button>
+        );
         return (
           <div key={v.filename} className="flex items-center">
-            <button
-              type="button"
-              {...variantList.getOptionProps(variantOptionKey, false)}
-              disabled={unusableLocal}
-              onClick={() =>
-                handleVariantClick(
-                  v.quant,
-                  v.filename,
-                  v.downloaded,
-                  expectedBytes,
-                )
-              }
-              className={cn(
-                "flex min-w-0 flex-1 items-center justify-between gap-2 rounded-full py-1 pl-2 pr-1.5 text-left text-sm transition-colors hover:bg-[#ececec] focus-visible:bg-[#ececec] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring dark:hover:bg-[var(--sidebar-accent)] dark:focus-visible:bg-[var(--sidebar-accent)]",
-                unusableLocal &&
-                  "cursor-default opacity-50 hover:bg-transparent dark:hover:bg-transparent",
-              )}
-            >
-              <span className="min-w-0 flex-1 truncate font-mono text-xs">
-                <span
-                  className={cn(oom && "!text-gray-500 dark:!text-gray-400")}
-                >
-                  {v.quant}
-                </span>
-                {unusableLocal ? (
-                  <span className="ml-1.5 text-ui-9 font-sans font-medium text-amber-700 dark:text-amber-300">
-                    incomplete
-                  </span>
-                ) : v.downloaded ? (
-                  <>
-                    <span className="ml-1.5 text-ui-9 font-sans font-medium text-green-600/90 dark:text-green-400/80">
-                      downloaded
-                    </span>
-                    {v.update_available ? (
-                      <span className="ml-1.5 text-ui-9 font-sans font-medium text-amber-700 dark:text-amber-300">
-                        update available
-                      </span>
-                    ) : null}
-                  </>
-                ) : v.quant === effectiveRecommended ? (
-                  <span className="ml-1.5 text-ui-9 font-sans font-medium text-primary/70">
-                    recommended
-                  </span>
-                ) : null}
-              </span>
-              <span className="flex items-center gap-1.5 shrink-0">
-                {oom && (
-                  <span className="text-ui-9 font-medium !text-red-700 !bg-red-50 dark:!text-red-300 dark:!bg-red-500/15 px-1.5 py-0.5 rounded">
-                    OOM
-                  </span>
-                )}
-                {tight && (
-                  <span className="text-ui-9 font-medium !text-amber-400">
-                    TIGHT
-                  </span>
-                )}
-                <span className="font-mono text-ui-10 text-muted-foreground tabular-nums">
-                  <SizeText value={formatBytes(v.size_bytes)} />
-                </span>
-              </span>
-            </button>
+            {/* The explanation rides the row button, not the icon: a nested trigger inside a
+                button is neither a tab stop nor safe to click, so it could only ever be hovered. */}
+            {companionBytes === null ? (
+              rowButton
+            ) : (
+              <Tooltip delayDuration={0}>
+                <TooltipTrigger asChild={true}>{rowButton}</TooltipTrigger>
+                <TooltipContent side="top" className="tooltip-compact">
+                  <GgufDownloadFootprintExplanation
+                    checkpointBytes={v.size_bytes}
+                    companionBytes={companionBytes}
+                  />
+                </TooltipContent>
+              </Tooltip>
+            )}
             {v.downloaded && onConfigure && (
               <ModelLoadSettingsAction
                 ariaLabel={`Inference settings for ${repoId} ${v.quant}`}
@@ -1852,6 +2043,7 @@ export function HubModelPicker({
   externalModels = [],
   value,
   onSelect: onSelectProp,
+  resolveDownloadFootprint,
   onFoldersChange,
   onBrowseHub,
   onModelsChange,
@@ -1870,6 +2062,7 @@ export function HubModelPicker({
   externalModels?: ExternalModelOption[];
   value?: string;
   onSelect: (id: string, meta: ModelSelectorChangeMeta) => void;
+  resolveDownloadFootprint?: ModelDownloadFootprintResolver;
   onFoldersChange?: () => void;
   /** Open the full Hub page to browse more models. */
   onBrowseHub?: () => void;
@@ -3671,6 +3864,7 @@ export function HubModelPicker({
             allowPin={true}
             onHasVision={(v) => reportVision(c.repo_id, v)}
             onSelect={onSelect}
+            resolveDownloadFootprint={resolveDownloadFootprint}
             onConfigure={onConfigure}
             hfToken={hfToken || undefined}
             parentOptionKey={optionKey}
@@ -4466,6 +4660,7 @@ export function HubModelPicker({
                                   repoId={m.id}
                                   onDevice={true}
                                   onSelect={onSelect}
+                                  resolveDownloadFootprint={resolveDownloadFootprint}
                                   onConfigure={onConfigure}
                                   parentOptionKey={optionKey}
                                   onNavigatePastStart={() =>
@@ -4595,6 +4790,7 @@ export function HubModelPicker({
                                 repoId={m.id}
                                 onDevice={true}
                                 onSelect={onSelect}
+                                resolveDownloadFootprint={resolveDownloadFootprint}
                                 onConfigure={onConfigure}
                                 parentOptionKey={optionKey}
                                 onNavigatePastStart={() =>
@@ -4710,6 +4906,7 @@ export function HubModelPicker({
                                 repoId={m.id}
                                 onDevice={true}
                                 onSelect={onSelect}
+                                resolveDownloadFootprint={resolveDownloadFootprint}
                                 onConfigure={onConfigure}
                                 parentOptionKey={optionKey}
                                 onNavigatePastStart={() =>
@@ -4800,6 +4997,7 @@ export function HubModelPicker({
                               <GgufVariantExpander
                                 repoId={id}
                                 onSelect={onSelect}
+                                resolveDownloadFootprint={resolveDownloadFootprint}
                                 onConfigure={onConfigure}
                                 hfToken={hfToken || undefined}
                                 parentOptionKey={optionKey}
@@ -4913,6 +5111,7 @@ export function HubModelPicker({
                             <GgufVariantExpander
                               repoId={id}
                               onSelect={onSelect}
+                              resolveDownloadFootprint={resolveDownloadFootprint}
                               onConfigure={onConfigure}
                               hfToken={hfToken || undefined}
                               parentOptionKey={optionKey}
@@ -5019,6 +5218,7 @@ export function HubModelPicker({
                               <GgufVariantExpander
                                 repoId={id}
                                 onSelect={onSelect}
+                                resolveDownloadFootprint={resolveDownloadFootprint}
                                 onConfigure={onConfigure}
                                 hfToken={hfToken || undefined}
                                 parentOptionKey={optionKey}
