@@ -2,6 +2,10 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 import {
+  forceQuit,
+  FORCE_QUIT_AFTER_MS,
+} from "@/components/tauri/closing-signal";
+import {
   installProgressMessage,
   startupWaitingMessage,
   STATUS_MESSAGE_ROTATION_MS,
@@ -11,7 +15,7 @@ import { Spinner } from "@/components/ui/spinner";
 import type { BackendStatus } from "@/hooks/use-tauri-backend";
 import type { CopySupportDiagnosticsResult } from "@/lib/tauri-diagnostics";
 import { AnimatePresence, motion } from "motion/react";
-import { useEffect, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 
 interface StartupScreenProps {
   status: BackendStatus;
@@ -267,6 +271,42 @@ function RepairingContent({
   );
 }
 
+function ClosingContent() {
+  // The reap has its own timeouts and normally beats this. If it does not, it is wedged,
+  // and the overlay is over the titlebar, so this button is the only way out of the app.
+  const [wedged, setWedged] = useState(false);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setWedged(true), FORCE_QUIT_AFTER_MS);
+    return () => clearTimeout(timer);
+  }, []);
+
+  return (
+    <div className="flex h-full w-full flex-col items-center">
+      <div className="flex flex-1 items-center">
+        <Logo />
+      </div>
+      <div className="mb-10 flex w-full flex-col items-center gap-2">
+        <Spinner className="size-6 text-primary" />
+        <p className="text-sm font-bold text-foreground" aria-live="polite">
+          Closing Unsloth Desktop...
+        </p>
+        <p className="text-sm text-muted-foreground">Shutting down the backend.</p>
+        {wedged && (
+          <div className="mt-4 flex flex-col items-center gap-2">
+            <p className="max-w-xs text-center text-xs text-muted-foreground">
+              This is taking longer than it should.
+            </p>
+            <ActionButton variant="secondary" onClick={() => void forceQuit()}>
+              Force quit
+            </ActionButton>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function InstallErrorContent({
   error,
   onRetryInstall,
@@ -481,21 +521,51 @@ export function StartupScreen({
   }
 
   return (
+    <StartupSurface>
+      <AnimatePresence mode="wait">
+        <motion.div
+          key={status}
+          className="flex h-full w-full flex-col items-center justify-center text-center"
+          initial={{ opacity: 0 }}
+          animate={{ opacity: 1 }}
+          exit={{ opacity: 0 }}
+          transition={{ duration: 0.2, ease: EASE_OUT_QUART }}
+        >
+          {renderContent()}
+        </motion.div>
+      </AnimatePresence>
+    </StartupSurface>
+  );
+}
+
+/** The chrome both full-window screens sit in, so they agree on insets and scrolling. */
+function StartupSurface({ children }: { children: ReactNode }) {
+  return (
     <div className="box-border flex h-full w-full flex-col items-center overflow-y-auto bg-background pb-6 pt-[var(--studio-startup-top-inset,0px)]">
       <div className="flex min-h-0 flex-1 w-full max-w-md items-center justify-center px-6">
-        <AnimatePresence mode="wait">
-          <motion.div
-            key={status}
-            className="flex h-full w-full flex-col items-center justify-center text-center"
-            initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            transition={{ duration: 0.2, ease: EASE_OUT_QUART }}
-          >
-            {renderContent()}
-          </motion.div>
-        </AnimatePresence>
+        {children}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Shown from the moment a quit is requested until the process is gone. Separate from
+ * StartupScreen because a quit can come from the running app, where no backend status
+ * applies, and unanimated because it has to be on screen for the very next paint.
+ *
+ * A layer over the app rather than a replacement for it: a declined quit has to hand the
+ * user back the tree they had, in-flight generations and unsaved drafts included. The
+ * z-index clears the titlebar and the download stack, the last of which is 9998.
+ */
+export function ClosingScreen() {
+  return (
+    <div className="fixed inset-0 z-[9999]">
+      <StartupSurface>
+        <div className="flex h-full w-full flex-col items-center justify-center text-center">
+          <ClosingContent />
+        </div>
+      </StartupSurface>
     </div>
   );
 }
