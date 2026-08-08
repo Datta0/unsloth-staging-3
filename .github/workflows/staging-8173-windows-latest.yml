@@ -1,0 +1,38 @@
+name: "staging-8173 windows-latest"
+on:
+  push:
+    branches: ["pr-8173-xplat-ci"]
+    paths:
+      - 'studio/frontend/src/features/video/api.ts'
+      - 'studio/frontend/src/features/video/video-page.tsx'
+      - 'studio/frontend/src/lib/native-files.ts'
+      - 'studio/src-tauri/src/loopback_http.rs'
+      - 'studio/src-tauri/src/main.rs'
+      - 'studio/src-tauri/src/native_file_dialogs.rs'
+      - 'studio/src-tauri/tauri.conf.json'
+      - '.github/workflows/staging-8173-windows-latest.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest tests/studio/test_desktop_reliability_frontend_contract.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' || rc=$?; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; exit "$rc"
