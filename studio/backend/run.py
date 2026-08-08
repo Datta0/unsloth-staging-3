@@ -1136,6 +1136,73 @@ def _remove_pid_file():
         pass
 
 
+# Windows terminates the process ~5s after a close event, so leave a margin.
+_CONSOLE_SHUTDOWN_BUDGET = 4.5
+
+
+def _run_console_shutdown(shutdown) -> None:
+    try:
+        shutdown()
+    except Exception as error:
+        logger.warning("Console-close cleanup failed: %s", error)
+
+
+def _install_windows_console_handler(shutdown) -> bool:
+    """Run the graceful shutdown when the console window is closed.
+
+    Closing the window raises CTRL_CLOSE_EVENT, which Python never turns into a
+    signal, so neither a signal handler nor atexit runs and cleanup is skipped.
+    ``shutdown`` takes no arguments and must not touch signal.signal: Windows
+    runs this on a thread it creates for the event, and Windows kills the
+    process about five seconds later, so the work is bounded to fit. No-op off
+    Windows.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        CTRL_C_EVENT, CTRL_BREAK_EVENT = 0, 1
+        CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT = 2, 5, 6
+        HANDLER = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+
+        import threading
+
+        def _on_console_event(event: int) -> bool:
+            if event in (CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT):
+                worker = threading.Thread(
+                    target = _run_console_shutdown, args = (shutdown,), daemon = True
+                )
+                worker.start()
+                worker.join(timeout = _CONSOLE_SHUTDOWN_BUDGET)
+                return True
+            # Ctrl+C / Ctrl+Break already arrive as Python signals; pass them
+            # on rather than shutting down twice.
+            del CTRL_C_EVENT, CTRL_BREAK_EVENT
+            return False
+
+        callback = HANDLER(_on_console_event)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+        kernel32.SetConsoleCtrlHandler.argtypes = [HANDLER, wintypes.BOOL]
+        kernel32.SetConsoleCtrlHandler.restype = wintypes.BOOL
+        if not kernel32.SetConsoleCtrlHandler(callback, True):
+            logger.warning(
+                "Could not install the console-close handler (WinError %s); closing the "
+                "window will skip subprocess cleanup.",
+                ctypes.get_last_error(),
+            )
+            return False
+        # Hold a reference: a collected callback leaves Windows calling into
+        # freed memory.
+        globals()["_WINDOWS_CONSOLE_HANDLER"] = callback
+        logger.info("Console-close handler installed")
+        return True
+    except Exception as error:
+        logger.warning("Could not install the console-close handler: %s", error)
+        return False
+
+
 def _graceful_shutdown(server = None):
     """Shut down all subprocess backends and the uvicorn server.
 
@@ -1189,8 +1256,9 @@ def _graceful_shutdown(server = None):
 
     # 7. Backstop sweep for any adopted child the steps above missed.
     try:
-        from utils.process_lifetime import terminate_all
+        from utils.process_lifetime import clear_breadcrumb, terminate_all
         terminate_all()
+        clear_breadcrumb()  # nothing left for the next startup to sweep
     except Exception as e:
         logger.warning("Error in process-lifetime sweep: %s", e)
 
@@ -1849,9 +1917,18 @@ def run_server(
 
     # Reap every child if the parent dies abnormally (terminal close, Task
     # Manager kill, SIGKILL); must run before any child can spawn.
-    from utils.process_lifetime import initialize_parent_lifetime
+    from utils.process_lifetime import initialize_parent_lifetime, reap_recorded_children
 
     initialize_parent_lifetime()
+    # macOS has neither PR_SET_PDEATHSIG nor job objects, so a Studio that
+    # crashed left its sidecars running. Sweep before spawning anything: a
+    # leftover holds VRAM, a port, and the files an update has to replace.
+    try:
+        reaped = reap_recorded_children()
+        if reaped:
+            logger.warning("Reaped %d orphan(s) from a previous Studio: %s", len(reaped), reaped)
+    except Exception as e:
+        logger.warning("Could not sweep orphans from a previous run: %s", e)
 
     # --secure exposes ONLY the Cloudflare link: reject --secure --no-cloudflare,
     # then force a loopback bind so the raw port is never public (even -H 0.0.0.0).
@@ -2487,6 +2564,15 @@ if __name__ == "__main__":
     # On Windows, some terminals send SIGBREAK for Ctrl+C / Ctrl+Break.
     if hasattr(signal, "SIGBREAK"):
         signal.signal(signal.SIGBREAK, _signal_handler)
+
+    # NOT _signal_handler: Windows runs this on a thread it creates, and
+    # signal.signal() off the main thread raises, which would leave the window
+    # close doing no cleanup at all.
+    def _console_shutdown():
+        _graceful_shutdown(_server)
+        _shutdown_event.set()
+
+    _install_windows_console_handler(_console_shutdown)
 
     # Keep running until shutdown signal. Event.wait() without a timeout blocks at
     # the C level on Linux, preventing SIGINT delivery; a short timeout in a loop
