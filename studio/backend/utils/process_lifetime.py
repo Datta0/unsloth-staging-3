@@ -11,9 +11,13 @@ reaps every process in the job when the parent's last handle closes. Mirrors the
 desktop app's job in studio/src-tauri/src/windows_job.rs.
 
 POSIX: each long-lived child sets prctl(PR_SET_PDEATHSIG) on Linux via a tiny
-preexec hook (macOS has no equivalent and relies on the cooperative path +
-terminate_all). Linux's signal is per-direct-child only, so multiprocessing
+preexec hook. Linux's signal is per-direct-child only, so multiprocessing
 workers are also tracked for terminate_all.
+
+macOS has neither mechanism, so tracked children are also recorded on disk and
+the next startup sweeps whatever the previous run left behind
+(reap_recorded_children). That record is the only reaper macOS has after a
+crash, a Force Quit or a closed terminal.
 
 Best-effort throughout: any failure degrades to today's behavior, never raises.
 Stdlib only.
@@ -37,6 +41,53 @@ _spawner: "Optional[_Spawner]" = None
 _initialized = False
 _win_job_handle: Optional[int] = None  # retained for the interpreter's lifetime
 _tracked_pids: "dict[int, Optional[str]]" = {}  # pid -> identity, reaped by terminate_all
+# Serialises edit-then-write: two threads adopting at once could otherwise each
+# write from its own snapshot, and the older write would drop the newer pid.
+_record_lock = threading.Lock()
+
+
+# Whether cleanup-on-abnormal-exit is in force, and why not. A silent failure
+# here leaks every child on a crash, so record it and log it.
+_win_job_status: "tuple[bool, str]" = (False, "not attempted")
+
+
+def _last_error(ctypes_module) -> int:
+    # get_last_error is Windows-only; a POSIX probe must not raise here.
+    getter = getattr(ctypes_module, "get_last_error", None)
+    try:
+        return int(getter()) if getter else 0
+    except Exception:
+        return 0
+
+
+def _record_job_status(
+    ok: bool,
+    detail: str,
+    last_error: int = 0,
+) -> None:
+    global _win_job_status
+    if last_error:
+        detail = f"{detail} (WinError {last_error})"
+    _win_job_status = (ok, detail)
+    try:
+        import logging
+        logger = logging.getLogger(__name__)
+        if ok:
+            logger.info("Child-process cleanup on abnormal exit: %s", detail)
+        else:
+            logger.warning(
+                "Child-process cleanup on abnormal exit is NOT guaranteed: %s. Children may "
+                "survive a crash or a force quit; the startup sweep reaps them on the next "
+                "launch.",
+                detail,
+            )
+    except Exception:
+        pass
+
+
+def windows_job_status() -> "tuple[bool, str]":
+    """(in_force, detail) for the Windows kill-on-close job."""
+    return _win_job_status
 
 
 def _is_linux() -> bool:
@@ -63,6 +114,11 @@ def initialize_parent_lifetime() -> None:
         _initialized = True
         if _is_windows():
             _install_windows_job()
+        elif _is_linux():
+            _record_job_status(True, "PR_SET_PDEATHSIG per child")
+        else:
+            # macOS: no pdeathsig, no job object; reap_recorded_children covers it.
+            _record_job_status(False, "no kernel-level parent-death signal on this platform")
 
 
 def _win_signatures(kernel32) -> None:
@@ -132,23 +188,27 @@ def _install_windows_job() -> None:
 
         job = kernel32.CreateJobObjectW(None, None)
         if not job:
+            _record_job_status(False, "CreateJobObjectW failed", _last_error(ctypes))
             return
         info = _EXT()
         info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
         if not kernel32.SetInformationJobObject(
             job, _JobObjectExtendedLimitInformation, ctypes.byref(info), ctypes.sizeof(info)
         ):
+            _record_job_status(False, "SetInformationJobObject failed", _last_error(ctypes))
             kernel32.CloseHandle(job)
             return
         # AssignProcessToJobObject(parent) makes children inherit the job. May
         # fail if Unsloth already runs inside an incompatible host job (pre-Win8);
         # degrade to the cooperative path rather than blocking startup.
         if not kernel32.AssignProcessToJobObject(job, kernel32.GetCurrentProcess()):
+            _record_job_status(False, "AssignProcessToJobObject failed", _last_error(ctypes))
             kernel32.CloseHandle(job)
             return
         _win_job_handle = job  # hold the handle so the job is not closed early
-    except Exception:
-        pass
+        _record_job_status(True, "kill-on-close job installed")
+    except Exception as error:
+        _record_job_status(False, f"{type(error).__name__}: {error}")
 
 
 # ── Child binding ──
@@ -326,23 +386,179 @@ def child_popen_kwargs(preexec_fn: Optional[Callable[[], None]] = None) -> dict:
 
 
 def _pid_identity(pid: int) -> Optional[str]:
-    # Linux /proc starttime (stat field 22); pins identity so a reused pid is not
-    # signalled later. None (other platforms / unreadable) disables the check.
-    if not _is_linux():
-        return None
-    try:
-        with open(f"/proc/{pid}/stat", encoding = "utf-8") as fh:
-            stat = fh.read()
-        return stat[stat.rfind(")") + 2 :].split()[19]  # after comm: starttime
-    except Exception:
-        return None
+    # Start time pins identity so a reused pid is never signalled later. None
+    # (unreadable, or a platform with no cheap source) disables the check.
+    if _is_linux():
+        try:
+            with open(f"/proc/{pid}/stat", encoding = "utf-8") as fh:
+                stat = fh.read()
+            comm = stat[stat.find("(") + 1 : stat.rfind(")")]
+            # starttime has 10ms granularity, so pair it with comm: a recycled
+            # pid then has to match both.
+            return f"{stat[stat.rfind(')') + 2 :].split()[19]}:{comm}"
+        except Exception:
+            return None
+    if _is_windows():
+        # Creation time, so a recycled pid is never mistaken for the child that
+        # was recorded. Same purpose as starttime on Linux.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [
+                ctypes.POINTER(wintypes.FILETIME)
+            ] * 4
+            kernel32.GetProcessTimes.restype = wintypes.BOOL
+            handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+            if not handle:
+                return None
+            try:
+                created = wintypes.FILETIME()
+                other = [wintypes.FILETIME() for _ in range(3)]
+                if not kernel32.GetProcessTimes(
+                    handle, ctypes.byref(created), *[ctypes.byref(x) for x in other]
+                ):
+                    return None
+                return f"{created.dwHighDateTime}:{created.dwLowDateTime}"
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return None
+    if sys.platform == "darwin":
+        # No /proc; `ps -o lstart` is enough to spot a recycled pid.
+        try:
+            import subprocess
+
+            out = subprocess.run(
+                ["ps", "-o", "lstart=,comm=", "-p", str(pid)],
+                capture_output = True,
+                text = True,
+                encoding = "utf-8",
+                errors = "replace",
+                timeout = 5,
+            )
+            line = (out.stdout or "").strip()
+            return line or None
+        except Exception:
+            return None
+    return None
 
 
 def forget_pid(pid: Optional[int]) -> None:
     """Stop tracking a child the owner has reaped, so terminate_all never
     signals a recycled pid."""
     if pid:
-        _tracked_pids.pop(pid, None)
+        with _record_lock:
+            _tracked_pids.pop(pid, None)
+            _write_breadcrumb()
+
+
+# ── Crash-survivable child record ──
+#
+# macOS has neither PR_SET_PDEATHSIG nor job objects, so a crash leaves every
+# sidecar running. Record children as they are adopted; sweep the previous
+# run's leftovers at startup.
+
+
+def _breadcrumb_dir():
+    from pathlib import Path
+
+    override = os.environ.get("UNSLOTH_STUDIO_CHILD_RECORD")
+    if override:
+        return Path(override)
+    try:
+        from utils.paths.storage_roots import studio_root
+        return Path(studio_root()) / "run" / "children"
+    except Exception:
+        return None
+
+
+def _breadcrumb_file():
+    # One file per owner: two Studios can share a home (different ports), and a
+    # single shared file would let the second erase the first's children.
+    directory = _breadcrumb_dir()
+    return None if directory is None else directory / f"{os.getpid()}.json"
+
+
+def _write_breadcrumb() -> None:
+    path = _breadcrumb_file()
+    if path is None:
+        return
+    try:
+        import json
+
+        path.parent.mkdir(parents = True, exist_ok = True)
+        payload = {
+            "owner_pid": os.getpid(),
+            "owner_identity": _pid_identity(os.getpid()),
+            "children": [
+                {"pid": pid, "identity": identity} for pid, identity in _tracked_pids.items()
+            ],
+        }
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding = "utf-8")
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def clear_breadcrumb() -> None:
+    """Drop our record after a clean shutdown; everything in it is already gone."""
+    path = _breadcrumb_file()
+    if path is not None:
+        _unlink(path)
+
+
+def _identity_or_none(pid) -> "Optional[str]":
+    return _pid_identity(pid) if isinstance(pid, int) and pid > 0 else None
+
+
+def _pid_alive(pid: int) -> bool:
+    if _is_windows():
+        # NOT os.kill(pid, 0): that is TerminateProcess here, so the probe
+        # would kill the process it is asking about.
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            SYNCHRONIZE = 0x0010_0000
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            WAIT_TIMEOUT = 0x102
+            ERROR_ACCESS_DENIED = 5
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error = True)
+            kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+            kernel32.WaitForSingleObject.restype = wintypes.DWORD
+            kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+
+            handle = kernel32.OpenProcess(
+                SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                # ACCESS_DENIED means alive but another user's; else it is gone.
+                return _last_error(ctypes) == ERROR_ACCESS_DENIED
+            try:
+                # Signalled means exited; still waiting means running.
+                return kernel32.WaitForSingleObject(handle, 0) == WAIT_TIMEOUT
+            finally:
+                kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def adopt_pid(pid: Optional[int]) -> None:
@@ -351,7 +567,10 @@ def adopt_pid(pid: Optional[int]) -> None:
     Tolerates a None or already-exited pid."""
     if not pid:
         return
-    _tracked_pids[pid] = _pid_identity(pid)
+    identity = _pid_identity(pid)
+    with _record_lock:
+        _tracked_pids[pid] = identity
+        _write_breadcrumb()
     if _is_windows() and _win_job_handle:
         try:
             import ctypes
@@ -385,6 +604,95 @@ def terminate_all(timeout: float = 5.0) -> None:
             _posix_terminate(pid, timeout)
         except Exception:
             pass
+
+
+def reap_recorded_children(timeout: float = 5.0) -> "list[int]":
+    """Kill children recorded by a previous Studio that is no longer running.
+
+    Runs once at startup, before anything new spawns. Every record in the
+    directory is considered, so a Studio that crashed while a sibling was
+    running is still cleaned up. A child is only signalled when its recorded
+    start-time identity still matches, so a recycled pid is never touched.
+    """
+    directory = _breadcrumb_dir()
+    if directory is None or not directory.is_dir():
+        return []
+    killed: "list[int]" = []
+    for path in sorted(directory.glob("*.json")):
+        killed.extend(_reap_one_record(path, timeout))
+    return killed
+
+
+def _reap_one_record(path, timeout: float) -> "list[int]":
+    import json
+
+    killed: "list[int]" = []
+    try:
+        record = json.loads(path.read_text(encoding = "utf-8"))
+    except Exception:
+        _unlink(path)
+        return killed
+    if not isinstance(record, dict):
+        _unlink(path)
+        return killed
+
+    owner_pid = record.get("owner_pid")
+    owner_identity = record.get("owner_identity")
+    # Identity decides, not the pid: pids recycle, and this process may have
+    # inherited the pid of the Studio that wrote the record.
+    owner_matches = owner_identity is None or owner_identity == _identity_or_none(owner_pid)
+    if owner_pid == os.getpid() and owner_matches:
+        return killed  # our own record
+    if isinstance(owner_pid, int) and owner_matches and _pid_alive(owner_pid):
+        return killed  # that Studio is still running; its children are its own
+
+    unresolved = False
+    children = record.get("children")
+    for entry in children if isinstance(children, list) else []:
+        pid = entry.get("pid") if isinstance(entry, dict) else None
+        if not isinstance(pid, int) or not _pid_alive(pid):
+            continue
+        identity = entry.get("identity")
+        current = _identity_or_none(pid)
+        if identity is None or current is None:
+            # Unverifiable: never signal a pid that might now be something else.
+            # Windows has no identity source here, and the Job Object already
+            # covers that case.
+            unresolved = True
+            continue
+        if identity != current:
+            continue  # recycled by an unrelated process
+        if _is_windows():
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        else:
+            _posix_terminate(pid, timeout = timeout)
+        # Counted once signalled: an unwaited child lingers as a zombie, which
+        # a liveness re-check would read as alive.
+        killed.append(pid)
+
+    if not unresolved:
+        _unlink(path)
+    if killed:
+        try:
+            import logging
+            logging.getLogger(__name__).warning(
+                "Reaped %d orphaned child process(es) left by a previous Studio: %s",
+                len(killed),
+                killed,
+            )
+        except Exception:
+            pass
+    return killed
+
+
+def _unlink(path) -> None:
+    try:
+        path.unlink(missing_ok = True)
+    except Exception:
+        pass
 
 
 def _posix_terminate(pid: int, timeout: float = 5.0) -> None:
