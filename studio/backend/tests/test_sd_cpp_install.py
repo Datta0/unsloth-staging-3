@@ -18,7 +18,10 @@ if str(_STUDIO) not in sys.path:
     sys.path.insert(0, str(_STUDIO))
 
 import hashlib  # noqa: E402
+import types  # noqa: E402
+import threading  # noqa: E402
 import io  # noqa: E402
+import re  # noqa: E402
 import json  # noqa: E402
 import urllib.error  # noqa: E402
 import zipfile  # noqa: E402
@@ -37,6 +40,7 @@ from install_sd_cpp_prebuilt import (  # noqa: E402
     default_install_dir,
     install,
     resolve_release_asset,
+    upstream_tag_for,
 )
 
 # A real stable-diffusion.cpp latest-release asset list.
@@ -400,10 +404,19 @@ def test_find_sd_cpp_binary_honors_studio_home(tmp_path, monkeypatch):
 # The shipped pin, not a copy of it: a hardcoded tag here silently stops describing what users
 # actually install the moment DEFAULT_TAG moves.
 _TAG = DEFAULT_TAG
-# Exactly what unslothai/stable-diffusion.cpp's CI publishes (CPU + Apple only; GPU hosts run diffusers).
+# Exactly what unslothai/stable-diffusion.cpp's CI publishes. It was CPU and Apple only, on the
+# premise that a GPU host runs diffusers instead. MiniMax-H3 falsified that: its diffusers path
+# wants more VRAM than a consumer card has, so those hosts fall back to the native engine, and on
+# Linux there was no accelerated build to fall back to. The CUDA leg is best effort and outside the
+# publisher's coverage gate, so it can be absent from a release; every test below has to hold
+# either way.
 _MIRROR_ASSETS = [
     f"sd-{_TAG}-bin-Darwin-macOS-arm64.zip",
     f"sd-{_TAG}-bin-Darwin-macOS-x86_64.zip",
+    # Before the plain build, which is the order a real release lists them in ("-cuda12.zip"
+    # sorts ahead of ".zip"). It matters: if auto picked by position rather than by the
+    # accelerator-marker filter, this ordering is what would expose it.
+    f"sd-{_TAG}-bin-Linux-Ubuntu-22.04-x86_64-cuda12.zip",
     f"sd-{_TAG}-bin-Linux-Ubuntu-22.04-x86_64.zip",
     f"sd-{_TAG}-bin-Linux-Ubuntu-24.04-aarch64.zip",
     f"sd-{_TAG}-bin-win-cpu-x64.zip",
@@ -433,6 +446,95 @@ def test_mirror_matrix_resolves_every_cpu_apple_host():
     assert _mresolve("Linux", "aarch64") == f"sd-{_TAG}-bin-Linux-Ubuntu-24.04-aarch64.zip"
     assert _mresolve("Windows", "AMD64") == f"sd-{_TAG}-bin-win-cpu-x64.zip"
     assert _mresolve("Windows", "AMD64", "cpu") == f"sd-{_TAG}-bin-win-cpu-x64.zip"
+
+
+def test_mirror_linux_cuda_resolves_the_cuda_bundle():
+    """A CUDA host asking for cuda gets the accelerated build. This is what makes MiniMax-H3
+    usable there: its GGUF path was running on the CPU because no Linux CUDA asset existed, and
+    video.py falls back to the CPU prebuilt whenever the accelerated one cannot be resolved."""
+    assert (
+        _mresolve("Linux", "x86_64", "cuda")
+        == f"sd-{_TAG}-bin-Linux-Ubuntu-22.04-x86_64-cuda12.zip"
+    )
+
+
+def test_mirror_linux_auto_still_takes_the_plain_cpu_build():
+    """The CUDA bundle ships the CUDA runtime and is roughly 25x the size of the CPU one. A host
+    that did not ask for a GPU build must not be handed it by accident."""
+    assert _mresolve("Linux", "x86_64") == f"sd-{_TAG}-bin-Linux-Ubuntu-22.04-x86_64.zip"
+    assert _mresolve("Linux", "x86_64", "cpu") == f"sd-{_TAG}-bin-Linux-Ubuntu-22.04-x86_64.zip"
+
+
+def test_mirror_linux_cuda_refuses_a_release_without_one():
+    """The CUDA leg is best effort, so a release can lack the asset. Returning None lets the
+    caller fall back deliberately; handing back the CPU build would leave the caller believing it
+    had a GPU binary, keep the load on the GPU device, and run sd-cli wholly on the CPU."""
+    without = [a for a in _MIRROR_ASSETS if "cuda" not in a]
+    assert (
+        resolve_release_asset(without, system = "Linux", machine = "x86_64", accelerator = "cuda") is None
+    )
+
+
+# ── the pin translates to upstream ───────────────────────────────────────────
+
+
+def test_upstream_tag_drops_the_mirror_fork_suffix():
+    """A mirror release built on an upstream one is that tag plus "-u<fork sha>", and only the
+    base half exists upstream. The suffix has to come off before the fallback asks for it."""
+    assert upstream_tag_for("master-813-bfbef5b-u13b9d92") == "master-813-bfbef5b"
+    assert upstream_tag_for("master-813-bfbef5b-u0665242") == "master-813-bfbef5b"
+    # A plain upstream tag, and a tag whose trailing segment is not a fork sha, pass through.
+    assert upstream_tag_for("master-809-eb7f35c") == "master-809-eb7f35c"
+    assert upstream_tag_for("v1.2.3-ubuntu") == "v1.2.3-ubuntu"
+    assert upstream_tag_for(None) is None
+
+
+def test_shipped_pin_translates_to_a_plain_upstream_tag():
+    """Guards the pin itself: whatever DEFAULT_TAG becomes, the string handed upstream must not
+    still carry a fork suffix, or the fallback is asking for a release that cannot exist."""
+    assert re.search(r"-u[0-9a-f]{7,}$", upstream_tag_for(DEFAULT_TAG)) is None
+
+
+def test_upstream_fallback_asks_for_the_translated_pin_not_latest(monkeypatch):
+    """A Linux Vulkan host: the mirror has no such asset, so resolution falls to upstream. It must
+    ask upstream for the pin's upstream base tag and stop there -- reaching an unpinned upstream
+    "latest" is exactly the reproducibility loss the translation exists to prevent."""
+    monkeypatch.delenv("UNSLOTH_SD_CPP_REPO", raising = False)
+    monkeypatch.setenv("UNSLOTH_SD_CPP_TAG", "master-813-bfbef5b-u13b9d92")
+    monkeypatch.setattr(sdmod.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(sdmod.platform, "machine", lambda: "x86_64")
+    seen = []
+
+    def fake_fetch(
+        tag = None,
+        *,
+        repo = None,
+        token = None,
+        timeout = 30.0,
+        allow_latest = True,
+    ):
+        seen.append((repo, tag))
+        if repo == sdmod.UPSTREAM_FALLBACK_REPO and tag == "master-813-bfbef5b":
+            return {
+                "tag_name": tag,
+                "assets": [{"name": "sd-master-bfbef5b-bin-Linux-Ubuntu-24.04-x86_64-vulkan.zip"}],
+            }
+        # The mirror serves the pin but builds no Vulkan asset; every other request 404s.
+        if repo == sdmod.DEFAULT_REPO and tag == "master-813-bfbef5b-u13b9d92":
+            return {
+                "tag_name": tag,
+                "assets": [{"name": f"sd-{tag}-bin-Linux-Ubuntu-22.04-x86_64.zip"}],
+            }
+        raise urllib.error.HTTPError(f"https://api/{repo}", 404, "not found", None, None)
+
+    monkeypatch.setattr(sdmod, "_fetch_release", fake_fetch)
+    repo, release, chosen = sdmod._resolve_with_fallback("vulkan", None)
+    assert repo == sdmod.UPSTREAM_FALLBACK_REPO
+    assert release["tag_name"] == "master-813-bfbef5b"
+    assert chosen.endswith("-vulkan.zip")
+    # The raw fork tag is never sent upstream, and no unpinned latest is ever requested.
+    assert (sdmod.UPSTREAM_FALLBACK_REPO, "master-813-bfbef5b-u13b9d92") not in seen
+    assert not any(tag is None for _repo_name, tag in seen)
 
 
 # ── mirror -> upstream fallback in install() ─────────────────────────────────
@@ -534,7 +636,10 @@ def test_mirror_windows_gpu_accel_is_no_match_not_cpu():
 
 
 def test_mirror_linux_gpu_accel_is_no_match_not_cpu():
-    for accel in ("cuda", "vulkan", "rocm"):
+    # cuda is no longer in this list: the mirror publishes a Linux CUDA bundle now, and
+    # test_mirror_linux_cuda_resolves_the_cuda_bundle pins that. vulkan and rocm are still
+    # unbuilt, and must return None rather than quietly resolving to the CPU zip.
+    for accel in ("vulkan", "rocm"):
         assert _mresolve("Linux", "x86_64", accel) is None
     assert _mresolve("Linux", "x86_64", "cpu") == f"sd-{_TAG}-bin-Linux-Ubuntu-22.04-x86_64.zip"
 
@@ -776,3 +881,432 @@ def test_a_reinstall_over_an_owned_root_keeps_the_repair_loop_closed(tmp_path, m
     sd_cli = install(install_dir = target)
     assert (target / ".unsloth-studio-owned").is_file()
     assert eng.is_managed_binary(str(sd_cli)) is True
+
+
+# ── the install records its accelerator, and a change reinstalls ─────────────
+
+
+def test_install_records_the_accelerator_it_installed(tmp_path, monkeypatch):
+    """The record is what lets a later ensure_* tell a CPU bundle from a GPU one."""
+    zb = _zip_with_sd_cli()
+    _stub_release(monkeypatch, zip_bytes = zb, digest = "sha256:" + hashlib.sha256(zb).hexdigest())
+    target = tmp_path / "sd-home" / "stable-diffusion.cpp"
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "sd-home" / "studio"))
+
+    install(install_dir = target)
+    assert sdmod.installed_accelerator(target) == "cpu"
+    # "auto" resolves to the same plain build, so it must not read as a different install.
+    assert sdmod.accelerator_class("auto") == sdmod.accelerator_class("cpu") == "cpu"
+    assert sdmod.accelerator_class("CUDA") == "cuda"
+    # No record at all is "unknown", not "cpu".
+    assert sdmod.installed_accelerator(tmp_path / "nothing-here") is None
+
+
+def _managed_tree(
+    tmp_path,
+    monkeypatch,
+    accelerator = None,
+):
+    """A Studio-owned install tree, optionally carrying an install record."""
+    root = tmp_path / "sd-home" / "stable-diffusion.cpp"
+    (root / "sd-bin").mkdir(parents = True)
+    (root / ".unsloth-studio-owned").touch()
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "sd-home" / "studio"))
+    if accelerator is not None:
+        sdmod._write_install_record(root, accelerator = accelerator, repo = "r", tag = "t")
+    return root
+
+
+def test_a_cpu_install_is_reinstalled_when_cuda_is_requested(tmp_path, monkeypatch):
+    """The P1: an upgraded Linux CUDA host already holding the managed CPU bundle. Both ensure_*
+    returned any runnable binary they found, so the new CUDA asset was never installed and native
+    generation silently stayed entirely on the CPU."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cpu")
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    installs: list = []
+
+    def _install(**kwargs):
+        installs.append(kwargs)
+        server.write_bytes(b"cuda-build")
+        sdmod._write_install_record(root, accelerator = kwargs["accelerator"], repo = "r", tag = "t")
+        return root / "sd-bin" / "sd-cli"
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    assert bk.ensure_sd_server_binary(accelerator = "cuda") == str(server)
+    assert [k["accelerator"] for k in installs] == ["cuda"], "the CUDA build must be installed"
+    assert server.read_bytes() == b"cuda-build"
+    # Now that the record says cuda, the next load reuses it instead of reinstalling.
+    assert bk.ensure_sd_server_binary(accelerator = "cuda") == str(server)
+    assert len(installs) == 1
+
+
+def test_asking_for_the_cpu_build_never_reinstalls(tmp_path, monkeypatch):
+    """Only an upgrade reinstalls. A CPU/auto request must reuse whatever is there, including an
+    install predating the record, or every CPU host would re-download on its next load."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = None)  # no record: an older install
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cpu-build")
+    cli = root / "sd-bin" / "sd-cli"
+    cli.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "find_sd_cpp_binary", lambda: str(cli))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+
+    def _install(**_kwargs):
+        raise AssertionError("a CPU request must not reinstall")
+
+    monkeypatch.setattr(sdmod, "install", _install)
+    assert bk.ensure_sd_server_binary(accelerator = "cpu") == str(server)
+    assert bk.ensure_sd_cpp_binary(accelerator = "auto") == str(cli)
+
+
+def test_a_user_supplied_binary_is_never_reinstalled_over_on_an_accelerator_change(
+    tmp_path, monkeypatch
+):
+    """An unmarked root is the user's own build. install() would refuse it anyway, so attempting
+    the upgrade would only cost a download and end with no binary at all."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = tmp_path / "sd-home" / "stable-diffusion.cpp"  # deliberately NOT marked
+    (root / "sd-bin").mkdir(parents = True)
+    monkeypatch.setenv("UNSLOTH_STUDIO_HOME", str(tmp_path / "sd-home" / "studio"))
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"users-own-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+
+    def _install(**_kwargs):
+        raise AssertionError("an unmarked (user-owned) root must not be reinstalled over")
+
+    monkeypatch.setattr(sdmod, "install", _install)
+    assert bk.ensure_sd_server_binary(accelerator = "cuda") == str(server)
+
+
+def test_a_failed_upgrade_keeps_the_working_binary_and_stops_retrying(tmp_path, monkeypatch):
+    """A host with no asset for the requested accelerator must keep the binary it has (returning
+    None would drop native inference entirely) and must not re-resolve on every later load."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cpu")
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    attempts: list = []
+
+    def _install(**kwargs):
+        attempts.append(kwargs)
+        raise RuntimeError("No prebuilt sd-cli for this host")
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    assert bk.ensure_sd_server_binary(accelerator = "vulkan") == str(server)
+    assert bk.ensure_sd_server_binary(accelerator = "vulkan") == str(server)
+    assert len(attempts) == 1, "the hopeless upgrade must be attempted once, not once per load"
+    assert server.read_bytes() == b"cpu-build"
+
+
+def test_the_upgrade_waits_for_the_resident_server_to_stop(tmp_path, monkeypatch):
+    """The install replaces the sd-server file, and the resident server is executing that exact
+    path: Linux refuses to open a running executable for writing (ETXTBSY) and Windows locks it.
+    Resolving must therefore NOT install while a server is up; the load retries once it is
+    stopped, which is the only moment the file is free."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cpu")
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    monkeypatch.setattr(bk, "_install_allowed", lambda: True)
+    monkeypatch.setattr(
+        bk, "resolve_diffusion_device_target", lambda: types.SimpleNamespace(backend = "cuda")
+    )
+    installs: list = []
+
+    def _install(**kwargs):
+        installs.append(kwargs)
+        server.write_bytes(b"cuda-build")
+        sdmod._write_install_record(root, accelerator = kwargs["accelerator"], repo = "r", tag = "t")
+        return root / "sd-bin" / "sd-cli"
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    backend = bk.SdCppDiffusionBackend()
+    # A resident server is up: resolving must hand back the existing binary and install nothing.
+    backend._state = types.SimpleNamespace(server = object())
+    mode, resolved, _engine = backend._resolve_backend()
+    assert mode == "server" and resolved == str(server)
+    assert installs == [], "no install may run while the server holds its own executable"
+    assert server.read_bytes() == b"cpu-build"
+
+    # Once it is stopped, the deferred upgrade lands.
+    backend._state = None
+    upgraded = backend._upgrade_server_after_teardown(str(server))
+    assert [k["accelerator"] for k in installs] == ["cuda"]
+    assert upgraded == str(server) and server.read_bytes() == b"cuda-build"
+    # Now that the record matches, a later teardown does not reinstall again.
+    assert backend._upgrade_server_after_teardown(str(server)) == str(server)
+    assert len(installs) == 1
+
+
+def test_a_failed_post_teardown_upgrade_keeps_the_existing_server(tmp_path, monkeypatch):
+    """An upgrade may never cost the load the binary it already had."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cpu")
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    monkeypatch.setattr(bk, "_install_allowed", lambda: True)
+    monkeypatch.setattr(
+        bk, "resolve_diffusion_device_target", lambda: types.SimpleNamespace(backend = "cuda")
+    )
+
+    def _boom(**_kwargs):
+        raise RuntimeError("no prebuilt for this host")
+
+    monkeypatch.setattr(sdmod, "install", _boom)
+
+    backend = bk.SdCppDiffusionBackend()
+    backend._state = None
+    assert backend._upgrade_server_after_teardown(str(server)) == str(server)
+    assert server.read_bytes() == b"cpu-build"
+
+
+def test_a_recorded_gpu_install_is_replaced_when_the_cpu_build_is_wanted(tmp_path, monkeypatch):
+    """The mirror image of the CPU-to-CUDA upgrade. Nothing on the sd-server/sd-cli command line
+    selects a backend -- the build itself is the choice -- so a recorded CUDA install keeps running
+    on the GPU after the device target resolves to CPU. Only a RECORDED mismatch reinstalls: an
+    unrecorded install stays put, else every legacy CPU host would redownload on a CPU target."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cuda")
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cuda-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    installs: list = []
+
+    def _install(**kwargs):
+        installs.append(kwargs)
+        server.write_bytes(b"cpu-build")
+        sdmod._write_install_record(root, accelerator = kwargs["accelerator"], repo = "r", tag = "t")
+        return root / "sd-bin" / "sd-cli"
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    assert bk.ensure_sd_server_binary(accelerator = "cpu") == str(server)
+    assert [k["accelerator"] for k in installs] == ["cpu"]
+    assert server.read_bytes() == b"cpu-build"
+    # The record now says cpu, so the next CPU load reuses it.
+    assert bk.ensure_sd_server_binary(accelerator = "cpu") == str(server)
+    assert len(installs) == 1
+
+
+def test_the_upgrade_waits_for_an_active_one_shot_generation(tmp_path, monkeypatch):
+    """A one-shot load holds the managed tree just as hard as a resident server: begin_load only
+    signals the in-flight generation to cancel, and _resolve_backend runs before the load waits on
+    _generate_lock, so the old sd-cli can still be executing from the tree an install would
+    overwrite. Defer there too, and land the upgrade after the teardown."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cpu")
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    monkeypatch.setattr(bk, "_install_allowed", lambda: True)
+    monkeypatch.setattr(
+        bk, "resolve_diffusion_device_target", lambda: types.SimpleNamespace(backend = "cuda")
+    )
+    installs: list = []
+
+    def _install(**kwargs):
+        installs.append(kwargs)
+        server.write_bytes(b"cuda-build")
+        sdmod._write_install_record(root, accelerator = kwargs["accelerator"], repo = "r", tag = "t")
+        return root / "sd-bin" / "sd-cli"
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    backend = bk.SdCppDiffusionBackend()
+    # One-shot: no resident server, but a generation is still running out of the tree.
+    backend._state = types.SimpleNamespace(server = None)
+    backend._active_generate_cancel = threading.Event()
+    mode, resolved, _engine = backend._resolve_backend()
+    assert mode == "server" and resolved == str(server)
+    assert installs == [], "no install may run while a one-shot sd-cli is executing"
+    assert server.read_bytes() == b"cpu-build"
+    assert backend._deferred_accelerator_install is True
+
+    # After the teardown the generation is over and the tree is free.
+    backend._state = None
+    backend._active_generate_cancel = None
+    assert backend._upgrade_server_after_teardown(str(server)) == str(server)
+    assert [k["accelerator"] for k in installs] == ["cuda"]
+    assert server.read_bytes() == b"cuda-build"
+
+
+def test_an_idle_backend_installs_the_matching_build_immediately(tmp_path, monkeypatch):
+    """The deferral is only for a tree in use: with nothing running, resolving installs at once."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cpu")
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    monkeypatch.setattr(bk, "_install_allowed", lambda: True)
+    monkeypatch.setattr(
+        bk, "resolve_diffusion_device_target", lambda: types.SimpleNamespace(backend = "cuda")
+    )
+    installs: list = []
+
+    def _install(**kwargs):
+        installs.append(kwargs)
+        server.write_bytes(b"cuda-build")
+        sdmod._write_install_record(root, accelerator = kwargs["accelerator"], repo = "r", tag = "t")
+        return root / "sd-bin" / "sd-cli"
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    backend = bk.SdCppDiffusionBackend()
+    mode, resolved, _engine = backend._resolve_backend()
+    assert mode == "server" and resolved == str(server)
+    assert [k["accelerator"] for k in installs] == ["cuda"]
+    assert backend._deferred_accelerator_install is False
+
+
+def test_the_router_entry_point_cannot_replace_a_running_server(tmp_path, monkeypatch):
+    """select_and_activate_engine calls ensure_sd_server_binary DIRECTLY, before begin_load stops
+    anything, so a deferral that lives only in _resolve_backend does not cover it: a /images/load
+    that resolves to CUDA while the managed CPU server is resident would extract over the running
+    executable. The refusal therefore lives in _accelerator_changed, where every caller passes."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cpu")
+    server = root / "sd-bin" / "sd-server"
+    server.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: str(server))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    installs: list = []
+
+    def _install(**kwargs):
+        installs.append(kwargs)
+        server.write_bytes(b"cuda-build")
+        sdmod._write_install_record(root, accelerator = kwargs["accelerator"], repo = "r", tag = "t")
+        return root / "sd-bin" / "sd-cli"
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    resident = bk.SdCppDiffusionBackend()
+    resident._state = types.SimpleNamespace(server = object())
+    monkeypatch.setattr(bk, "_sd_cpp_backend", resident)
+
+    # The router's own call, verbatim: no backend instance in sight.
+    assert bk.ensure_sd_server_binary(accelerator = "cuda") == str(server)
+    assert installs == [], "the running server's file may not be overwritten"
+    assert server.read_bytes() == b"cpu-build"
+
+    # With nothing resident the same call upgrades as before.
+    monkeypatch.setattr(bk, "_sd_cpp_backend", None)
+    assert bk.ensure_sd_server_binary(accelerator = "cuda") == str(server)
+    assert [k["accelerator"] for k in installs] == ["cuda"]
+
+
+def test_the_one_shot_fallback_keeps_the_requested_accelerator(tmp_path, monkeypatch):
+    """_resolve_engine is also the fallback a GPU sd-server that would not start lands on. It
+    asked for the default "cpu", which -- now that a recorded GPU install counts as a mismatch
+    against a CPU request -- would reinstall the plain bundle over the working GPU one and run the
+    whole generation on the CPU because of an unrelated server startup failure."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cuda")
+    cli = root / "sd-bin" / "sd-cli"
+    cli.write_bytes(b"cuda-build")
+    monkeypatch.setattr(bk, "find_sd_cpp_binary", lambda: str(cli))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    monkeypatch.setattr(bk, "_install_allowed", lambda: True)
+    monkeypatch.setattr(
+        bk, "resolve_diffusion_device_target", lambda: types.SimpleNamespace(backend = "cuda")
+    )
+    monkeypatch.setattr(bk, "SdCppEngine", lambda binary: types.SimpleNamespace(
+        binary = binary, is_available = lambda: True, version = lambda: "x"
+    ))
+
+    def _install(**kwargs):
+        raise AssertionError(f"no reinstall may happen here (asked for {kwargs['accelerator']})")
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    backend = bk.SdCppDiffusionBackend()
+    assert backend._resolve_engine().binary == str(cli)
+    assert cli.read_bytes() == b"cuda-build"
+
+
+def test_a_serverless_deferred_install_still_lands_after_teardown(tmp_path, monkeypatch):
+    """The serverless branch: only sd-cli is installed, so the deferral resolves the load to
+    one-shot, and gating the post-teardown retry on mode == "server" skipped it for good. The
+    archive carries the sd-cli this load generates with, so the install has to run anyway."""
+    import core.inference.sd_cpp_backend as bk
+
+    root = _managed_tree(tmp_path, monkeypatch, accelerator = "cpu")
+    cli = root / "sd-bin" / "sd-cli"
+    cli.write_bytes(b"cpu-build")
+    monkeypatch.setattr(bk, "find_sd_server_binary", lambda: None)  # serverless install
+    monkeypatch.setattr(bk, "find_sd_cpp_binary", lambda: str(cli))
+    monkeypatch.setattr(bk, "_server_binary_runnable", lambda *_a, **_k: True)
+    monkeypatch.setattr(bk, "_failed_accelerator_upgrades", set())
+    monkeypatch.setattr(bk, "_install_allowed", lambda: True)
+    monkeypatch.setattr(
+        bk, "resolve_diffusion_device_target", lambda: types.SimpleNamespace(backend = "cuda")
+    )
+    installs: list = []
+
+    def _install(**kwargs):
+        installs.append(kwargs)
+        cli.write_bytes(b"cuda-build")
+        sdmod._write_install_record(root, accelerator = kwargs["accelerator"], repo = "r", tag = "t")
+        return cli
+
+    monkeypatch.setattr(sdmod, "install", _install)
+
+    backend = bk.SdCppDiffusionBackend()
+    backend._state = types.SimpleNamespace(server = None)
+    backend._active_generate_cancel = threading.Event()  # a one-shot sd-cli is still running
+    mode, server_binary, _engine = backend._resolve_backend()
+    assert mode == "oneshot" and server_binary is None
+    assert installs == [] and backend._deferred_accelerator_install is True
+
+    # After the teardown the tree is free, and the install lands even though the load resolved to
+    # one-shot: sd-cli comes out of the same archive.
+    backend._state = None
+    backend._active_generate_cancel = None
+    assert backend._upgrade_server_after_teardown(None) is None  # this archive ships no server
+    assert [k["accelerator"] for k in installs] == ["cuda"], "the sd-cli still has to be upgraded"
+    assert cli.read_bytes() == b"cuda-build"
+
+    # And a matching tree is not reinstalled on the next deferred load.
+    assert backend._upgrade_server_after_teardown(None) is None
+    assert len(installs) == 1
