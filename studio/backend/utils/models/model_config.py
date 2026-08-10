@@ -30,7 +30,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Callable, List, Tuple, Union
+from typing import Callable, Iterable, List, Tuple, Union
 import hashlib
 import json
 import threading
@@ -1765,6 +1765,71 @@ def dspark_preference_key(name: str) -> tuple[int, str]:
     return dspark_precision_rank(name), Path(name).name.lower()
 
 
+# DFlash publishes the same precision vocabulary (and the published sidecar
+# carries no precision token at all, which lands in the catch-all rank), so the
+# ordering is shared rather than duplicated.
+dflash_precision_rank = dspark_precision_rank
+
+
+def dflash_preference_key(name: str) -> tuple[int, str]:
+    """Sort key picking the preferred DFlash sidecar by name alone."""
+    return dflash_precision_rank(name), Path(name).name.lower()
+
+
+def _drafter_names_other_weight(
+    candidate_name: str,
+    weight_name: Optional[str],
+    other_weight_names: Iterable[str],
+    *,
+    kind: str = "dflash",
+) -> bool:
+    """Whether a sidecar names a DIFFERENT weight sitting beside it.
+
+    A sidecar that names no family at all (the published ``dflash-kquant.gguf``,
+    whose stem is a precision token) has to stay eligible, so "does it name a
+    family" cannot be answered from the sidecar name alone. It is answered
+    against the weights actually present instead: only a stem that pairs with
+    some OTHER weight in the same repo/folder is evidence the sidecar belongs to
+    that neighbour rather than to the weight being loaded.
+    """
+    if weight_name is None:
+        return False
+    if _drafter_matches_weight(candidate_name, weight_name, kind = kind):
+        return False
+    return any(
+        _drafter_matches_weight(candidate_name, other, kind = kind) for other in other_weight_names
+    )
+
+
+def dflash_repo_preference_key(
+    name: str,
+    weight_name: Optional[str] = None,
+    other_weight_names: Iterable[str] = (),
+) -> tuple[int, int, int, str]:
+    """Order DFlash sidecars in a repo listing / cache snapshot against the
+    weight actually being loaded.
+
+    dflash_preference_key ranks by precision and name alone, which is all a
+    single-model repo needs. A repo hosting more than one family also has to be
+    told which weight each sidecar belongs to, or ``dflash-model-A-Q8_0.gguf``
+    outranks the generic ``dflash-kquant.gguf`` on precision and model B is
+    launched with model A's drafter. Same rule the local scan applies in
+    detect_dflash_file, kept in one place so the download, the snapshot reuse
+    and the offline cache all pick the same file.
+
+    Three buckets: a sidecar naming this weight's family (most specific stem
+    first, as detect_mtp_file does), then one naming no weight present here,
+    then one naming a neighbour. The last is demoted rather than dropped, so a
+    repo whose only sidecar looks foreign still gets a fallback and today's
+    single-sidecar behaviour is unchanged.
+    """
+    precision, sort_name = dflash_preference_key(name)
+    if weight_name is not None and _drafter_matches_weight(name, weight_name, kind = "dflash"):
+        return 0, _drafter_stem_rank(name, kind = "dflash"), precision, sort_name
+    foreign = _drafter_names_other_weight(name, weight_name, other_weight_names)
+    return 2 if foreign else 1, 0, precision, sort_name
+
+
 def detect_mtp_file(
     path: str,
     search_root: Optional[str] = None,
@@ -2038,6 +2103,150 @@ def detect_dspark_file(
         if accept is not None and not accept(launch):
             continue
         logger.info("Detected DSpark drafter: %s", launch)
+        return launch
+    return None
+
+
+def detect_dflash_file(
+    path: str,
+    search_root: Optional[str] = None,
+    accept: Optional[Callable[[str], bool]] = None,
+) -> Optional[str]:
+    """Find a DFlash sidecar for a local GGUF model.
+
+    Two things differ from detect_dspark_file, both forced by how DFlash is
+    published:
+
+    1. Root level only. ``dspark/`` is always a publisher's companion folder, so
+       that scan is safe; ``dflash/`` is a family name a user picks for real
+       weights (the reason llama_cpp._DRAFTER_DIR_KINDS leaves it out), so
+       reaching into it would launch a weight copy as --model-draft.
+    2. No filename pairing. The published sidecar is ``dflash-kquant.gguf``,
+       which names no model family at all, so _drafter_matches_weight would
+       reject the one file this exists to find. The header is checked instead:
+       a DFlash sidecar declares ``general.architecture = dflash``, which no
+       real weight does, and that is a stronger signal than a filename. It also
+       settles the adversarial case on its own, since a model merely CALLED
+       DFlash (``Qwen3.6-35B-A3B-DFlash-Q4_K_M.gguf``) reports its own
+       architecture.
+
+    A sidecar that does name a family (``dflash-Qwen3.6-27B-BF16.gguf``, the
+    scheme ggml-org uses) still wins over an unnamed one for the weight it
+    matches, so a multi-model folder attaches the specific sidecar first.
+
+    ``accept`` filters candidates in preference order, so a caller with extra
+    rules (a native lease) keeps scanning instead of treating the first
+    rejection as no sidecar at all.
+    """
+
+    def _rank(candidate: Path) -> tuple[int, int, int, int, str]:
+        # A sidecar naming THIS weight's family first, then any unpaired one,
+        # then precision, then total size so a split copy cannot outrank a
+        # smaller single file, then name for a stable order.
+        paired = _drafter_matches_weight(candidate.name, weight_name, kind = "dflash")
+        return (
+            0 if paired else 1,
+            _drafter_stem_rank(candidate.name, kind = "dflash") if paired else 0,
+            dflash_precision_rank(candidate.name),
+            _drafter_total_size(candidate),
+            candidate.name.lower(),
+        )
+
+    p = Path(path)
+    weight_name = p.name if p.suffix.lower() == ".gguf" else None
+    start_dir = p.parent if p.is_file() else p
+    dirs = [start_dir]
+    if search_root is not None:
+        dirs.append(Path(search_root))
+
+    candidates: list[Path] = []
+    other_weights: list[str] = []
+    seen: set[Path] = set()
+    # dict.fromkeys: search_root is the weight's own parent for a flat layout,
+    # and scanning it twice doubles the directory reads for nothing.
+    for root in dict.fromkeys(dirs):
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for candidate in entries:
+            lower = candidate.name.lower()
+            if not lower.endswith(".gguf"):
+                continue
+            # Prefix form only, deliberately. The shared companion predicates
+            # (_drafter_path_kind, is_mtp_drafter_path) know DFlash by the
+            # dflash- prefix, so accepting <model>-dflash.gguf here would let one
+            # file be a drafter for discovery AND a selectable Q8_0 main model in
+            # the quant picker, and choosing that variant would hand llama-server
+            # the drafter as the target. Teaching the predicate the suffix
+            # instead would hide a real model whose name merely ends in DFlash,
+            # which is the case #7811 exists to protect, so detection gives the
+            # form up rather than the picker giving up a model. No published
+            # DFlash sidecar uses it; the shipped one is dflash-kquant.gguf.
+            if not lower.startswith("dflash-"):
+                # Every other GGUF in the folder is a weight some sidecar could
+                # be naming. Recorded so a sidecar belonging to a NEIGHBOUR can
+                # be told apart from one naming no family at all (below).
+                other_weights.append(candidate.name)
+                continue
+            try:
+                # Collapse a split copy to shard 1 before ranking.
+                launch = _local_gguf_load_path(candidate)
+                # is_file() follows the link, so this also drops a dangling
+                # snapshot symlink and a directory named like a sidecar. Without
+                # it --model-draft gets a path llama-server cannot open, which
+                # fails the whole load rather than falling back to no
+                # speculation (detect_dspark_file guards the same way).
+                if not (launch.is_file() and _drafter_split_is_complete(launch)):
+                    continue
+                resolved = launch.resolve()
+            except OSError:
+                continue
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            candidates.append(launch)
+
+    # A sidecar naming a family that belongs to a NEIGHBOUR weight is that
+    # neighbour's drafter, not a generic one. _drafter_matches_weight is False
+    # both for it and for a sidecar naming no family (dflash-kquant.gguf), so
+    # ranking alone bucketed the two together and precision could float the
+    # foreign one to the top: loading model B beside dflash-model-A-Q8_0.gguf
+    # and dflash-kquant.gguf launched model A's drafter for model B. Both carry
+    # a real dflash header, so the architecture check behind the ranking cannot
+    # catch it. _drafter_names_other_weight decides against the weights actually
+    # present, which keeps the published unpaired sidecar eligible (its stem,
+    # "kquant", names no file here) without hardcoding which stems are precision
+    # tokens. Shared with the remote paths through dflash_repo_preference_key,
+    # so a download and a local scan agree on which sidecar belongs here.
+    if weight_name is not None and other_weights:
+        kept: list[Path] = []
+        for candidate in candidates:
+            if _drafter_names_other_weight(candidate.name, weight_name, other_weights):
+                logger.info(
+                    "detect_dflash_file: dropped %s (names another weight in this folder)",
+                    candidate.name,
+                )
+                continue
+            kept.append(candidate)
+        candidates = kept
+
+    for candidate in sorted(candidates, key = _rank):
+        meta = read_gguf_general_metadata(str(candidate)) or {}
+        if (meta.get("general.architecture") or "").strip().lower() != "dflash":
+            logger.info(
+                "detect_dflash_file: dropped %s (architecture %r is not dflash)",
+                candidate.name,
+                meta.get("general.architecture"),
+            )
+            continue
+        try:
+            launch = _drafter_launch_path(candidate)
+        except OSError:
+            continue
+        if accept is not None and not accept(launch):
+            continue
+        logger.info("Detected DFlash drafter: %s", launch)
         return launch
     return None
 
@@ -3530,6 +3739,7 @@ class ModelConfig:
     gguf_mmproj_file: Optional[str] = None  # Full path to the mmproj .gguf file (vision projection)
     gguf_mtp_file: Optional[str] = None  # Full path to the separate MTP drafter (local mode)
     gguf_dspark_file: Optional[str] = None  # Full path to a DSpark sidecar (local mode)
+    gguf_dflash_file: Optional[str] = None  # Full path to a DFlash sidecar (local mode)
     gguf_hf_repo: Optional[str] = (
         None  # HF repo ID for -hf mode (e.g. "unsloth/gemma-3-4b-it-GGUF")
     )
@@ -3682,6 +3892,7 @@ class ModelConfig:
                 if mtp_file:
                     logger.info(f"Detected MTP drafter: {mtp_file}")
                 dspark_file = detect_dspark_file(gguf_file, search_root = companion_root)
+                dflash_file = detect_dflash_file(gguf_file, search_root = companion_root)
 
                 return cls(
                     identifier = identifier,
@@ -3702,6 +3913,7 @@ class ModelConfig:
                     gguf_mmproj_file = mmproj_file,
                     gguf_mtp_file = mtp_file,
                     gguf_dspark_file = dspark_file,
+                    gguf_dflash_file = dflash_file,
                 )
         else:
             # Does the HF repo contain GGUF files?
