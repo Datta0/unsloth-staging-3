@@ -33,6 +33,7 @@ import { TauriUpdateContext } from "@/hooks/tauri-update-context";
 import { type BackendStatus, useTauriBackend } from "@/hooks/use-tauri-backend";
 import { useTauriUpdate } from "@/hooks/use-tauri-update";
 import { isTauri } from "@/lib/api-base";
+import { getToastOffsets } from "@/lib/toast-offset";
 import { useRouterState } from "@tanstack/react-router";
 import { MotionConfig } from "motion/react";
 import {
@@ -838,6 +839,8 @@ const REDUCED_MOTION_MAP = {
 } as const;
 
 export function AppProvider({ children }: AppProviderProps) {
+  const pathname = useRouterState({ select: (s) => s.location.pathname });
+  const toastOffsets = getToastOffsets(pathname, isTauri);
   const reduceMotion = useAppearanceCustomStore(
     (s) => s.customization.reduceMotion,
   );
@@ -853,10 +856,10 @@ export function AppProvider({ children }: AppProviderProps) {
           visibleToasts={2}
           expand={true}
           closeButton={true}
-          // Clear the chat header buttons on the right. On desktop, also drop
-          // below the ~34px custom window titlebar so toasts don't cover the
-          // minimize / maximize / close controls.
-          offset={{ top: isTauri ? 46 : 12, right: 64 }}
+          // Chat toasts start below its 48px header. Desktop adds the 34px
+          // titlebar clearance that every route already needs.
+          offset={toastOffsets.default}
+          mobileOffset={toastOffsets.mobile}
         />
       </TooltipProvider>
     </MotionConfig>
