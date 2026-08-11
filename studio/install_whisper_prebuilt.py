@@ -160,7 +160,10 @@ SLIM_BACKEND_MODULE_GLOBS = {
     },
     "cuda": {"linux": "libggml-cuda.so*", "windows": "ggml-cuda.dll"},
     "metal": {"macos": "libggml-metal*.dylib"},
-    "rocm": {"linux": "libggml-hip.so*", "windows": "*hip*.dll"},
+    # Windows rocm must name the ggml module: the bundles also ship amdhip64,
+    # hipblas and libhipblaslt, so a looser *hip*.dll would pass on a runtime
+    # that has no ROCm ggml backend at all.
+    "rocm": {"linux": "libggml-hip.so*", "windows": "ggml-hip*.dll"},
     "vulkan": {"linux": "libggml-vulkan.so*", "windows": "ggml-vulkan.dll"},
 }
 
@@ -387,6 +390,18 @@ def llama_runtime_pairs(
     return commit is not None and commit == _llama_ggml_commit(required_tag)
 
 
+def _ships_windows_gpu_ggml_module(llama_bin_dir: Path) -> bool:
+    """Whether a paired Windows llama runtime carries a GPU ggml backend module.
+    Only the cpu-only bundle links ggml against libomp, and bundle_profile cannot
+    tell them apart: it is absent on both the published rocm artifacts and every
+    upstream-sourced install, so the files on disk decide."""
+    for backend, per_os in SLIM_BACKEND_MODULE_GLOBS.items():
+        glob = per_os.get("windows")
+        if backend != "cpu" and glob and any(llama_bin_dir.glob(glob)):
+            return True
+    return False
+
+
 def slim_pairing_for_artifact(
     artifact: dict[str, Any], host: HostInfo, backend: str
 ) -> tuple[Path, str] | None:
@@ -415,7 +430,19 @@ def slim_pairing_for_artifact(
     if not isinstance(sonames, list) or not sonames:
         log(f"slim_selection: {asset} skipped: manifest lists no requires_ggml_sonames")
         return None
-    missing = [str(name) for name in sonames if not (llama_bin_dir / str(name)).is_file()]
+    required_sonames = [str(name) for name in sonames]
+    if host.is_windows and _ships_windows_gpu_ggml_module(llama_bin_dir):
+        # The shared Windows manifest lists libomp because the cpu llama bundle
+        # links ggml against it; the rocm/cuda/vulkan bundles neither ship nor
+        # import it, so requiring it there only ever mis-rejects a valid pairing.
+        # A cpu-only bundle keeps the gate, since its ggml really needs the DLL.
+        # link_ggml_runtime still wires it whenever the bundle ships it.
+        required_sonames = [
+            name
+            for name in required_sonames
+            if not (name.lower().startswith("libomp") and name.lower().endswith(".dll"))
+        ]
+    missing = [name for name in required_sonames if not (llama_bin_dir / name).is_file()]
     if missing:
         log(f"slim_selection: {asset} skipped: llama runtime missing {', '.join(missing)}")
         return None
