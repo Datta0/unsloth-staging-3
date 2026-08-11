@@ -1,0 +1,146 @@
+name: "staging-8398 powershell 5.1 vs 7"
+# Why this exists: studio/setup.ps1 is only ever run by Windows PowerShell 5.1 in the field
+# (the CLI launches powershell.exe), but upstream CI runs the .ps1 suite under pwsh 7 only.
+# PowerShell 7 gives a scalar an intrinsic .Count of 1 where 5.1 does not always, so a whole
+# class of bug -- #8335 among them -- is invisible to a pwsh-only suite. windows-latest ships
+# both: powershell.exe is 5.1, pwsh.exe is 7. Run the suite under each, report separately.
+on:
+  push:
+    branches: ["pr-8398-xplat-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  ps-suite:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Two separate matrix entries, not two steps, so the two interpreters get their own
+          # job result and one cannot mask the other.
+          - id: winps-5.1
+            exe: powershell
+            gate_suite: "no"
+          - id: pwsh-7
+            exe: pwsh
+            gate_suite: "yes"
+    name: "ps-suite (${{ matrix.id }})"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Confirm which interpreter this really is
+        run: |
+          ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -Command \
+            '"exe=${{ matrix.exe }}"; $PSVersionTable | Format-List | Out-String'
+          # Hard gate on the identity: the whole point of the 5.1 leg is that it is 5.1, so a
+          # runner image that quietly aliased powershell.exe to pwsh must fail here, loudly,
+          # rather than produce a green job that proves nothing.
+          MAJOR=$(${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -Command '$PSVersionTable.PSVersion.Major' | tr -d '\r')
+          echo "detected major version: $MAJOR"
+          if [ "${{ matrix.id }}" = "winps-5.1" ] && [ "$MAJOR" != "5" ]; then
+            echo "::error::expected Windows PowerShell 5.x from powershell.exe, got $MAJOR"; exit 1
+          fi
+          if [ "${{ matrix.id }}" = "pwsh-7" ] && [ "$MAJOR" -lt 7 ]; then
+            echo "::error::expected PowerShell 7+ from pwsh.exe, got $MAJOR"; exit 1
+          fi
+
+      - name: Fetch upstream main's pre-fix studio/setup.ps1
+        run: |
+          # The pre-fix source is taken from upstream main, not reconstructed by editing the
+          # post-fix file, so the experiment compares the two real source shapes.
+          git fetch --depth=1 https://github.com/unslothai/unsloth.git main
+          git show FETCH_HEAD:studio/setup.ps1 > prefix_setup.ps1
+          wc -l prefix_setup.ps1 studio/setup.ps1
+          grep -n 'wmiGpus = ' prefix_setup.ps1 studio/setup.ps1 || true
+
+      - name: "DECISIVE: pre-fix vs post-fix AMD WMI region under ${{ matrix.id }}"
+        run: |
+          ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass \
+            -File .github/staging/ps51_wmi_unroll_proof.ps1 \
+            -PreFix prefix_setup.ps1 -PostFix studio/setup.ps1
+
+      - name: "tests/studio/*.ps1 suite under ${{ matrix.id }}"
+        run: |
+          # Every file, one at a time, with its own exit code kept, so the summary says which
+          # file broke rather than only that something did. Under 5.1 this is informational:
+          # the suite is written for pwsh 7 and at least one file asserts it is running on 7.
+          fails=""
+          for f in tests/studio/*.ps1; do
+            echo "===================================================================="
+            echo "== $f  (${{ matrix.id }})"
+            echo "===================================================================="
+            if ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -File "$f"; then
+              echo "RESULT ${{ matrix.id }} PASS $f"
+            else
+              echo "RESULT ${{ matrix.id }} FAIL $f (exit $?)"
+              fails="$fails $f"
+            fi
+          done
+          echo "===================================================================="
+          echo "SUMMARY (${{ matrix.id }}) failing files:${fails:- none}"
+          if [ "${{ matrix.gate_suite }}" = "yes" ] && [ -n "$fails" ]; then
+            echo "::error::suite failures under ${{ matrix.id }}:$fails"; exit 1
+          fi
+          if [ -n "$fails" ]; then
+            echo "::warning::suite failures under ${{ matrix.id }} (informational):$fails"
+          fi
+
+      - name: "PR #8398's own test under ${{ matrix.id }}"
+        if: always()
+        run: |
+          # Called out on its own because it is the test the PR adds. It is authored for pwsh 7
+          # and asserts so; the 5.1 result is recorded, not gated.
+          set +e
+          ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass \
+            -File tests/studio/test_amd_venv_repair_loop.ps1
+          rc=$?
+          echo "test_amd_venv_repair_loop.ps1 under ${{ matrix.id }}: exit $rc"
+          if [ "${{ matrix.gate_suite }}" = "yes" ]; then exit $rc; fi
+          exit 0
+
+  ps-suite-baseline:
+    # The same suite, the same runner, upstream main instead of the PR head. A file that fails
+    # here as well is pre-existing on windows-latest and not the PR's doing; upstream's parity
+    # workflow only ever runs these under pwsh, so nothing here has a Windows history to lean on.
+    runs-on: windows-latest
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - id: winps-5.1
+            exe: powershell
+          - id: pwsh-7
+            exe: pwsh
+    name: "ps-suite-baseline (${{ matrix.id }})"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: unslothai/unsloth
+          ref: main
+          persist-credentials: false
+      - name: "upstream main tests/studio/*.ps1 under ${{ matrix.id }}"
+        run: |
+          fails=""
+          for f in tests/studio/*.ps1; do
+            echo "== $f  (baseline ${{ matrix.id }})"
+            if ${{ matrix.exe }} -NoProfile -ExecutionPolicy Bypass -File "$f" > /dev/null 2>&1; then
+              echo "BASELINE ${{ matrix.id }} PASS $f"
+            else
+              echo "BASELINE ${{ matrix.id }} FAIL $f"
+              fails="$fails $f"
+            fi
+          done
+          echo "BASELINE SUMMARY (${{ matrix.id }}) failing on upstream main:${fails:- none}"
+          # Never gates: this job produces a baseline list, not a verdict.
+          exit 0
