@@ -23,6 +23,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from staging_whisper_spoof import BUNDLES, LLAMA_TAG, fetch, plant  # noqa: E402
 
+# the whisper installer writes its own marker name, not the llama one
+MARKER_NAME = "UNSLOTH_WHISPER_PREBUILT_INFO.json"
+
 
 def log(msg: str) -> None:
     print(msg, flush=True)
@@ -67,7 +70,7 @@ def main() -> int:
     if not wbin.is_dir():
         wbin = install_dir / "build" / "bin"
     server = wbin / "whisper-server.exe"
-    marker = json.loads((install_dir / "UNSLOTH_PREBUILT_INFO.json").read_text())
+    marker = json.loads((install_dir / MARKER_NAME).read_text())
     present = {p.name.lower() for p in wbin.iterdir()}
 
     log("\nverifying the installed tree")
@@ -99,14 +102,15 @@ def main() -> int:
     ok &= check("sidecar launch guard reports the runtime intact",
                 bool(guard.slim_runtime_intact(str(server))))
 
-    # a second run must be a no-op rather than a reinstall
+    # A second run must detect the existing install rather than reinstall it.
+    # Compared on the server's inode timestamp and the marker bytes, so this
+    # cannot pass merely because the command exited zero.
     log("\nre-running the installer (must detect the existing install)")
+    before = (server.stat().st_mtime_ns, (install_dir / MARKER_NAME).read_bytes())
     proc2 = subprocess.run(cmd, text=True, env=env, capture_output=True)
-    combined = (proc2.stdout or "") + (proc2.stderr or "")
+    after = (server.stat().st_mtime_ns, (install_dir / MARKER_NAME).read_bytes())
     ok &= check("second run succeeds", proc2.returncode == 0)
-    ok &= check("second run did not rewire from scratch",
-                "already" in combined.lower() or "up to date" in combined.lower()
-                or proc2.returncode == 0)
+    ok &= check("second run left the installed tree untouched", before == after)
 
     log("\nRESULT: " + ("all install checks passed" if ok else "install checks FAILED"))
     return 0 if ok else 1

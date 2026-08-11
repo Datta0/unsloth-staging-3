@@ -74,10 +74,13 @@ CHECKS = {
         # damage: rocm runtime without its ggml backend module
         ("rocm bundle minus ggml-hip", "rocm", ["--has-rocm", "--rocm-gfx", "gfx1150"],
          (("ggml-hip.dll",), ()), False, None),
-        # the glob fix in isolation: libomp present so only naming the module rejects
+        # The glob fix in isolation: libomp is present so the soname gate cannot
+        # do the rejecting. ROCm must be refused for want of the ggml module; the
+        # CPU retry then legitimately succeeds on this runtime's ggml-cpu.dll,
+        # so the proof is that cpu is chosen and rocm is never claimed.
         ("rocm bundle minus ggml-hip, libomp present", "rocm",
          ["--has-rocm", "--rocm-gfx", "gfx1150"],
-         (("ggml-hip.dll",), ("libomp140.x86_64.dll",)), False, None),
+         (("ggml-hip.dll",), ("libomp140.x86_64.dll",)), True, "cpu"),
     ],
     "linux": [
         ("cpu bundle, forced cpu", "cpu", ["--backend", "cpu"], ((), ()), True, "cpu"),

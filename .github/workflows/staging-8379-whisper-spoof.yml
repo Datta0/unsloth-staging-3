@@ -33,6 +33,9 @@ jobs:
       # planting a REAL published llama.cpp bundle as the managed install and by
       # the installer's own hardware hints, so the pairing sees a genuine ROCm,
       # CUDA or Vulkan runtime layout on a genuine filesystem.
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest structlog
+
       - name: Whisper prebuilt spoof matrix
         run: python staging_whisper_spoof.py --repo-root .
 
@@ -51,6 +54,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip structlog
 
       - name: Install a real slim whisper against a real ROCm llama runtime
         run: python staging_whisper_install.py --repo-root .
