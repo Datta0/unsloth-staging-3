@@ -1,0 +1,25 @@
+name: "Mirror / CDN throttling probe"
+
+on:
+  push:
+    branches: [dl-mirror-probe]
+  workflow_dispatch:
+
+concurrency:
+  group: mirror-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    name: "${{ matrix.os }} mirror latency"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe
+        shell: bash
+        run: bash .github/workflows/mirror_probe.sh
