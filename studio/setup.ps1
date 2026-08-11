@@ -2348,7 +2348,10 @@ if (-not $HasNvidiaSmi) {
             # inference forwards nothing: code 45 ("not connected") is routine on a muxless
             # laptop with a parked dGPU, and with no healthy peer there is nothing to
             # depose. Mirrors the same fallback in install_python_stack.py's WMI path.
-            $wmiGpus = if ($healthyGpus.Count -gt 0) { $healthyGpus } else { $amdGpus }
+            # @() wraps the WHOLE if: an unwrapped one-element branch unrolls to a bare
+            # WMI object, whose .Count is $null in PS 5.1 (unlike a string or hashtable),
+            # so the guard below failed and a single-AMD-GPU host reported no GPU at all.
+            $wmiGpus = @(if ($healthyGpus.Count -gt 0) { $healthyGpus } else { $amdGpus })
             if ($wmiGpus.Count -gt 0) {
                 $script:ROCmGpuLabels = @($wmiGpus | ForEach-Object { $_.Name })
                 $ROCmGpuLabel = $script:ROCmGpuLabels[0]
@@ -2395,7 +2398,12 @@ if (-not $HasNvidiaSmi) {
             }
             # Only the WMI path carries more than one name; other callers left a single
             # synthesized label, so default to it.
-            $gpuNames = if ($script:ROCmGpuLabels) { @($script:ROCmGpuLabels) } else { @($ROCmGpuLabel) }
+            # @() wraps the WHOLE if, not each branch: a one-element branch unrolls on its way
+            # out, leaving a bare String on a single-adapter host, and $gpuNames[$nameIdx] then
+            # indexes the NAME and yields "A". Nothing maps, and the $nameArches[0] rescue below
+            # is skipped under a visible-device mask, so a pinned single-GPU host inferred no
+            # arch at all -- the same "gpu none" the WMI scan above used to report.
+            $gpuNames = @(if ($script:ROCmGpuLabels) { @($script:ROCmGpuLabels) } else { @($ROCmGpuLabel) })
             # Index over the ADAPTER list, not the inferred arches: an unrecognised name
             # drops out below, and indexing the shortened list would name the wrong card.
             $nameIdx = Resolve-VisibleGpuIndex $gpuNames.Count
@@ -2422,6 +2430,18 @@ if (-not $HasNvidiaSmi) {
                 substep "Tip: set UNSLOTH_ROCM_GFX_ARCH=$script:ROCmGfxArch to skip inference next time" "Cyan"
             }
         }
+    }
+    # 3. Last resort: the arch install.ps1 resolved a second ago in the same run. Runs after
+    #    everything above because those are mask- and shadowing-aware and the installer's scan
+    #    is not, so this fills a gap rather than deposing a better answer. Without it, a scan
+    #    that answers there but not here expects cpu torch against the ROCm wheels the
+    #    installer just placed, calls the venv stale, and loops the install forever.
+    #    Private handoff, never UNSLOTH_ROCM_GFX_ARCH: nested installers read that name as an
+    #    operator override, and this value is inferred, not chosen by anyone.
+    if (-not $script:ROCmGfxArch -and $env:_UNSLOTH_ROCM_GFX_ARCH_HANDOFF) {
+        $script:ROCmGfxArch = $env:_UNSLOTH_ROCM_GFX_ARCH_HANDOFF.Trim().ToLower()
+        $ROCmGpuLabel = "AMD ROCm ($script:ROCmGfxArch)"
+        substep "gfx arch forwarded by the installer: $script:ROCmGfxArch" "Cyan"
     }
     # Capture ROCm version early for display and wheel selection.
     # Run whenever the HIP SDK binary is present, not just when the device is accessible --
