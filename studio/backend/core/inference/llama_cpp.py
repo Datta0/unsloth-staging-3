@@ -7066,7 +7066,16 @@ class LlamaCppBackend:
             kept: list = []
             for _ in range(alen):
                 n = struct.unpack("<Q", f.read(8))[0]
-                raw = f.read(n)
+                if not n:
+                    continue
+                # Only "<...>" / "[...]" entries survive delimiter_shaped_tokens, so seek
+                # past the rest instead of reading and decoding them. UTF-8 is
+                # self-synchronising, so no multi-byte character starts with either byte.
+                first = f.read(1)
+                if first != b"<" and first != b"[":
+                    f.seek(n - 1, 1)
+                    continue
+                raw = first + f.read(n - 1)
                 # A vocabulary holds arbitrary bytes; a marker is text, so undecodable
                 # entries are simply not markers.
                 try:
