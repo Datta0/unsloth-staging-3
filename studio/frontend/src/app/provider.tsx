@@ -840,7 +840,11 @@ const REDUCED_MOTION_MAP = {
 
 export function AppProvider({ children }: AppProviderProps) {
   const pathname = useRouterState({ select: (s) => s.location.pathname });
-  const toastOffsets = getToastOffsets(pathname, isTauri);
+  const toastOffsets = getToastOffsets(
+    pathname,
+    isTauri,
+    shouldUseCustomWindowTitlebar(),
+  );
   const reduceMotion = useAppearanceCustomStore(
     (s) => s.customization.reduceMotion,
   );
@@ -856,8 +860,8 @@ export function AppProvider({ children }: AppProviderProps) {
           visibleToasts={2}
           expand={true}
           closeButton={true}
-          // Chat toasts start below its 48px header. Desktop adds the 34px
-          // titlebar clearance that every route already needs.
+          // Header routes clear their controls. Desktop chrome also stays clear,
+          // except where a macOS page header overlays the native titlebar.
           offset={toastOffsets.default}
           mobileOffset={toastOffsets.mobile}
         />
