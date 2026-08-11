@@ -1,0 +1,56 @@
+name: "staging-8379 whisper prebuilt spoof"
+
+on:
+  push:
+    branches: [pr-8379-ci]
+  pull_request:
+    branches: ["**"]
+
+concurrency:
+  group: whisper-spoof-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  spoof:
+    name: "whisper pairing (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # The runners have no AMD or NVIDIA device. The accelerator is spoofed by
+      # planting a REAL published llama.cpp bundle as the managed install and by
+      # the installer's own hardware hints, so the pairing sees a genuine ROCm,
+      # CUDA or Vulkan runtime layout on a genuine filesystem.
+      - name: Whisper prebuilt spoof matrix
+        run: python staging_whisper_spoof.py --repo-root .
+
+      - name: Whisper prebuilt unit tests
+        run: python -m pytest tests/studio/install/test_install_whisper_prebuilt_logic.py -q
+        env:
+          PYTHONPATH: studio/backend
+
+  install:
+    name: "real slim install (windows rocm spoof)"
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install a real slim whisper against a real ROCm llama runtime
+        run: python staging_whisper_install.py --repo-root .
