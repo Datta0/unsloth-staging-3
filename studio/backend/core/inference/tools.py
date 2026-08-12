@@ -8939,6 +8939,61 @@ def _build_sandbox_paths_note() -> str:
     )
 
 
+# Full access (permission_mode='full') edits, applied to the sandboxed text
+# rather than writing a second copy of it. Everything the two modes share -- the
+# relative-path advice, the persisted workdir, the download-link note -- is prose
+# that gets tuned over time, and a parallel copy would drift out of sync in
+# silence. Only the claims the sandbox makes true are touched. A rewording that
+# stops one of these matching is caught by test_full_access_tool_prompt.py, which
+# asserts the sandboxed markers are gone from the result on both platforms.
+_FULL_ACCESS_SUBSTITUTIONS = (
+    # The only sentence in the python description that names the sandbox. Just
+    # dropped, not reworded: where the code runs is said once, by the paths note
+    # below, which both tools carry.
+    ("Execute Python code in a sandbox and", "Execute Python code and"),
+    # POSIX: real absolute paths DO resolve with the sandbox off, so a blanket
+    # denial is wrong. The two named conventions stay denied, because they are
+    # still handled specially: _build_bypass_env keeps _SANDBOX_SITE_DIR on
+    # PYTHONPATH, so sandbox_site/sitecustomize.py goes on healing an absent
+    # /mnt/data or /tmp/outputs onto the workdir in bypass runs too. Promising
+    # that every absolute path resolves would make the model report a write to
+    # /mnt/data that actually landed in the working directory.
+    (
+        "; absolute paths like /mnt/data or /tmp/outputs do not exist.",
+        ". The code sandbox is disabled, so absolute paths on the machine running "
+        "Unsloth Studio do resolve; /mnt/data and /tmp/outputs are still not real "
+        "there, and writes to them are redirected into the working directory.",
+    ),
+    # Windows already says where the code runs and never denies absolute paths,
+    # so there is nothing false to remove; state the capability instead. "the
+    # user's own machine" is narrowed at the same time: --secure and -H 0.0.0.0
+    # are documented remote modes (README), and the tools run on the host serving
+    # Studio, which is then not the device the user is looking at.
+    (
+        " You are on Windows, and this runs on the user's own machine.",
+        " You are on Windows, and this runs on the machine running Unsloth Studio. "
+        "The code sandbox is disabled, so absolute paths there do resolve.",
+    ),
+)
+
+
+def _to_full_access(description: str) -> str:
+    """Rewrite a sandboxed tool description for Full access.
+
+    Under bypass_permissions the loops pass disable_sandbox=True:
+    _build_bypass_env / _bypass_preexec skip the static analysis, the command
+    blocklist and the rlimits, so the host filesystem really is reachable.
+    Handing a model the sandboxed text in that mode makes it answer "I am
+    sandboxed and cannot see your files" to a question one tool call would have
+    answered. Untouched clauses are the ones still true in both modes: the
+    workdir is the per-session dir either way (_build_bypass_env repoints HOME /
+    TMPDIR / TEMP / TMP at it), and so is the download-link note.
+    """
+    for sandboxed, full_access in _FULL_ACCESS_SUBSTITUTIONS:
+        description = description.replace(sandboxed, full_access)
+    return description
+
+
 def _build_terminal_shell_note() -> str:
     """Shell-specific note, on the TERMINAL description only.
 
@@ -9006,6 +9061,57 @@ TERMINAL_TOOL = {
         },
     },
 }
+
+# Full access runs these two without the sandbox, so it gets its own pair of
+# schemas rather than a per-request rebuild: the descriptions are
+# platform-derived constants either way. The sandboxed pair stays the module
+# default, so every existing importer keeps the safe wording. The shell note is
+# unaffected by the substitutions and carries through as-is.
+PYTHON_TOOL_FULL_ACCESS = {
+    "type": "function",
+    "function": {
+        **PYTHON_TOOL["function"],
+        "description": _to_full_access(PYTHON_TOOL["function"]["description"]),
+    },
+}
+
+TERMINAL_TOOL_FULL_ACCESS = {
+    "type": "function",
+    "function": {
+        **TERMINAL_TOOL["function"],
+        "description": _to_full_access(TERMINAL_TOOL["function"]["description"]),
+    },
+}
+
+_FULL_ACCESS_TOOL_BY_NAME = {
+    "python": PYTHON_TOOL_FULL_ACCESS,
+    "terminal": TERMINAL_TOOL_FULL_ACCESS,
+}
+
+
+def apply_full_access_tool_descriptions(tools: list[dict]) -> list[dict]:
+    """Swap python/terminal for their Full access schemas.
+
+    Only the two sandboxed built-ins are touched; web_search, render_html,
+    search_knowledge_base and MCP tools are passed through untouched, and a list
+    without either built-in is returned as-is so callers can apply this
+    unconditionally. The input list is never mutated -- ALL_TOOLS entries are
+    module globals shared across requests.
+    """
+    if not tools:
+        return tools
+    swapped = False
+    out: list[dict] = []
+    for tool in tools:
+        name = (tool.get("function") or {}).get("name") if isinstance(tool, dict) else None
+        replacement = _FULL_ACCESS_TOOL_BY_NAME.get(name)
+        if replacement is None:
+            out.append(tool)
+        else:
+            out.append(replacement)
+            swapped = True
+    return out if swapped else tools
+
 
 RENDER_HTML_TOOL = {
     "type": "function",
