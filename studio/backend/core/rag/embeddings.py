@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 import threading
 from contextlib import contextmanager
 from functools import lru_cache
@@ -48,6 +49,147 @@ _TORCH_DEVICE = {DeviceType.CUDA: "cuda", DeviceType.XPU: "xpu"}
 
 def _device() -> str:
     return _TORCH_DEVICE.get(get_device(), "cpu")
+
+
+def _rocm_gpu_is_fatal() -> bool:
+    """True when this host's ROCm stack faults on its first real GPU allocation.
+
+    ROCm is ``DeviceType.CUDA`` internally, so nothing here distinguishes a healthy CUDA
+    host from a ROCm wheel built for the wrong gfx arch. That cannot be decided in this
+    process: the mismatch SIGSEGVs inside the HIP runtime and takes uvicorn with it (#8474,
+    host in #7331). So a child allocates first and its death is the answer. Asked once per
+    process, and never off ROCm, so every other host spawns nothing.
+
+    Only ``_safe_torch_device`` calls this, after ``_device()`` has settled detection, so
+    the unknown case below is not a ROCm host going unprobed.
+    """
+    if _host_is_rocm() is not True:
+        return False
+    from utils.device_allocation_probe import probe_torch_device_allocation
+
+    return not probe_torch_device_allocation("cuda:0").ok
+
+
+def _host_is_rocm() -> bool | None:
+    """True/False once hardware detection has settled, None while it has not.
+
+    Tri-state on purpose. Detection imports torch and this is reached from
+    ``active_backend_is_llama()`` on the settings request path, so forcing it is not an
+    option; but collapsing "not yet known" into False would let that path fall through to
+    the in-process AMD GPU query. Callers decide what "unknown" means for them.
+    """
+    try:
+        from utils.hardware import hardware as hardware_mod
+        if not hardware_mod.DETECTION_COMPLETE.is_set():
+            return None
+        return bool(hardware_mod.IS_ROCM)
+    except Exception:  # noqa: BLE001 - if we cannot even tell, leave behaviour untouched
+        return False
+
+
+def _rocm_is_possible() -> bool:
+    """Could this host be ROCm at all, answered without torch and without detection.
+
+    Keeps the "detection has not settled" caution narrow. Treating every unsettled host as
+    possibly-ROCm is safe for the crash but too broad: it hands a CPU or macOS host the
+    provisional answer, which ``routes/settings.py`` reads as "not llama" and drops its
+    GGUF handling, so a valid local .gguf briefly 409s on a host with no AMD GPU.
+
+    ``torch.version.hip`` settles it exactly: a build attribute, read without initialising
+    the driver (``hardware.py::apply_gpu_ids`` relies on that), and the ROCm-ness the
+    dangerous query turns on. Consulted only when torch is already imported, then read off
+    disk, and only then does each platform fall back to a file test or to no claim:
+      * macOS never has ROCm.
+      * Linux: ROCm's own kernel driver publishes this topology directory, and
+        ``utils/hardware/hardware.py`` already reads it (``_rocm_kfd_gpu_pci_ids``).
+      * Windows: nothing equivalent, and an installed HIP SDK is NOT evidence -- ``main.py``
+        refuses to let HIP_PATH/ROCM_PATH alone pick a backend for the same reason.
+    """
+    try:
+        torch = sys.modules.get("torch")
+        if torch is not None:
+            if getattr(getattr(torch, "version", None), "hip", None) is not None:
+                return True
+            # AMD SDK wheels leave torch.version.hip unset and only say rocm in the version
+            # string; hardware.py's own ROCm test carries the same fallback. And a torch
+            # that is in sys.modules but still executing has neither yet, which is absence
+            # of evidence, not evidence of absence, so that stays possible.
+            version_string = getattr(torch, "__version__", None)
+            if not isinstance(version_string, str) or not version_string:
+                return True
+            return "rocm" in version_string.lower()
+        installed = _installed_torch_is_rocm()
+        if installed is not None:
+            return installed
+        if sys.platform == "darwin":
+            return False
+        if sys.platform == "win32":
+            # Nothing torch-free left to read, and Windows has no KFD node. An installed
+            # HIP SDK is not evidence (main.py makes the same point), but neither is its
+            # absence, so keep the caution rather than the convenience.
+            return True
+        return os.path.isdir("/sys/class/kfd/kfd/topology/nodes")
+    except Exception:  # noqa: BLE001 - unsure means possible; the caution is the safe side
+        return True
+
+
+@lru_cache(maxsize = 1)
+def _installed_torch_is_rocm() -> bool | None:
+    """Is the INSTALLED torch a ROCm build, answered without importing it.
+
+    ``torch/version.py`` holds generated literals and ``find_spec`` locates the package
+    without executing it, so this reads the same two facts detection reads, long before
+    torch is imported. That matters on Windows, which has no KFD node.
+
+    False also covers torch being absent, which is a definite answer: no torch, no ROCm
+    torch path. None is reserved for an installation that is there but unreadable. Cached,
+    being filesystem I/O on a request path.
+    """
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("torch")
+        if spec is None or not spec.origin:
+            # Absent, not unreadable. There is no ROCm torch path to protect on a
+            # --no-torch install, and saying "unknown" here would make Windows cautious
+            # forever and cost that install the llama/GGUF answer it actually resolves to.
+            return False
+        version_py = os.path.join(os.path.dirname(spec.origin), "version.py")
+        with open(version_py, encoding = "utf-8") as handle:
+            source = handle.read()
+    except Exception:  # noqa: BLE001 - no answer, and the caller decides what that means
+        return None
+
+    # hip = '6.3.42134' on a ROCm build, hip: Optional[str] = None otherwise.
+    if re.search(r"^hip\b[^=\n]*=\s*['\"]", source, re.MULTILINE):
+        return True
+    match = re.search(r"^__version__\s*=\s*['\"]([^'\"]+)", source, re.MULTILINE)
+    if match:
+        # AMD SDK wheels leave hip unset and only say rocm here; same fallback as
+        # utils/hardware/hardware.py.
+        return "rocm" in match.group(1).lower()
+    return None
+
+
+def _safe_torch_device() -> str:
+    """``_device()``, except that a ROCm GPU which cannot allocate resolves to CPU.
+
+    Degrading to CPU rather than to the llama-server GGUF embedder is deliberate: same
+    backend, same model, so the vectors are unchanged and no knowledge base needs
+    reindexing. bge-small on CPU is a slowdown, not a loss of function.
+    """
+    device = _device()
+    if device != "cuda":
+        return device
+    if _rocm_gpu_is_fatal():
+        logger.warning(
+            "this host's ROCm GPU crashed an isolated allocation probe, so it cannot be "
+            "used in this process without killing the backend; loading the embedding "
+            "model on CPU instead. Embeddings are unchanged, so no knowledge base needs "
+            "reindexing. Usually a torch wheel built for a different gfx arch."
+        )
+        return "cpu"
+    return device
 
 
 _torchao_stub_done = False
@@ -355,13 +497,17 @@ def _get(model_name: str | None = None):
             from sentence_transformers import SentenceTransformer
             from utils.hf_cache_settings import active_hf_hub_cache
 
-            device = _device()
+            device = _safe_torch_device()
+            # A GPU we were pushed off is not a host that never had one: fp16 wins on the
+            # GPU and is slow and patchily supported on CPU. Only the degraded case
+            # switches, so a genuine CPU/Apple host loads exactly as before.
+            degraded_to_cpu = device == "cpu" and _device() == "cuda"
             logger.info("loading embedding model %s on %s", name, device)
             _guard_model_security(name, local_only)
             st_kwargs = dict(
                 device = device,
                 cache_folder = active_hf_hub_cache(),
-                model_kwargs = dtype_kwargs("float16"),
+                model_kwargs = dtype_kwargs("float32" if degraded_to_cpu else "float16"),
             )
             load_target = name
             if local_only:
@@ -497,7 +643,45 @@ _AUTO_ALIASES = frozenset({"auto", ""})
 def _resolve_auto() -> str:
     """Pick a backend for ``auto``: sentence-transformers when a CUDA/ROCm GPU is
     present (torch fp16 wins bulk indexing), else the torch-free GGUF llama-server
-    -- or ST if its binary is missing. GPU check is torch-free (nvidia-smi)."""
+    -- or ST if its binary is missing.
+
+    The GPU check is torch-free on NVIDIA (nvidia-smi) but NOT on AMD, where
+    ``_get_gpu_free_memory`` falls back to torch ``mem_get_info`` in this process. So
+    anything that might be ROCm answers without asking it, which is what stops this
+    function steering an affected host into the crash it exists to route around. The answer
+    is the same either way: a working ROCm GPU takes sentence-transformers, a condemned one
+    is placed on CPU by ``_safe_torch_device``. No allocation probe runs here; the device
+    decision belongs to the load.
+
+    Settles detection if it has not settled, so the answer is final and safe for
+    ``_get_backend`` to cache. ``active_backend_is_llama`` must not block on detection and
+    so decides the ROCm case itself rather than coming here.
+    """
+    is_rocm = _host_is_rocm()
+    if is_rocm is None:
+        # get_device() imports torch under its own lock: affordable for the builder,
+        # not for the request path, which does not come here.
+        try:
+            get_device()
+            is_rocm = _host_is_rocm()
+        except Exception:  # noqa: BLE001 - detection failing is not this function's problem
+            is_rocm = None
+
+    if is_rocm is True or (is_rocm is None and _rocm_is_possible()):
+        # None here is detection that would not settle. Hold back the AMD query only for a
+        # host that could be ROCm, so a CPU or macOS host keeps its real answer, and with
+        # it its GGUF classification.
+        return "sentence-transformers"
+
+    return _resolve_by_gpu_and_binary()
+
+
+def _resolve_by_gpu_and_binary() -> str:
+    """The non-ROCm half of ``auto``: GPU present -> ST, else the GGUF llama-server, or ST
+    if its binary is missing. Exactly what ``_resolve_auto`` was before this file learned
+    about ROCm. Needs no hardware detection, so the request path calls it directly instead
+    of going through the resolver and parking on the detection lock.
+    """
     from core.inference.llama_cpp import LlamaCppBackend
 
     if LlamaCppBackend._get_gpu_free_memory():
@@ -623,7 +807,21 @@ def active_backend_is_llama() -> bool:
                 return False
             return isinstance(backend, LlamaServerBackend)
         raw = (config.EMBED_BACKEND or "auto").strip().lower()
-        key = _resolve_auto() if raw in _AUTO_ALIASES else raw
+        if raw in _AUTO_ALIASES:
+            # Runs inside PUT /embedding-model, so it must not sit behind hardware
+            # detection. A ROCm host, or an unsettled one that could be ROCm, answers
+            # without asking: auto resolves to sentence-transformers on every ROCm host, so
+            # False is the real answer, and it leaves the ST pickle gate ENGAGED, the
+            # conservative direction for a security check. Everything else keeps the
+            # llama/GGUF classification settings.py needs to accept a local .gguf.
+            is_rocm = _host_is_rocm()
+            if is_rocm is True or (is_rocm is None and _rocm_is_possible()):
+                return False
+            # ensure_hardware_detected() holds _DETECT_LOCK across a cold torch import, so
+            # _resolve_auto here would park the request on the wait this branch avoids.
+            key = _resolve_auto() if is_rocm is False else _resolve_by_gpu_and_binary()
+        else:
+            key = raw
         return key in _LLAMA_ALIASES
     except Exception:  # noqa: BLE001 - a backend probe must never block saving
         return False

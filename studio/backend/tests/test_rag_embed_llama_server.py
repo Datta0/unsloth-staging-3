@@ -7,6 +7,7 @@ import subprocess
 import sys
 import textwrap
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -97,6 +98,351 @@ def test_explicit_backend_overrides_auto(monkeypatch):
     assert type(embeddings._get_backend()).__name__ == "_SentenceTransformersBackend"
     monkeypatch.setattr(config, "EMBED_BACKEND", "llama-server")
     assert isinstance(embeddings._get_backend(), LlamaServerBackend)
+
+
+def _mock_rocm_probe(monkeypatch, *, is_rocm, probe_ok):
+    """Pin ROCm-ness and the isolated allocation probe's verdict (#8474)."""
+    import threading
+
+    from utils import device_allocation_probe as probe_mod
+    from utils.hardware import hardware as hardware_mod
+    from utils.hardware.hardware import DeviceType
+
+    monkeypatch.setattr(embeddings, "get_device", lambda: DeviceType.CUDA)
+    monkeypatch.setattr(hardware_mod, "IS_ROCM", is_rocm)
+    detected = threading.Event()
+    detected.set()
+    monkeypatch.setattr(hardware_mod, "DETECTION_COMPLETE", detected)
+    monkeypatch.setattr(
+        probe_mod,
+        "probe_torch_device_allocation",
+        lambda device = "cuda:0": probe_mod.DeviceAllocationProbeResult(
+            ok = probe_ok,
+            device = device,
+            returncode = 0 if probe_ok else -11,
+            reason = None if probe_ok else "killed by SIGSEGV",
+            duration_seconds = 0.1,
+        ),
+    )
+
+
+def test_auto_does_not_query_gpu_memory_after_a_failed_rocm_probe(monkeypatch):
+    # _get_gpu_free_memory falls back to torch mem_get_info in THIS process on AMD, so on
+    # a condemned host auto-resolution used to steer into the very crash it should avoid.
+    # The probe has to be consulted first.
+    _stub_st_load(monkeypatch)
+    _mock_rocm_probe(monkeypatch, is_rocm = True, probe_ok = False)
+    from core.inference.llama_cpp import LlamaCppBackend
+
+    monkeypatch.setattr(config, "EMBED_BACKEND", "auto")
+
+    def _must_not_run():
+        raise AssertionError("_get_gpu_free_memory reached on a condemned ROCm host")
+
+    monkeypatch.setattr(LlamaCppBackend, "_get_gpu_free_memory", staticmethod(_must_not_run))
+    monkeypatch.setattr(
+        LlamaCppBackend, "_find_llama_server_binary", staticmethod(lambda: "/bin/llama-server")
+    )
+
+    # Sentence-transformers, not llama-server: the model and therefore the vector space
+    # stays the same, so no knowledge base needs reindexing. The device moves, not the
+    # backend.
+    assert embeddings._resolve_auto() == "sentence-transformers"
+
+
+def _forbid_gpu_query(monkeypatch):
+    """Make the in-process AMD GPU-memory query a test failure if it is reached."""
+    from core.inference.llama_cpp import LlamaCppBackend
+
+    def _must_not_run():
+        raise AssertionError("_get_gpu_free_memory reached; its AMD path runs torch here")
+
+    monkeypatch.setattr(LlamaCppBackend, "_get_gpu_free_memory", staticmethod(_must_not_run))
+    monkeypatch.setattr(
+        LlamaCppBackend, "_find_llama_server_binary", staticmethod(lambda: "/bin/llama-server")
+    )
+
+
+def _forbid_probe(monkeypatch):
+    """Make the isolated allocation probe a test failure if it is reached."""
+    from utils import device_allocation_probe as probe_mod
+
+    def _must_not_run(device = "cuda:0"):
+        raise AssertionError("allocation probe reached on a request path")
+
+    monkeypatch.setattr(probe_mod, "probe_torch_device_allocation", _must_not_run)
+
+
+def test_settings_gate_does_not_block_on_detection_or_probe(monkeypatch):
+    # active_backend_is_llama() runs inside PUT /embedding-model. Before detection settles
+    # it must not force detection, must not run the probe (a cold torch import is allowed
+    # 120s), and must not reach the AMD GPU query. Answering False keeps the ST pickle gate
+    # engaged, which is the safe direction for a security check.
+    import threading
+
+    from utils.hardware import hardware as hardware_mod
+
+    monkeypatch.setattr(config, "EMBED_BACKEND", "auto")
+    monkeypatch.setattr(hardware_mod, "DETECTION_COMPLETE", threading.Event())  # unset
+    monkeypatch.setattr(
+        embeddings, "get_device", lambda: (_ for _ in ()).throw(AssertionError("forced detection"))
+    )
+    _forbid_gpu_query(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    assert embeddings.active_backend_is_llama() is False
+
+
+def _unsettled_detection(monkeypatch, *, rocm_possible):
+    """Detection still running, with ROCm-possibility pinned torch-free."""
+    import threading
+
+    from utils.hardware import hardware as hardware_mod
+
+    monkeypatch.setattr(config, "EMBED_BACKEND", "auto")
+    monkeypatch.setattr(hardware_mod, "DETECTION_COMPLETE", threading.Event())  # unset
+    monkeypatch.setattr(embeddings, "_rocm_is_possible", lambda: rocm_possible)
+
+
+def test_a_cpu_host_keeps_its_gguf_classification_while_detection_runs(monkeypatch):
+    # settings.py reads this to decide whether a local .gguf needs HF verification. A host
+    # that can never be ROCm must keep its real answer during the detection window, or a
+    # valid local .gguf transiently 409s on a machine that has no AMD GPU at all.
+    _unsettled_detection(monkeypatch, rocm_possible = False)
+    _mock_auto(monkeypatch, gpus = [], binary = "/bin/llama-server")
+    assert embeddings.active_backend_is_llama() is True
+
+
+def test_a_possibly_rocm_host_still_holds_back_while_detection_runs(monkeypatch):
+    _unsettled_detection(monkeypatch, rocm_possible = True)
+    _forbid_gpu_query(monkeypatch)
+    _forbid_probe(monkeypatch)
+    assert embeddings.active_backend_is_llama() is False
+
+
+def test_resolver_keeps_the_gguf_answer_for_an_impossible_rocm_host(monkeypatch):
+    _unsettled_detection(monkeypatch, rocm_possible = False)
+    monkeypatch.setattr(embeddings, "get_device", lambda: None)  # detection stays unsettled
+    _mock_auto(monkeypatch, gpus = [], binary = "/bin/llama-server")
+    assert embeddings._resolve_auto() == "llama-server"
+
+
+def test_settings_gate_never_waits_on_hardware_detection(monkeypatch):
+    # ensure_hardware_detected() holds _DETECT_LOCK across a cold torch import, so a
+    # request reaching get_device() while background detection runs parks for the whole
+    # pass. ROCm is already ruled out here, and the rest of auto needs no detection.
+    _unsettled_detection(monkeypatch, rocm_possible = False)
+    monkeypatch.setattr(
+        embeddings, "get_device", lambda: (_ for _ in ()).throw(AssertionError("forced detection"))
+    )
+    _mock_auto(monkeypatch, gpus = [], binary = "/bin/llama-server")
+    assert embeddings.active_backend_is_llama() is True
+
+
+def _no_torch_loaded(monkeypatch, *, installed = None):
+    """torch not imported. ``installed`` is what the torch-free on-disk read reports."""
+    monkeypatch.delitem(sys.modules, "torch", raising = False)
+    embeddings._installed_torch_is_rocm.cache_clear()
+    monkeypatch.setattr(embeddings, "_installed_torch_is_rocm", lambda: installed)
+
+
+def test_rocm_is_possible_is_false_on_macos(monkeypatch):
+    _no_torch_loaded(monkeypatch)
+    monkeypatch.setattr(embeddings.sys, "platform", "darwin")
+    assert embeddings._rocm_is_possible() is False
+
+
+def test_rocm_is_possible_follows_the_kfd_node_on_linux(monkeypatch):
+    _no_torch_loaded(monkeypatch)
+    monkeypatch.setattr(embeddings.sys, "platform", "linux")
+    seen: list = []
+
+    def _isdir(path):
+        seen.append(path)
+        return False
+
+    monkeypatch.setattr(embeddings.os.path, "isdir", _isdir)
+    assert embeddings._rocm_is_possible() is False
+    # ROCm's own kernel driver publishes this; hardware.py reads the same tree.
+    assert seen == ["/sys/class/kfd/kfd/topology/nodes"]
+
+
+def test_an_installed_hip_sdk_alone_is_not_a_rocm_host(monkeypatch):
+    # main.py makes the same point where it refuses to let HIP_PATH/ROCM_PATH pick a
+    # backend: a CUDA or CPU box can carry the SDK. What decides is the installed wheel,
+    # which is readable before torch is imported.
+    _no_torch_loaded(monkeypatch, installed = False)
+    monkeypatch.setattr(embeddings.sys, "platform", "win32")
+    assert embeddings._rocm_is_possible() is False
+
+
+def test_a_windows_rocm_wheel_is_seen_before_torch_is_imported(monkeypatch):
+    # The startup window, and the standing case when the torch warm is disabled: detection
+    # unsettled and torch not yet imported. Windows has no KFD node, so the wheel on disk
+    # is the only thing that can keep this host off the in-process AMD query.
+    _no_torch_loaded(monkeypatch, installed = True)
+    monkeypatch.setattr(embeddings.sys, "platform", "win32")
+    assert embeddings._rocm_is_possible() is True
+
+
+def test_windows_stays_cautious_when_the_wheel_cannot_be_read(monkeypatch):
+    _no_torch_loaded(monkeypatch, installed = None)
+    monkeypatch.setattr(embeddings.sys, "platform", "win32")
+    assert embeddings._rocm_is_possible() is True
+
+
+def test_installed_torch_is_read_without_importing_torch(monkeypatch, tmp_path):
+    # torch/version.py is generated literals, and find_spec locates the package without
+    # executing it, so this reads what detection reads long before torch is imported.
+    import importlib.util
+
+    embeddings._installed_torch_is_rocm.cache_clear()
+    package = tmp_path / "torch"
+    package.mkdir()
+    (package / "__init__.py").write_text("raise AssertionError('torch was imported')")
+
+    def _fake_find_spec(name):
+        assert name == "torch"
+        return SimpleNamespace(origin = str(package / "__init__.py"))
+
+    monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
+
+    (package / "version.py").write_text(
+        "__version__ = '2.9.1+rocm6.3'\nhip: Optional[str] = '6.3.42134'\n"
+    )
+    assert embeddings._installed_torch_is_rocm() is True
+
+    embeddings._installed_torch_is_rocm.cache_clear()
+    (package / "version.py").write_text("__version__ = '2.9.1+cu128'\nhip: Optional[str] = None\n")
+    assert embeddings._installed_torch_is_rocm() is False
+
+    # AMD SDK wheel: hip unset, rocm only in the version string.
+    embeddings._installed_torch_is_rocm.cache_clear()
+    (package / "version.py").write_text(
+        "__version__ = '2.11.0+rocm7.1'\nhip: Optional[str] = None\n"
+    )
+    assert embeddings._installed_torch_is_rocm() is True
+
+    # Absent is a definite answer, not an unknown: no torch, no ROCm torch path. A
+    # --no-torch install resolves to llama-server, and calling this unknown would make
+    # Windows cautious forever and reject the local GGUF that install is meant to take.
+    embeddings._installed_torch_is_rocm.cache_clear()
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name: None)
+    assert embeddings._installed_torch_is_rocm() is False
+
+    # Present but unreadable stays unknown, which is what the caution is reserved for.
+    embeddings._installed_torch_is_rocm.cache_clear()
+    (package / "version.py").unlink()
+    monkeypatch.setattr(importlib.util, "find_spec", _fake_find_spec)
+    assert embeddings._installed_torch_is_rocm() is None
+
+
+def test_a_no_torch_windows_install_keeps_its_gguf_answer(monkeypatch):
+    # --no-torch on Windows: detection never settles when the torch warm is disabled, and
+    # auto really does resolve to llama-server there, so PUT /embedding-model must accept a
+    # local GGUF rather than send it through the sentence-transformers verification path.
+    _no_torch_loaded(monkeypatch, installed = False)
+    monkeypatch.setattr(embeddings.sys, "platform", "win32")
+    _mock_auto(monkeypatch, gpus = [], binary = "/bin/llama-server")
+    assert embeddings._rocm_is_possible() is False
+    assert embeddings.active_backend_is_llama() is True
+
+
+def test_rocm_is_possible_reads_torch_hip_when_torch_is_already_loaded(monkeypatch):
+    # A build attribute, so reading it initialises no driver, and it is the exact ROCm-ness
+    # the dangerous query depends on. Only consulted when torch is already imported.
+    monkeypatch.setattr(embeddings.sys, "platform", "win32")
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(version = SimpleNamespace(hip = "6.3.42134"))
+    )
+    assert embeddings._rocm_is_possible() is True
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(version = SimpleNamespace(hip = None), __version__ = "2.9.1+cu128"),
+    )
+    assert embeddings._rocm_is_possible() is False
+
+
+def test_an_amd_sdk_wheel_without_hip_metadata_is_still_rocm(monkeypatch):
+    # AMD SDK wheels leave torch.version.hip unset and only say rocm in the version string.
+    # hardware.py's own ROCm test carries the same fallback (utils/hardware/hardware.py).
+    monkeypatch.setattr(embeddings.sys, "platform", "linux")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(version = SimpleNamespace(hip = None), __version__ = "2.9.1+rocm6.3"),
+    )
+    assert embeddings._rocm_is_possible() is True
+
+
+def test_a_half_imported_torch_is_treated_as_possibly_rocm(monkeypatch):
+    # torch can be in sys.modules while still executing, so neither attribute is there yet.
+    # That is absence of evidence, and the caution has to keep the safe side.
+    monkeypatch.setattr(embeddings.sys, "platform", "linux")
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace())
+    assert embeddings._rocm_is_possible() is True
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(version = SimpleNamespace()))
+    assert embeddings._rocm_is_possible() is True
+
+
+def test_settings_gate_does_not_probe_on_a_settled_rocm_host(monkeypatch):
+    _mock_rocm_probe(monkeypatch, is_rocm = True, probe_ok = False)
+    monkeypatch.setattr(config, "EMBED_BACKEND", "auto")
+    _forbid_gpu_query(monkeypatch)
+    _forbid_probe(monkeypatch)
+
+    assert embeddings.active_backend_is_llama() is False
+
+
+def test_settings_gate_still_reports_llama_on_a_settled_non_rocm_host(monkeypatch):
+    # The NVIDIA/CPU path keeps its old answer: nvidia-smi is torch-free and cheap.
+    _mock_rocm_probe(monkeypatch, is_rocm = False, probe_ok = True)
+    _mock_auto(monkeypatch, gpus = [], binary = "/bin/llama-server")
+    assert embeddings.active_backend_is_llama() is True
+
+
+def test_builder_settles_detection_rather_than_guessing(monkeypatch):
+    # The backend builder caches its answer, so unlike the request path it must not commit
+    # a provisional one: it settles detection first and then decides.
+    import threading
+
+    from utils.hardware import hardware as hardware_mod
+    from utils.hardware.hardware import DeviceType
+
+    monkeypatch.setattr(config, "EMBED_BACKEND", "auto")
+    event = threading.Event()
+    monkeypatch.setattr(hardware_mod, "DETECTION_COMPLETE", event)
+    monkeypatch.setattr(hardware_mod, "IS_ROCM", False)
+
+    settled = {"count": 0}
+
+    def _detect():
+        settled["count"] += 1
+        event.set()
+        return DeviceType.CPU
+
+    monkeypatch.setattr(embeddings, "get_device", _detect)
+    _mock_auto(monkeypatch, gpus = [], binary = "/bin/llama-server")
+
+    assert embeddings._resolve_auto() == "llama-server"
+    assert settled["count"] == 1
+
+
+def test_auto_is_unchanged_after_a_passing_rocm_probe(monkeypatch):
+    _stub_st_load(monkeypatch)
+    _mock_rocm_probe(monkeypatch, is_rocm = True, probe_ok = True)
+    _mock_auto(monkeypatch, gpus = [(0, 40000)], binary = "/bin/llama-server")
+    assert embeddings._resolve_auto() == "sentence-transformers"
+
+
+def test_auto_on_a_non_rocm_host_still_asks_gpu_memory(monkeypatch):
+    # The NVIDIA path must be byte-identical to before: nvidia-smi decides, no probe.
+    _stub_st_load(monkeypatch)
+    _mock_rocm_probe(monkeypatch, is_rocm = False, probe_ok = False)
+    _mock_auto(monkeypatch, gpus = [], binary = "/bin/llama-server")
+    assert embeddings._resolve_auto() == "llama-server"
 
 
 def test_llama_backend_imports_no_torch():
