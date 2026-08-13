@@ -18,6 +18,7 @@ import {
   Cancel01Icon,
   CloudIcon,
   CpuIcon,
+  BugIcon,
   DatabaseSettingIcon,
   Globe02Icon,
   HelpCircleIcon,
@@ -52,6 +53,7 @@ import { AppearanceTab } from "./tabs/appearance-tab";
 import { ChatTab } from "./tabs/chat-tab";
 import { ConnectionsTab } from "./tabs/connections-tab";
 import { DataTab } from "./tabs/data-tab";
+import { DebuggingTab } from "./tabs/debugging-tab";
 import { GeneralTab } from "./tabs/general-tab";
 import { ProfileTab } from "./tabs/profile-tab";
 import { ResourcesTab } from "./tabs/resources-tab";
@@ -117,6 +119,7 @@ const TABS: TabDef[] = [
     icon: DatabaseSettingIcon,
     badgeKey: "common.new",
   },
+  { id: "debugging", labelKey: "settings.tabs.debugging", icon: BugIcon },
   { id: "about", labelKey: "settings.tabs.about", icon: HelpCircleIcon },
 ];
 
@@ -152,6 +155,8 @@ function renderTab(tab: SettingsTab) {
       return <ApiKeysTab />;
     case "agents":
       return <AgentsTab />;
+    case "debugging":
+      return <DebuggingTab />;
     case "about":
       return <AboutTab />;
   }
@@ -264,6 +269,7 @@ export function SettingsDialog() {
     data: null,
     "api-keys": null,
     agents: null,
+    debugging: null,
     about: null,
   });
 
