@@ -207,3 +207,62 @@ def reset_cache_case_resolution_state() -> None:
     _CACHE_CASE_RESOLUTION_MEMO.clear()
     for key in _CACHE_CASE_RESOLUTION_STATS:
         _CACHE_CASE_RESOLUTION_STATS[key] = 0
+
+
+def _wsl_reveal_in_explorer(path: Path) -> bool:
+    import subprocess
+    if not _IS_WSL:
+        return False
+    try:
+        windows_path = subprocess.run(
+            ["wslpath", "-w", str(path)],
+            capture_output = True,
+            text = True,
+            encoding = "utf-8",
+            errors = "replace",
+            check = True,
+            timeout = 10,
+        ).stdout.strip()
+        if not windows_path:
+            return False
+        argument = f"/select,{windows_path}" if path.is_file() else windows_path
+        subprocess.Popen(["explorer.exe", argument])
+        return True
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def reveal_in_file_manager(path: Path) -> None:
+    """Open the OS file manager with *path* selected (best effort per platform).
+
+    Raises ``FileNotFoundError`` when the target is already gone: the Linux
+    branch falls back to the parent directory, so a path deleted between the
+    caller's check and this call would open the directory holding it, which for
+    a sandbox is the root holding every other chat's.
+    """
+    import subprocess
+
+    if not path.exists():
+        raise FileNotFoundError(str(path))
+
+    target = str(path)
+    if sys.platform == "darwin":
+        cmd = ["open", "-R", target] if path.is_file() else ["open", target]
+        subprocess.Popen(cmd)
+    elif os.name == "nt":
+        if path.is_file():
+            subprocess.Popen(["explorer", f"/select,{target}"])
+        else:
+            os.startfile(target)  # noqa: S606 - local user's own file manager
+    elif not _wsl_reveal_in_explorer(path):
+        # No cross-desktop "select file" standard on Linux; open the directory.
+        if path.is_dir():
+            directory = target
+        elif path.is_file():
+            directory = str(path.parent)
+        else:
+            # Gone between the guard above and this branch, which are two
+            # separate stats. Widening to the parent here would open the root
+            # holding every other chat's sandbox, so fail closed instead.
+            raise FileNotFoundError(target)
+        subprocess.Popen(["xdg-open", directory])
