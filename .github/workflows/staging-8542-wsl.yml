@@ -1,0 +1,96 @@
+name: "staging-8542 wsl install + update"
+# WSL is neither plain Linux nor Windows: platform.system() reports Linux, but the
+# filesystem, /tmp and shortcut locations are the Windows host's. PR 8542 changes the
+# launcher refresh that runs at the end of `unsloth studio update`, so this runs the
+# real installer and the real update inside WSL and checks the launcher is stable.
+on:
+  push:
+    branches: ["pr-8542-ci"]
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+
+jobs:
+  wsl:
+    name: WSL Ubuntu 24.04 install + update
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up WSL (Ubuntu 24.04)
+        uses: Vampire/setup-wsl@v6
+        with:
+          distribution: Ubuntu-24.04
+          set-as-default: "true"
+          update: "false"
+          additional-packages: curl ca-certificates git python3 python3-venv
+
+      - name: Install Unsloth Studio inside WSL
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          export UNSLOTH_STUDIO_HOME="$PWD/.studio-home"
+          export UNSLOTH_NO_TORCH=1
+          export UNSLOTH_SKIP_AUTOSTART=1
+          export UNSLOTH_VERBOSE=1
+          bash ./install.sh < /dev/null
+          echo "INSTALL_RC=$?"
+          ls -la "$UNSLOTH_STUDIO_HOME/share/" || true
+
+      - name: Run the real update twice and compare the launcher
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          export UNSLOTH_STUDIO_HOME="$PWD/.studio-home"
+          export UNSLOTH_NO_TORCH=1
+          export UNSLOTH_SKIP_AUTOSTART=1
+          LAUNCHER="$UNSLOTH_STUDIO_HOME/share/launch-studio.sh"
+          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
+          [ -x "$BIN" ] || { echo "::error::no unsloth binary at $BIN"; exit 1; }
+          a=$(sha256sum "$LAUNCHER" | cut -c1-16)
+
+          "$BIN" studio update --no-verify < /dev/null; echo "UPDATE1_RC=$?"
+          b=$(sha256sum "$LAUNCHER" | cut -c1-16)
+
+          "$BIN" studio update --no-verify < /dev/null; echo "UPDATE2_RC=$?"
+          c=$(sha256sum "$LAUNCHER" | cut -c1-16)
+
+          echo "launcher sha: install=$a update=$b update2=$c"
+          [ "$a" = "$b" ] && [ "$b" = "$c" ] || {
+            echo "::error::launcher changed across updates on WSL ($a / $b / $c)"; exit 1; }
+
+          # The refresh must never leave its temporary installer behind. find rather
+          # than ls, because an unmatched glob makes ls exit 2 and wsl-bash runs with -e,
+          # so the clean case would abort the step.
+          leftovers=$(find /tmp -maxdepth 1 -name 'unsloth-studio-refresh-*' | wc -l)
+          [ "$leftovers" = "0" ] || { echo "::error::$leftovers stray refresh temp files"; exit 1; }
+          echo "WSL install + double update clean"
+
+      - name: An unreachable installer must not fail the update
+        shell: wsl-bash {0}
+        run: |
+          set -uo pipefail
+          export UNSLOTH_STUDIO_HOME="$PWD/.studio-home"
+          export UNSLOTH_NO_TORCH=1
+          export UNSLOTH_SKIP_AUTOSTART=1
+          BIN="$UNSLOTH_STUDIO_HOME/unsloth_studio/bin/unsloth"
+          LAUNCHER="$UNSLOTH_STUDIO_HOME/share/launch-studio.sh"
+          before=$(sha256sum "$LAUNCHER" | cut -c1-16)
+          # Point the fetch at a black hole. A non-zero exit is expected and is not what is under test: with the network
+          # black-holed the package phase cannot reach PyPI. What must hold is that the
+          # unreachable installer leaves the launcher alone. wsl-bash runs with -e, so
+          # the status has to be captured rather than allowed to abort the step.
+          set +e
+          http_proxy=http://127.0.0.1:1 https_proxy=http://127.0.0.1:1 \
+            "$BIN" studio update --no-verify < /dev/null
+          rc=$?
+          set -e
+          echo "OFFLINE_RC=$rc (non-zero expected, the package phase cannot reach PyPI)"
+          after=$(sha256sum "$LAUNCHER" | cut -c1-16)
+          [ "$before" = "$after" ] || {
+            echo "::error::offline update changed the launcher ($before -> $after)"; exit 1; }
+          echo "offline update left the launcher intact"
