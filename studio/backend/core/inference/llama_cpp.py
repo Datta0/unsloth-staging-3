@@ -68,6 +68,7 @@ from core.inference.llama_server_args import (
     parse_gpu_layers_override,
     parse_split_mode_override,
     resolve_requested_ctx,
+    strip_context_only,
     strip_shadowing_flags,
     strip_split_mode_only,
 )
@@ -5859,6 +5860,66 @@ class LlamaCppBackend:
                 binary, for_llama_server = for_llama_server
             )
         ]
+
+    @staticmethod
+    def _metal_zero_ctx_floor(
+        effective_ctx: int,
+        auto_fit: bool,
+        gpu_memory_mode: Optional[str],
+        native_ctx: Optional[int],
+    ) -> int:
+        """Context to start at when Metal would otherwise be sent "-c 0", else 0.
+
+        "-c 0" is the over-commit the Apple cap exists to prevent: llama.cpp
+        reads it as fit_params_min_ctx = UINT32_MAX, which pins the model's full
+        native length and disables the reduction --fit would do. Two paths reach
+        the command builder with a zero context after that cap has been skipped
+        or thrown away:
+
+          * the cap is guarded on ``effective_ctx > 0``, so a GGUF whose
+            metadata carries no context length is never capped at all;
+          * the ``except Exception`` around GPU selection restores the original
+            request, which is 0 when context is on Auto. That discards a context
+            the cap had already computed, and logs "using --fit on" while
+            emitting the one argument that disables --fit.
+
+        Either way the child starts at native and over-commits unified memory,
+        which surfaces as llama-server's "Compute error." at decode (#5118,
+        #6529). Floor to the same 4096 the cap falls back to without a KV
+        estimate.
+
+        Only when a Metal budget is resolvable, which is 0 off Apple Silicon, so
+        this is inert everywhere else. Auto-layers is left alone because it omits
+        -c entirely and lets --fit size it, and manual offload is left alone
+        because there the user owns memory management, cap included.
+        """
+        if effective_ctx > 0 or auto_fit or gpu_memory_mode == "manual":
+            return 0
+        if not LlamaCppBackend._apple_metal_memory_budget_bytes():
+            return 0
+        return min(4096, native_ctx or 4096)
+
+    @staticmethod
+    def _metal_drops_zero_ctx_override(
+        ctx_override: Optional[int], auto_fit: bool, gpu_memory_mode: Optional[str]
+    ) -> bool:
+        """Whether a pass-through "-c 0" must be dropped before it reaches Metal.
+
+        User extras are appended after Studio's own -c and llama.cpp is last-wins
+        ("only last value will be used"), so a zero override outlives both the
+        Apple cap and the floor above and re-pins the native length. It is also
+        strictly worse than passing no -c at all: the -c handler sets
+        fit_params_min_ctx = UINT32_MAX on value 0, which disables the context
+        reduction --fit would otherwise perform, so the one flag that looks like
+        "let llama.cpp decide" is the one that stops it from deciding.
+
+        Only a zero override; a positive -c stays honored as it is today. Same
+        scope as the floor, so inert off Apple Silicon and silent on manual
+        memory management, where the user owns the budget.
+        """
+        if ctx_override != 0 or auto_fit or gpu_memory_mode == "manual":
+            return False
+        return bool(LlamaCppBackend._apple_metal_memory_budget_bytes())
 
     @staticmethod
     def _apple_metal_memory_budget_bytes() -> int:
@@ -14075,6 +14136,24 @@ class LlamaCppBackend:
                     except Exception as e:
                         logger.debug(f"mmproj audio-capability read failed: {e}")
 
+                auto_fit = gpu_memory_mode == "manual" and gpu_layers < 0
+                if self._metal_drops_zero_ctx_override(ctx_override, auto_fit, gpu_memory_mode):
+                    extra_args = strip_context_only(extra_args)
+                    logger.warning(
+                        "Dropping the pass-through zero context: on Metal it pins the "
+                        "model's native length and disables --fit."
+                    )
+                _metal_floor = self._metal_zero_ctx_floor(
+                    effective_ctx, auto_fit, gpu_memory_mode, self._context_length
+                )
+                if _metal_floor:
+                    effective_ctx = _metal_floor
+                    max_available_ctx = max(max_available_ctx or 0, effective_ctx)
+                    logger.warning(
+                        "No GPU is enumerated on Metal and the context cap did not "
+                        f"run, so starting at {effective_ctx} rather than the model's "
+                        "native length."
+                    )
                 cmd = [
                     binary,
                     "-m",
@@ -14094,7 +14173,6 @@ class LlamaCppBackend:
                 # "-c 0" would instead pin the FULL native context (llama.cpp's
                 # -c handler sets fit_params_min_ctx = UINT32_MAX on value 0,
                 # disabling --fit's reduction). See gpu_memory_mode.
-                auto_fit = gpu_memory_mode == "manual" and gpu_layers < 0
                 if effective_ctx > 0:
                     cmd.extend(["-c", str(effective_ctx)])
                 elif not auto_fit:
