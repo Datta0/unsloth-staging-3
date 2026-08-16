@@ -58,6 +58,7 @@ from hub.utils.gguf_plan import (
     build_gguf_variant_plans,
     is_main_gguf_variant_path,
 )
+from utils.paths.path_utils import is_appledouble_metadata
 
 logger = get_logger(__name__)
 
@@ -648,6 +649,7 @@ def _direct_gguf_loads(path: Path) -> bool:
         _is_mmproj_filename(path.name)
         or _is_mtp_drafter_path(context)
         or is_big_endian_gguf_path(context, _extract_quant_label(context))
+        or is_appledouble_metadata(path)
     )
 
 
