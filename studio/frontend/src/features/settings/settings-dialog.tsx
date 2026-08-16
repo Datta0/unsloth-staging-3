@@ -3,6 +3,7 @@
 
 import { FloatingMonitor } from "@/components/floating-monitor";
 import { getClientPlatform } from "@/components/tauri/window-titlebar";
+import { Button } from "@/components/ui/button";
 import {
   Dialog,
   DialogContent,
@@ -13,6 +14,7 @@ import { type TranslationKey, useT } from "@/i18n";
 import { isTauri } from "@/lib/api-base";
 import { MicIcon } from "@/lib/mic-icon";
 import { cn } from "@/lib/utils";
+import { scheduleIdleTask } from "@/lib/schedule-idle-task";
 import {
   BotIcon,
   Cancel01Icon,
@@ -31,7 +33,12 @@ import {
 import { HugeiconsIcon } from "@hugeicons/react";
 import { motion, useReducedMotion } from "motion/react";
 import {
+  Component,
+  type ComponentType,
   type FC,
+  type ReactNode,
+  Suspense,
+  lazy,
   useDeferredValue,
   useEffect,
   useMemo,
@@ -46,18 +53,103 @@ import {
   type SettingsTab,
   useSettingsDialogStore,
 } from "./stores/settings-dialog-store";
-import { AboutTab } from "./tabs/about-tab";
-import { AgentsTab } from "./tabs/agents-tab";
-import { ApiKeysTab } from "./tabs/api-keys-tab";
-import { AppearanceTab } from "./tabs/appearance-tab";
-import { ChatTab } from "./tabs/chat-tab";
-import { ConnectionsTab } from "./tabs/connections-tab";
-import { DataTab } from "./tabs/data-tab";
-import { DebuggingTab } from "./tabs/debugging-tab";
-import { GeneralTab } from "./tabs/general-tab";
-import { ProfileTab } from "./tabs/profile-tab";
-import { ResourcesTab } from "./tabs/resources-tab";
-import { VoiceTab } from "./tabs/voice-tab";
+// The dialog is rendered at the app root and is closed on launch, but its twelve tab
+// panels and everything they pull in were in the entry's static import closure, so the
+// browser fetched, parsed and executed all of it before the first paint. Each panel is
+// loaded when it is first shown instead. `loadTab` is also what prefetches the rest, so
+// there is no second list to keep in step.
+const TAB_LOADERS = {
+  general: () => import("./tabs/general-tab").then((m) => ({ default: m.GeneralTab })),
+  profile: () => import("./tabs/profile-tab").then((m) => ({ default: m.ProfileTab })),
+  appearance: () =>
+    import("./tabs/appearance-tab").then((m) => ({ default: m.AppearanceTab })),
+  resources: () =>
+    import("./tabs/resources-tab").then((m) => ({ default: m.ResourcesTab })),
+  chat: () => import("./tabs/chat-tab").then((m) => ({ default: m.ChatTab })),
+  voice: () => import("./tabs/voice-tab").then((m) => ({ default: m.VoiceTab })),
+  connections: () =>
+    import("./tabs/connections-tab").then((m) => ({ default: m.ConnectionsTab })),
+  data: () => import("./tabs/data-tab").then((m) => ({ default: m.DataTab })),
+  "api-keys": () => import("./tabs/api-keys-tab").then((m) => ({ default: m.ApiKeysTab })),
+  agents: () => import("./tabs/agents-tab").then((m) => ({ default: m.AgentsTab })),
+  debugging: () =>
+    import("./tabs/debugging-tab").then((m) => ({ default: m.DebuggingTab })),
+  about: () => import("./tabs/about-tab").then((m) => ({ default: m.AboutTab })),
+} satisfies Record<SettingsTab, () => Promise<{ default: FC }>>;
+
+function lazyTabs<T extends Record<string, () => Promise<{ default: FC }>>>(
+  loaders: T,
+): Record<keyof T, ComponentType> {
+  const out = {} as Record<keyof T, ComponentType>;
+  for (const id of Object.keys(loaders) as (keyof T)[]) {
+    out[id] = lazy(loaders[id]);
+  }
+  return out;
+}
+
+const LAZY_TABS = lazyTabs(TAB_LOADERS);
+
+interface PanelBoundaryProps {
+  tab: SettingsTab;
+  message: string;
+  reloadLabel: string;
+  children: ReactNode;
+}
+
+interface PanelBoundaryState {
+  tab: SettingsTab;
+  failed: boolean;
+}
+
+/**
+ * A panel is fetched the first time it is shown, so it can now fail where it could not
+ * before: offline, or a page whose entry bundle predates an in-place rewrite of `dist/`
+ * and still names chunks that have been replaced. This dialog is mounted at the app root
+ * and nothing above it catches, so an unguarded failure unmounts the whole of Studio, not
+ * one panel; that was reproduced with the panel's module blocked.
+ *
+ * Reload rather than retry: React caches a `lazy` rejection for the life of the page, and
+ * the browser's module map caches the failed import, so re-importing the same URL rethrows
+ * without a new request (whatwg/html#6768). index.html is served no-store, so a reload does
+ * pick up the current chunk names.
+ */
+class SettingsPanelBoundary extends Component<
+  PanelBoundaryProps,
+  PanelBoundaryState
+> {
+  state: PanelBoundaryState = { tab: this.props.tab, failed: false };
+
+  static getDerivedStateFromError(): Partial<PanelBoundaryState> {
+    return { failed: true };
+  }
+
+  // A different tab is a different chunk, so let it render rather than holding the
+  // whole panel area on one panel's failure.
+  static getDerivedStateFromProps(
+    props: PanelBoundaryProps,
+    state: PanelBoundaryState,
+  ): Partial<PanelBoundaryState> | null {
+    return props.tab === state.tab ? null : { tab: props.tab, failed: false };
+  }
+
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return (
+      <div className="flex min-h-40 flex-1 flex-col items-center justify-center gap-3 text-center">
+        <p className="text-muted-foreground text-sm">{this.props.message}</p>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            window.location.reload();
+          }}
+        >
+          {this.props.reloadLabel}
+        </Button>
+      </div>
+    );
+  }
+}
 
 interface TabDef {
   id: SettingsTab;
@@ -138,32 +230,8 @@ const SETTINGS_SEARCH_INDEX = createSettingsSearchIndex({
 });
 
 function renderTab(tab: SettingsTab) {
-  switch (tab) {
-    case "general":
-      return <GeneralTab />;
-    case "profile":
-      return <ProfileTab />;
-    case "appearance":
-      return <AppearanceTab />;
-    case "resources":
-      return <ResourcesTab />;
-    case "chat":
-      return <ChatTab />;
-    case "voice":
-      return <VoiceTab />;
-    case "connections":
-      return <ConnectionsTab />;
-    case "data":
-      return <DataTab />;
-    case "api-keys":
-      return <ApiKeysTab />;
-    case "agents":
-      return <AgentsTab />;
-    case "debugging":
-      return <DebuggingTab />;
-    case "about":
-      return <AboutTab />;
-  }
+  const Tab = LAZY_TABS[tab];
+  return <Tab />;
 }
 
 export function SettingsDialog() {
@@ -179,6 +247,22 @@ export function SettingsDialog() {
   // from a deferred value so the nav updates first.
   const panelTab = useDeferredValue(activeTab);
   const [query, setQuery] = useState("");
+
+  // Once the dialog has been opened, pull the other panels in on idle so a tab
+  // click never waits on a network round trip. Nothing here runs while it is
+  // closed, which is the state it is in for the whole launch.
+  useEffect(() => {
+    if (!open) return;
+    return scheduleIdleTask(() => {
+      for (const load of Object.values(TAB_LOADERS)) {
+        // The prefetch warms panels nobody has asked for, so a fetch that fails is
+        // not something to report; the boundary above speaks for the panel the user
+        // does open. Swallowed here because an unhandled rejection would otherwise
+        // reach the page for every panel a lost connection could not reach.
+        void load().catch(() => undefined);
+      }
+    });
+  }, [open]);
 
   const results = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -484,7 +568,25 @@ export function SettingsDialog() {
                 ref={mainScrollRef}
                 className="hover-scrollbar flex min-h-0 min-w-0 flex-1 flex-col overflow-y-auto p-6 [scrollbar-gutter:stable]"
               >
-                {renderTab(panelTab)}
+                {/* Only the first view of a panel waits, and the prefetch below
+                    usually gets there first, so switching tabs stays instant.
+                    The fallback is delayed so a panel that arrives promptly, which
+                    is every panel on a local install, never flashes it. */}
+                <SettingsPanelBoundary
+                  tab={panelTab}
+                  message={t("settings.dialog.panelFailed")}
+                  reloadLabel={t("settings.dialog.panelReload")}
+                >
+                  <Suspense
+                    fallback={
+                      <div className="fade-in fill-mode-both flex flex-1 animate-in items-center justify-center text-muted-foreground text-sm delay-300 duration-150">
+                        {t("common.loading")}
+                      </div>
+                    }
+                  >
+                    {renderTab(panelTab)}
+                  </Suspense>
+                </SettingsPanelBoundary>
               </div>
             </main>
           </div>
