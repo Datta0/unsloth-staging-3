@@ -20,7 +20,12 @@ import routes.inference as inference_route
 from .llama_backend_double import FakeLlamaCppBackend
 
 
-class _ToolGgufBackend(FakeLlamaCppBackend):
+class _ToolGgufBackend:
+    is_loaded = True
+    model_identifier = "test/model.gguf"
+    context_length = None
+    _is_audio = False
+    is_vision = False
     supports_tools = True
 
     def generate_chat_completion_with_tools(self, **kwargs):
