@@ -22,6 +22,7 @@ import {
   saveChatThread,
   syncChatMessages,
   updateChatProject,
+  type ChatThreadWritePatch,
   updateChatThread,
 } from "../api/chat-api";
 import { DEXIE_DB_NAME, db } from "../db";
@@ -574,6 +575,7 @@ export type StoredChatThreadReadResult = {
 
 export async function getStoredChatThreadReadResult(
   threadId: string,
+  options: { bounded?: boolean } = {},
 ): Promise<StoredChatThreadReadResult> {
   // Incognito threads are never stored, so the lookup can only come back
   // empty -- short-circuit it instead of doing a Dexie read + backend GET.
@@ -586,7 +588,10 @@ export async function getStoredChatThreadReadResult(
   const legacyThread = await db.threads.get(threadId);
   let backendThread: ThreadRecord | null;
   try {
-    backendThread = await getChatThread(threadId);
+    // Bounded for a caller that is gating the UI on this read: an unbounded GET that
+    // never answers leaves the request open for the life of the page, and every retry
+    // opens another.
+    backendThread = await getChatThread(threadId, { bounded: options.bounded });
   } catch (error) {
     if (legacyThread && !isChatThreadDeleted(legacyThread.id)) {
       return { thread: legacyThread, cacheable: false };
@@ -913,12 +918,13 @@ export async function saveStoredChatThread(
 
 export async function updateStoredChatThread(
   threadId: string,
-  patch: Partial<ThreadRecord>,
+  patch: ChatThreadWritePatch,
+  options: { signal?: AbortSignal } = {},
 ): Promise<ThreadRecord | undefined> {
   if (isThreadIncognito(threadId)) return undefined;
   const thread = await ensureStoredChatThread(threadId);
   if (!thread) return undefined;
-  return updateChatThread(threadId, patch);
+  return updateChatThread(threadId, patch, options);
 }
 
 /** Thread ids whose sandbox still holds files, passed through from the route. */
