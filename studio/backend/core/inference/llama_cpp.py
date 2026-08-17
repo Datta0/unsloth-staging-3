@@ -49,6 +49,13 @@ from typing import (
 
 import httpx
 
+from core.inference.context_window import (
+    prompt_budget,
+    estimate_messages_tokens,
+    evicted_messages,
+    fit_rolling_context,
+    messages_have_media,
+)
 from core.inference.llama_server_args import (
     _GPU_LAYER_FLAGS,
     _LAYER_OFFLOAD_FLAGS,
@@ -85,6 +92,7 @@ from core.inference.tool_call_parser import (
     StreamingMarkupStripper as _StreamingMarkupStripper,
     RAG_MAX_SEARCHES_PER_TURN,
     RAG_SEARCH_CAP_NUDGE,
+    RAG_SEARCH_TOOLS,
     parse_tool_calls_from_text as _shared_parse_tool_calls_from_text,
     strip_leading_bare_json_call,
     strip_llama3_leading_sentinels,
@@ -458,6 +466,366 @@ def _native_linux_system_rocm_lib_dirs(binary_dir: str = "") -> "list[str]":
 # enough for reasoning-heavy GGUFs and max_tokens-omitting API clients.
 _DEFAULT_MAX_TOKENS_FLOOR = 32768
 _DEFAULT_FIRST_TOKEN_TIMEOUT_S = 1200.0  # 20 min
+
+
+def _conversation_recall_reserve(thread_id: Optional[str]) -> int:
+    """Room to hold back during a fit for the turns recalled straight after it."""
+    if not thread_id:
+        return 0
+    try:
+        from core.rag import config as rag_config
+        from core.rag import conversation_archive
+
+        # Eligibility, not just availability. A temporary chat is never archived, so
+        # nothing can ever be recalled into the room held back for it -- and the reserve
+        # is subtracted from the trim target, so on a small window it evicts most of the
+        # history to reserve space that stays empty. Measured on a 4K chat: 15 tokens of
+        # conversation survived instead of 1,615.
+        if not conversation_archive.can_archive(thread_id):
+            return 0
+        # And whether it is actually working. sqlite-vec can be present and the thread
+        # persisted while the embedder cannot start, in which case archiving fails
+        # quietly and the recall injects nothing -- so the room held back is pure loss,
+        # on every compaction, and this failure mode forgets more history than having the
+        # feature turned off.
+        if conversation_archive.degraded():
+            return 0
+        return max(0, int(rag_config.CONVERSATION_RECALL_RESERVE_TOKENS))
+    except Exception:
+        return 0
+
+
+def _archive_branch_transcript(branch_messages: Optional[list[dict]]) -> Optional[list[str]]:
+    """The active branch, one normalised string per message, or None if there is nothing."""
+    if not branch_messages:
+        return None
+    try:
+        from core.rag import conversation_archive
+        return conversation_archive.branch_message_texts(branch_messages)
+    except Exception:
+        return None
+
+
+def _branch_boundary(conversation: list[dict], branch: Optional[list[dict]]) -> int:
+    """How many of the REQUEST's own leading messages a fit has evicted.
+
+    The boundary is persisted and re-applied to the NEXT request's saved transcript, so it
+    has to be counted in those terms. ``dropped_messages`` is not: the tool loop refits on
+    every iteration and the client sums the counts, so a long agent run adds the tool
+    exchanges this turn created -- messages the next request's transcript does not contain
+    -- and the boundary advances far past the turns that were actually evicted.
+
+    Counted by identity. Instruction messages are skipped rather than treated as the
+    front of the branch: a fit never evicts them, so a Studio request -- which always
+    prepends a system prompt -- would otherwise report a boundary of zero on every
+    compaction, and the boundary would slide forward on every single turn again.
+
+    The newest turn is excluded because it is never evicted and an inline recall rewrites
+    it in place, which would read as an eviction.
+    """
+    messages = list(branch or ())[:-1]
+    live = {id(message) for message in conversation}
+    count = 0
+    for message in messages:
+        if message.get("role") in ("system", "developer"):
+            continue
+        if id(message) in live:
+            break
+        count += 1
+    return count
+
+
+def _archive_message_text(content) -> str:
+    """One stored message flattened the way the branch check flattens it, or ""."""
+    try:
+        from core.rag import conversation_archive
+        return conversation_archive.message_text(content)
+    except Exception:
+        return ""
+
+
+def _archive_content_on_branch(content, transcript: Optional[list[str]]) -> bool:
+    if transcript is None:
+        return True
+    try:
+        from core.rag import conversation_archive
+        return conversation_archive.content_on_branch(content, transcript)
+    except Exception:
+        return True
+
+
+def _sticky_compaction_boundary(
+    thread_id: Optional[str], branch_messages: Optional[list[dict]] = None
+) -> int:
+    """How many leading messages this thread last compacted away, or 0.
+
+    The fit is otherwise stateless: the client re-sends the whole saved transcript on
+    every request, so "keep the newest N tokens" slides forward a turn or two at a time
+    and every reply compacts a little more than the last. That is bad for the user, who
+    can never be told anything more useful than "still compacting", and bad for
+    llama-server, whose prefix cache is thrown away each time the head of the prompt
+    moves. Reading the boundary back turns compaction into an occasional event.
+
+    The source is the thread's own newest assistant turn, which already persists this
+    number for the UI, so nothing new is stored and it survives a restart. Never raises:
+    a thread with no history, an API client that persists nothing, or a storage error
+    all mean "no boundary", which is exactly the old stateless behaviour.
+    """
+    if not thread_id:
+        return 0
+    try:
+        from storage import studio_db
+
+        # The stored rows are the whole message DAG, ordered by creation time, so the
+        # newest assistant turn can belong to a sibling branch left behind by Retry or
+        # regenerate. Its boundary describes a different conversation: applied to the
+        # branch actually being sent, it evicts a block sized for history this branch
+        # does not have. Skip the rows the request's own messages do not contain.
+        _branch = _archive_branch_transcript(branch_messages)
+        candidates = [
+            message
+            for message in reversed(studio_db.list_chat_messages(thread_id) or [])
+            if message.get("role") == "assistant"
+            and _archive_content_on_branch(message.get("content"), _branch)
+        ]
+        if not candidates:
+            return 0
+
+        # The newest on-branch assistant turn decides, EXCEPT that the branch check is
+        # textual, so two siblings whose replies read the same ("Done") are
+        # indistinguishable from here -- and Retry is exactly what produces them. Taking
+        # the first match would then apply a boundary measured on a different, possibly
+        # much deeper branch. Where the text cannot tell them apart, take the SMALLEST
+        # boundary offered: too small costs one more compaction later, too large evicts
+        # live history that this branch still has.
+        # The branch check is a substring test, because an archived turn is compared
+        # against fragments of itself. Here both sides are whole messages, and substring
+        # lets an abandoned short reply ("Done") ride in on any live message that merely
+        # contains it ("Not done yet") -- and then, having no live twin, decide the
+        # boundary on its own. Where any candidate matches a live message exactly, only
+        # the exact ones are considered.
+        _live = set(_branch or ())
+        _exact = [
+            message
+            for message in candidates
+            if _archive_message_text(message.get("content")) in _live
+        ]
+        if _exact:
+            candidates = _exact
+
+        newest = _archive_message_text(candidates[0].get("content"))
+        boundaries = []
+        for message in candidates:
+            if _archive_message_text(message.get("content")) != newest:
+                continue
+            metadata = message.get("metadata") or {}
+            if not isinstance(metadata, dict):
+                return 0
+            truncation = metadata.get("contextTruncation") or (metadata.get("custom") or {}).get(
+                "contextTruncation"
+            )
+            if not isinstance(truncation, dict):
+                return 0
+            # Only a fit that SUCCEEDED describes a boundary worth restoring.
+            if not truncation.get("fits"):
+                return 0
+            # Counted against the request's own transcript, which is what this is about
+            # to be applied to. `dropped_messages` is the fallback for turns saved before
+            # that was recorded: it is the same number for a single fit, and too large for
+            # a turn that refit several times.
+            recorded = truncation.get("boundary_messages")
+            if recorded is None:
+                recorded = truncation.get("dropped_messages")
+            boundaries.append(max(0, int(recorded or 0)))
+        return min(boundaries) if boundaries else 0
+    except Exception:
+        return 0
+    return 0
+
+
+def _prefix_user_text(message: dict, prefix: str) -> dict:
+    """Copy of ``message`` with ``prefix`` in front of its text. Never mutates."""
+    content = message.get("content")
+    if isinstance(content, str) or content is None:
+        return {**message, "content": prefix + (content or "")}
+    if isinstance(content, list):
+        parts = list(content)
+        for index, part in enumerate(parts):
+            if isinstance(part, dict) and part.get("type") in ("text", "input_text"):
+                parts[index] = {**part, "text": prefix + str(part.get("text") or "")}
+                return {**message, "content": parts}
+        return {**message, "content": [{"type": "text", "text": prefix}] + parts}
+    return message
+
+
+def _recall_top_k(budget_tokens: int) -> int:
+    """How many archived chunks actually fit in the room a fit obtained.
+
+    The reserve is what the fit AIMS to hold back, not what it always gets: protected
+    messages (system, the latest turn, anchored recalls) can stop the trim reaching its
+    target while the result is still under the prompt budget, which the fit accepts.
+    Injecting a full reserve's worth of recall on top of that pushes the request back
+    over the window, turning a successful compaction into a context-length error --
+    reproduced at ctx 8000 with a large latest turn: fit accepted at 6900, recall took
+    it to 8948. So the recall is sized from the room actually left, not from the wish.
+    """
+    try:
+        from core.rag import config as rag_config
+        chunk = max(1, int(rag_config.CHUNK_TOKENS))
+        cap = max(0, int(rag_config.CONVERSATION_ARCHIVE_TOP_K))
+    except Exception:
+        return 0
+    return max(0, min(cap, int(budget_tokens) // chunk))
+
+
+def _archive_and_recall(
+    conversation: list[dict],
+    before: list[dict],
+    *,
+    thread_id: Optional[str],
+    style: str,
+    recall_done: bool,
+    recall_budget_tokens: int = 0,
+    count_tokens: Optional[Callable[[list[dict]], int]] = None,
+    branch_messages: Optional[list[dict]] = None,
+) -> dict:
+    """Keep the turns this fit evicted, then pull the relevant ones back.
+
+    Returns ``{"conversation", "events", "counts", "recalled"}``. Never raises: a chat
+    that cannot archive still has to answer, so every failure degrades to the plain
+    fitted messages.
+
+    Recall fires at most once per request. The tool loop refits on every iteration, and
+    without the guard each pass would stack another recall block onto the prompt.
+    """
+    result = {
+        "conversation": conversation,
+        "events": [],
+        "counts": {},
+        "recalled": False,
+        "anchored": [],
+    }
+    if not thread_id:
+        return result
+    try:
+        from core.inference.tools import build_conversation_recall
+        from core.rag import conversation_archive
+
+        if not conversation_archive.enabled():
+            return result
+
+        gone = evicted_messages(before, conversation)
+        archived = conversation_archive.archive_turns(thread_id, gone) if gone else 0
+        counts = {"archived_messages": archived}
+
+        if recall_done:
+            result["counts"] = counts
+            return result
+
+        top_k = _recall_top_k(recall_budget_tokens)
+        if top_k <= 0:
+            # No room was actually obtained. Archiving still happened above, so nothing
+            # is lost: the turns stay searchable and the next fit can recall them.
+            result["counts"] = counts
+            return result
+
+        # An EXACT recount decides whether a recall is affordable, because the chunk
+        # arithmetic above is an estimate twice over: CHUNK_TOKENS is an embedding-token
+        # limit rather than the chat template's cost for the same text, and neither it
+        # nor the budget accounts for the <recalled_conversation> or synthetic tool
+        # wrappers around it. Overshooting eats the reply's reserve first and the window
+        # after that, which is the failure this whole path exists to prevent.
+        #
+        # So when the recount says no, ask for FEWER turns rather than giving up. With
+        # the shipped defaults a full top-K of long turns lands just over the reserve
+        # once wrapped, and dropping the lot there would disable the one retrieval this
+        # feature forces, on exactly the long conversations it exists for. Halving is
+        # bounded (4 -> 2 -> 1), and each attempt costs one small per-thread query.
+        attempts = []
+        attempt_k = top_k
+        while True:
+            attempts.append(attempt_k)
+            if attempt_k <= 1:
+                break
+            attempt_k = max(1, attempt_k // 2)
+
+        for index, k in enumerate(attempts):
+            recall = build_conversation_recall(
+                conversation,
+                thread_id,
+                style = style,
+                top_k = k,
+                branch_messages = branch_messages,
+            )
+            if not recall:
+                result["counts"] = counts
+                return result
+
+            candidate = _inject_recall(conversation, recall, style)
+            if candidate is None:
+                result["counts"] = counts
+                return result
+
+            grew = None
+            if count_tokens is not None and recall_budget_tokens > 0:
+                try:
+                    grew = count_tokens(candidate["conversation"]) - count_tokens(conversation)
+                except Exception:
+                    grew = None
+            if grew is not None and grew > recall_budget_tokens:
+                logger.info(
+                    "conversation_recall.over_budget grew=%s budget=%s top_k=%s",
+                    grew,
+                    recall_budget_tokens,
+                    k,
+                )
+                if index + 1 < len(attempts):
+                    continue
+                logger.info(
+                    "conversation_recall.dropped_over_budget budget=%s", recall_budget_tokens
+                )
+                result["counts"] = counts
+                return result
+
+            result["conversation"] = candidate["conversation"]
+            result["events"] = candidate["events"]
+            result["anchored"] = candidate["anchored"]
+            break
+
+        counts["recalled_chunks"] = int(recall.get("sources") or 0)
+        result["counts"] = counts
+        result["recalled"] = True
+    except Exception as exc:
+        logger.warning("Could not archive or recall compacted turns: %s", exc)
+    return result
+
+
+def _inject_recall(conversation: list[dict], recall: dict, style: str) -> Optional[dict]:
+    """The conversation with ``recall`` added, or None if there was nowhere to put it.
+
+    ``anchored`` is exactly what this injection is responsible for keeping: the two
+    synthetic messages for a tool exchange, or the single rewritten user message inline.
+    The caller protects those from a later refit, and protecting anything else would pin
+    a real turn that the fit is entitled to evict.
+    """
+    if style == "inline":
+        prefix = recall.get("prefix") or ""
+        updated = list(conversation)
+        for index in range(len(updated) - 1, -1, -1):
+            if updated[index].get("role") == "user":
+                updated[index] = _prefix_user_text(updated[index], prefix)
+                break
+        else:
+            return None
+        return {"conversation": updated, "events": [], "anchored": [updated[index]]}
+    added = list(recall["messages"])
+    return {
+        "conversation": list(conversation) + added,
+        "events": list(recall["events"]),
+        "anchored": added,
+    }
+
+
 # A transport error can arrive before the child is reapable; a request path cannot
 # afford the 5s the background MTP reload spends on the same race.
 _RESPAWN_REAP_GRACE_S = 1.0
@@ -20189,7 +20557,12 @@ class LlamaCppBackend:
                 return started
 
     @contextlib.contextmanager
-    def _open_chat_stream_with_respawn_retry(self, payload: dict, cancel_event):
+    def _open_chat_stream_with_respawn_retry(
+        self,
+        payload: dict,
+        cancel_event,
+        on_respawn: Optional[Callable[[], None]] = None,
+    ):
         """Open a chat stream, respawning a dead llama-server once before streaming.
 
         Retry only when opening the response fails: once it is open a consumer may
@@ -20223,6 +20596,8 @@ class LlamaCppBackend:
                     logger.warning(
                         "llama-server was unreachable; respawned it and retrying the generation"
                     )
+                    if on_respawn is not None:
+                        on_respawn()
                     continue
                 raise
 
@@ -20246,6 +20621,8 @@ class LlamaCppBackend:
         seed: Optional[int] = None,
         promote_reasoning_only: bool = True,
         perf_callback: Optional[Callable[[dict], None]] = None,
+        context_overflow: Optional[str] = None,
+        thread_id: Optional[str] = None,
         _allow_respawn_retry: bool = True,
     ) -> Generator[Union[str, dict], None, None]:
         """
@@ -20282,6 +20659,11 @@ class LlamaCppBackend:
             "repeat_penalty": repetition_penalty,
             "presence_penalty": presence_penalty,
         }
+        retry_messages = messages
+        retry_image_b64 = image_b64
+        retry_max_tokens = max_tokens
+        retry_context_overflow = context_overflow
+        retry_preflight_context_length = None
         if perf_callback is not None:
             payload["return_progress"] = True
             payload["timings_per_token"] = True
@@ -20301,6 +20683,81 @@ class LlamaCppBackend:
             if max_tokens is not None
             else (self._effective_context_length or _DEFAULT_MAX_TOKENS_FLOOR)
         )
+        if (
+            context_overflow == "truncate_oldest"
+            and self._effective_context_length
+            and not messages_have_media(openai_messages)
+        ):
+            try:
+                _before_fit = openai_messages
+                openai_messages, truncation = fit_rolling_context(
+                    openai_messages,
+                    context_length = self._effective_context_length,
+                    max_tokens = payload["max_tokens"],
+                    count_tokens = lambda fitted: self.count_chat_tokens(
+                        neutralize_control_markup_in_messages(fitted, None, self.markup_profile),
+                        None,
+                        None,
+                        strict = True,
+                        chat_template_kwargs = _reasoning_kw,
+                        continue_final_message = continue_final_message,
+                        should_abort = lambda: bool(cancel_event and cancel_event.is_set()),
+                    ),
+                    reserve_tokens = _conversation_recall_reserve(thread_id),
+                    sticky_dropped = _sticky_compaction_boundary(thread_id, _before_fit),
+                )
+                if truncation and truncation["fits"]:
+                    # Inline, not a forged tool exchange: this path sends no tools array,
+                    # and strict chat templates reject a tool role that has no catalogue.
+                    _recalled = _archive_and_recall(
+                        openai_messages,
+                        _before_fit,
+                        branch_messages = _before_fit,
+                        thread_id = thread_id,
+                        style = "inline",
+                        recall_done = False,
+                        recall_budget_tokens = max(
+                            0,
+                            prompt_budget(self._effective_context_length, payload["max_tokens"])
+                            - int(truncation.get("prompt_tokens_after") or 0),
+                        ),
+                        count_tokens = lambda fitted: self.count_chat_tokens(
+                            neutralize_control_markup_in_messages(
+                                fitted, None, self.markup_profile
+                            ),
+                            None,
+                            None,
+                            strict = True,
+                            chat_template_kwargs = _reasoning_kw,
+                            continue_final_message = continue_final_message,
+                        ),
+                    )
+                    openai_messages = _recalled["conversation"]
+                    truncation = {**truncation, **_recalled["counts"]}
+                if truncation and truncation.get("fits"):
+                    truncation = {
+                        **truncation,
+                        "boundary_messages": _branch_boundary(openai_messages, _before_fit),
+                    }
+                payload["messages"] = neutralize_control_markup_in_messages(
+                    openai_messages, None, self.markup_profile
+                )
+                # Reuse the exact fitted request after a respawn. Re-running this
+                # preflight would emit the same truncation event a second time.
+                retry_messages = openai_messages
+                retry_image_b64 = None
+                retry_max_tokens = payload["max_tokens"]
+                retry_context_overflow = None
+                retry_preflight_context_length = self._effective_context_length
+                # `fits` False too: it carries the diagnosis for a request that cannot
+                # be made to fit, and the client needs it to explain WHY. Without it the
+                # user only sees llama-server's error, which reports the size of the
+                # whole conversation and advises shortening it even when the single
+                # message just sent is the part that does not fit.
+                if truncation:
+                    yield {"type": "context_truncated", **truncation}
+            except Exception as exc:
+                logger.warning("Could not preflight the rolling context window: %s", exc)
         if stop:
             payload["stop"] = stop
         if seed is not None:
@@ -20433,14 +20890,23 @@ class LlamaCppBackend:
                 logger.warning(
                     "llama-server was unreachable; respawned it and retrying the generation"
                 )
+                if (
+                    retry_preflight_context_length is not None
+                    and retry_preflight_context_length != self._effective_context_length
+                ):
+                    # Refit the already-compacted prompt against a replacement server's
+                    # actual window. Any event now reports only additional evictions.
+                    retry_context_overflow = context_overflow
+                    if max_tokens is None:
+                        retry_max_tokens = None
                 yield from self.generate_chat_completion(
-                    messages,
-                    image_b64 = image_b64,
+                    retry_messages,
+                    image_b64 = retry_image_b64,
                     temperature = temperature,
                     top_p = top_p,
                     top_k = top_k,
                     min_p = min_p,
-                    max_tokens = max_tokens,
+                    max_tokens = retry_max_tokens,
                     repetition_penalty = repetition_penalty,
                     presence_penalty = presence_penalty,
                     stop = stop,
@@ -20452,6 +20918,13 @@ class LlamaCppBackend:
                     seed = seed,
                     promote_reasoning_only = promote_reasoning_only,
                     perf_callback = perf_callback,
+                    context_overflow = retry_context_overflow,
+                    # The retry refits for the replacement window, so it can evict more
+                    # of the conversation than the first attempt did. Without the thread
+                    # those extra turns are archived nowhere, nothing is recalled in
+                    # their place, and the fit holds back no reserve and re-applies no
+                    # boundary -- on the one path that deliberately compacts again.
+                    thread_id = thread_id,
                     _allow_respawn_retry = False,
                 )
                 return
@@ -20496,6 +20969,7 @@ class LlamaCppBackend:
         permission_mode: Optional[str] = None,
         promote_reasoning_only: bool = True,
         perf_callback: Optional[Callable[[dict], None]] = None,
+        context_overflow: Optional[str] = None,
     ) -> Generator[dict, None, None]:
         """
         Agentic loop: let the model call tools, execute them, and continue.
@@ -20510,7 +20984,11 @@ class LlamaCppBackend:
           {"type": "content", "text": "token"}            -- streamed content tokens (cumulative)
           {"type": "reasoning", "text": "token"}          -- streamed reasoning tokens (cumulative)
         """
-        from core.inference.tool_stream_exec import accepts_output_callback, stream_tool_execution
+        from core.inference.tool_stream_exec import (
+            accepts_kwarg,
+            accepts_output_callback,
+            stream_tool_execution,
+        )
         from core.inference.tools import (
             build_rag_autoinject,
             execute_tool,
@@ -20537,6 +21015,34 @@ class LlamaCppBackend:
             raise RuntimeError("llama-server is not loaded")
 
         conversation = list(messages)
+        _rolling_anchor_ids: set[int] = set()
+        # The loop refits on every iteration; recall must fire once per request, or each
+        # pass stacks another block of recalled turns onto the prompt.
+        _conversation_recall_done = False
+        # The sticky boundary describes the ORIGINAL transcript, so it may be applied at
+        # most once per request. The tool loop refits every iteration on the conversation
+        # the previous fit returned; re-applying the count there evicts another
+        # boundary-sized block of still-live history, and the truncation events sum, so
+        # the inflated total is persisted and the next request starts from it.
+        _sticky_boundary_applied = False
+        # exact templated prompt tokens minus what the estimator says about the same
+        # messages, measured once by the preflight. The estimator knows nothing about the
+        # tool catalogue or the template's own framing, and with a large catalogue (MCP
+        # schemas especially) that is thousands of tokens of the prompt it cannot see --
+        # enough for a conversation search to be told there is room for chunks the
+        # request cannot hold. Carrying the difference makes the estimate exact at the
+        # point it was measured and only approximate for what the loop appends after.
+        _prompt_token_offset: Optional[int] = None
+        # The branch this request is on, kept aside before anything is evicted from or
+        # injected into `conversation`. The archive is keyed by thread, and a thread's
+        # stored rows are the whole message DAG -- Retry and regenerate keep the replaced
+        # response as a sibling -- so recall has to be told which branch is live, and the
+        # messages the client sent are the only authoritative answer.
+        _request_branch: list[dict] = list(messages)
+        for message in reversed(conversation):
+            if message.get("role") == "user":
+                _rolling_anchor_ids.add(id(message))
+                break
 
         def _attach_internal_feedback_to_tool_result(feedback: str) -> bool:
             """Keep controller instructions inside the current tool exchange."""
@@ -20775,6 +21281,113 @@ class LlamaCppBackend:
                 neutralize_control_markup_in_messages,
             )
 
+            _reasoning_kw = self._request_reasoning_kwargs(
+                enable_thinking, reasoning_effort, preserve_thinking
+            )
+            _preflight_context_length = None
+            _preflight_succeeded = False
+            if (
+                context_overflow == "truncate_oldest"
+                and self._effective_context_length
+                and not messages_have_media(conversation)
+            ):
+                _preflight_context_length = self._effective_context_length
+                try:
+                    _before_fit = conversation
+                    conversation, truncation = fit_rolling_context(
+                        conversation,
+                        context_length = self._effective_context_length,
+                        max_tokens = max_tokens,
+                        count_tokens = lambda fitted: self.count_chat_tokens(
+                            neutralize_control_markup_in_messages(
+                                fitted, _markup_cache, self.markup_profile
+                            ),
+                            None,
+                            safe_tools,
+                            strict = True,
+                            chat_template_kwargs = _reasoning_kw,
+                            continue_final_message = bool(
+                                continue_final_message and trailing_assistant_text(fitted)
+                            ),
+                            should_abort = lambda: bool(cancel_event and cancel_event.is_set()),
+                        ),
+                        protected_message_ids = _rolling_anchor_ids,
+                        reserve_tokens = _conversation_recall_reserve(thread_id),
+                        sticky_dropped = (
+                            0
+                            if _sticky_boundary_applied
+                            else _sticky_compaction_boundary(thread_id, _request_branch)
+                        ),
+                    )
+                    # Set whatever the fit decided: the boundary has now been accounted
+                    # for in this request, whether or not it changed anything.
+                    _sticky_boundary_applied = True
+                    if truncation and truncation.get("fits"):
+                        # Before the recall injection, so the two sides describe the same
+                        # messages: this count came from the fit, which priced them with
+                        # the tool catalogue and the template.
+                        _prompt_token_offset = int(
+                            truncation.get("prompt_tokens_after") or 0
+                        ) - estimate_messages_tokens(conversation)
+                    if truncation and truncation["fits"]:
+                        _recalled = _archive_and_recall(
+                            conversation,
+                            _before_fit,
+                            branch_messages = _request_branch,
+                            thread_id = thread_id,
+                            # Tool style forges an assistant tool_call plus a tool
+                            # result for search_conversation. That is only safe when the
+                            # request actually advertises it: on the FIRST compaction the
+                            # archive did not exist at tool-selection time, so it is
+                            # absent, and a tool role with no matching catalogue entry is
+                            # the same strict-template hazard the plain path avoids.
+                            style = (
+                                "tool" if "search_conversation" in _enabled_tool_names else "inline"
+                            ),
+                            recall_done = _conversation_recall_done,
+                            recall_budget_tokens = max(
+                                0,
+                                prompt_budget(self._effective_context_length, max_tokens)
+                                - int(truncation.get("prompt_tokens_after") or 0),
+                            ),
+                            count_tokens = lambda fitted: self.count_chat_tokens(
+                                neutralize_control_markup_in_messages(
+                                    fitted, _markup_cache, self.markup_profile
+                                ),
+                                None,
+                                safe_tools,
+                                strict = True,
+                                chat_template_kwargs = _reasoning_kw,
+                            ),
+                        )
+                        conversation = _recalled["conversation"]
+                        truncation = {**truncation, **_recalled["counts"]}
+                        if _recalled["recalled"]:
+                            _conversation_recall_done = True
+                            # Anchor exactly what the injection added, so a later refit in
+                            # this same request cannot evict what we just paid to bring
+                            # back. NOT the last two messages: inline recall appends
+                            # nothing and rewrites the latest user turn in place, so that
+                            # slice also pinned the assistant turn before it, and with it
+                            # a whole eviction unit the fit was entitled to drop -- enough
+                            # to fail a later iteration that would otherwise have fit.
+                            for _message in _recalled["anchored"]:
+                                _rolling_anchor_ids.add(id(_message))
+                            for _ev in _recalled["events"]:
+                                yield _ev
+                    if truncation and truncation.get("fits"):
+                        truncation = {
+                            **truncation,
+                            "boundary_messages": _branch_boundary(conversation, _request_branch),
+                        }
+                    # `fits` False too, as on the other paths: it carries the diagnosis
+                    # for a request that cannot be made to fit.
+                    if truncation:
+                        yield {"type": "context_truncated", **truncation}
+                    _preflight_succeeded = True
+                except Exception as exc:
+                    logger.warning("Could not preflight the rolling context window: %s", exc)
+
             payload = {
                 # Re-run every iteration: tool results land in ``conversation`` as the
                 # loop goes, and a forged turn in one would render for real (#7066).
@@ -20799,9 +21412,6 @@ class LlamaCppBackend:
             if safe_tools:
                 payload["tools"] = safe_tools
                 payload["tool_choice"] = "auto"
-            _reasoning_kw = self._request_reasoning_kwargs(
-                enable_thinking, reasoning_effort, preserve_thinking
-            )
             if _reasoning_kw is not None:
                 payload["chat_template_kwargs"] = _reasoning_kw
             # Re-checked per iteration: once a tool result is appended the partial is
@@ -20818,6 +21428,70 @@ class LlamaCppBackend:
                 payload["stop"] = stop
             if seed is not None:
                 payload["seed"] = seed
+
+            _respawn_truncations: list[dict] = []
+
+            def _refit_iteration_after_respawn() -> None:
+                nonlocal conversation
+                _before_respawn_fit = conversation
+                if (
+                    _preflight_context_length is None
+                    or not self._effective_context_length
+                    or (
+                        _preflight_succeeded
+                        and _preflight_context_length == self._effective_context_length
+                    )
+                ):
+                    return
+                if max_tokens is None:
+                    payload["max_tokens"] = self._effective_context_length
+                try:
+                    conversation, truncation = fit_rolling_context(
+                        conversation,
+                        context_length = self._effective_context_length,
+                        max_tokens = max_tokens,
+                        count_tokens = lambda fitted: self.count_chat_tokens(
+                            neutralize_control_markup_in_messages(
+                                fitted, _markup_cache, self.markup_profile
+                            ),
+                            None,
+                            safe_tools,
+                            strict = True,
+                            chat_template_kwargs = _reasoning_kw,
+                            continue_final_message = bool(
+                                continue_final_message and trailing_assistant_text(fitted)
+                            ),
+                            should_abort = lambda: bool(cancel_event and cancel_event.is_set()),
+                        ),
+                        protected_message_ids = _rolling_anchor_ids,
+                    )
+                    if truncation and truncation["fits"]:
+                        # Archive only, deliberately: this refit runs against a smaller
+                        # replacement window with no reserve held back for a recall, so
+                        # injecting one here is what would push the retry back over the
+                        # window. Losing the turns is the part that cannot be undone --
+                        # the next request can still recall them.
+                        truncation.update(
+                            _archive_and_recall(
+                                conversation,
+                                _before_respawn_fit,
+                                thread_id = thread_id,
+                                style = "inline",
+                                recall_done = True,
+                                branch_messages = _request_branch,
+                            )["counts"]
+                        )
+                    payload["messages"] = neutralize_control_markup_in_messages(
+                        conversation, _markup_cache, self.markup_profile
+                    )
+                    if truncation and truncation["fits"]:
+                        truncation["boundary_messages"] = _branch_boundary(
+                            conversation, _request_branch
+                        )
+                        _respawn_truncations.append(truncation)
+                except Exception as exc:
+                    logger.warning("Could not refit rolling context after respawn: %s", exc)
+                    raise
 
             try:
                 # ── Speculative buffer state machine ──────────────────
@@ -20867,10 +21541,16 @@ class LlamaCppBackend:
                 _text_args_name = ""
                 _confirm_gated_iteration = bool(confirm_tool_calls) and not bypass_permissions
 
-                with self._open_chat_stream_with_respawn_retry(payload, cancel_event) as (
+                with self._open_chat_stream_with_respawn_retry(
+                    payload,
+                    cancel_event,
+                    on_respawn = _refit_iteration_after_respawn,
+                ) as (
                     response,
                     first_token_deadline,
                 ):
+                    for truncation in _respawn_truncations:
+                        yield {"type": "context_truncated", **truncation}
                     raw_buf = ""
                     for raw_chunk in self._iter_text_cancellable(
                         response,
@@ -21830,7 +22510,7 @@ class LlamaCppBackend:
                     _effective_timeout = None if tool_call_timeout >= 9999 else tool_call_timeout
                     # RAG: cap paraphrased KB re-searches that slip past the dup guard.
                     if (
-                        decision.tool_name == "search_knowledge_base"
+                        decision.tool_name in RAG_SEARCH_TOOLS
                         and _kb_search_count >= RAG_MAX_SEARCHES_PER_TURN
                     ):
                         result = RAG_SEARCH_CAP_NUDGE
@@ -21849,6 +22529,34 @@ class LlamaCppBackend:
                                 rag_scope = rag_scope,
                                 disable_sandbox = bypass_permissions,
                             )
+                            # Same branch the forced recall is filtered against, so a
+                            # model-initiated search cannot reach a sibling response the
+                            # forced recall correctly refused.
+                            if accepts_kwarg(execute_tool, "conversation_branch"):
+                                kwargs["conversation_branch"] = _request_branch
+                            # And the room actually left. The model picks its own top_k,
+                            # and the result lands in the current tool exchange, which
+                            # rolling truncation protects and therefore cannot evict: a
+                            # top_k the window cannot hold ends the turn in a
+                            # context-length error that no later refit can undo.
+                            if self._effective_context_length and accepts_kwarg(
+                                execute_tool, "conversation_budget_tokens"
+                            ):
+                                # Priced against the catalogue too. Estimating the
+                                # messages alone leaves the tools array out of the
+                                # prompt, and a big catalogue is enough of it that the
+                                # request can already be near its budget while this still
+                                # reports room for several 500-token chunks.
+                                _spent = estimate_messages_tokens(conversation) + (
+                                    _prompt_token_offset
+                                    if _prompt_token_offset is not None
+                                    else estimate_messages_tokens(safe_tools or [])
+                                )
+                                kwargs["conversation_budget_tokens"] = max(
+                                    0,
+                                    prompt_budget(self._effective_context_length, max_tokens)
+                                    - _spent,
+                                )
                             if accepts_output_callback(execute_tool):
                                 kwargs["output_callback"] = _output_callback
                             return execute_tool(
@@ -21863,7 +22571,7 @@ class LlamaCppBackend:
                             tool_call_id = decision.tool_call_id,
                             cancel_event = cancel_event,
                         )
-                        if decision.tool_name == "search_knowledge_base":
+                        if decision.tool_name in RAG_SEARCH_TOOLS:
                             _kb_search_count += 1
                     completion = tool_controller.record_result(decision, result)
                     resolved_provisional_tool_call_ids.add(decision.tool_call_id)
@@ -21999,6 +22707,96 @@ class LlamaCppBackend:
         # Final streaming pass with the full conversation context.
         from core.inference.chat_template_helpers import neutralize_control_markup_in_messages
 
+        _reasoning_kw = self._request_reasoning_kwargs(
+            enable_thinking, reasoning_effort, preserve_thinking
+        )
+        _final_max_tokens = (
+            max_tokens
+            if max_tokens is not None
+            else (self._effective_context_length or _DEFAULT_MAX_TOKENS_FLOOR)
+        )
+        _final_preflight_context_length = None
+        _final_preflight_succeeded = False
+        if (
+            context_overflow == "truncate_oldest"
+            and self._effective_context_length
+            and not messages_have_media(conversation)
+        ):
+            _final_preflight_context_length = self._effective_context_length
+            try:
+                _before_final_fit = conversation
+                conversation, truncation = fit_rolling_context(
+                    conversation,
+                    context_length = self._effective_context_length,
+                    max_tokens = _final_max_tokens,
+                    count_tokens = lambda fitted: self.count_chat_tokens(
+                        neutralize_control_markup_in_messages(fitted, None, self.markup_profile),
+                        None,
+                        None,
+                        strict = True,
+                        chat_template_kwargs = _reasoning_kw,
+                        should_abort = lambda: bool(cancel_event and cancel_event.is_set()),
+                    ),
+                    protected_message_ids = _rolling_anchor_ids,
+                    reserve_tokens = _conversation_recall_reserve(thread_id),
+                    sticky_dropped = (
+                        0
+                        if _sticky_boundary_applied
+                        else _sticky_compaction_boundary(thread_id, _request_branch)
+                    ),
+                )
+                _sticky_boundary_applied = True
+                if truncation and truncation["fits"]:
+                    _recalled = _archive_and_recall(
+                        conversation,
+                        _before_final_fit,
+                        branch_messages = _request_branch,
+                        thread_id = thread_id,
+                        # Inline, not tool: this final-answer request is counted and sent
+                        # with no tools array at all (the count above passes None), so a
+                        # forged tool_call plus tool role has no catalogue to match and is
+                        # a strict-template hazard.
+                        style = "inline",
+                        recall_done = _conversation_recall_done,
+                        recall_budget_tokens = max(
+                            0,
+                            prompt_budget(self._effective_context_length, max_tokens)
+                            - int(truncation.get("prompt_tokens_after") or 0),
+                        ),
+                        count_tokens = lambda fitted: self.count_chat_tokens(
+                            neutralize_control_markup_in_messages(
+                                fitted, None, self.markup_profile
+                            ),
+                            None,
+                            None,
+                            strict = True,
+                            chat_template_kwargs = _reasoning_kw,
+                        ),
+                    )
+                    conversation = _recalled["conversation"]
+                    truncation = {**truncation, **_recalled["counts"]}
+                    if _recalled["recalled"]:
+                        _conversation_recall_done = True
+                        for _message in _recalled["anchored"]:
+                            _rolling_anchor_ids.add(id(_message))
+                        for _ev in _recalled["events"]:
+                            yield _ev
+                if truncation and truncation.get("fits"):
+                    truncation = {
+                        **truncation,
+                        "boundary_messages": _branch_boundary(conversation, _request_branch),
+                    }
+                # `fits` False too: it carries the diagnosis for a request that cannot
+                # be made to fit, and the client needs it to explain WHY. Without it the
+                # user only sees llama-server's error, which reports the size of the
+                # whole conversation and advises shortening it even when the single
+                # message just sent is the part that does not fit.
+                if truncation:
+                    yield {"type": "context_truncated", **truncation}
+                _final_preflight_succeeded = True
+            except Exception as exc:
+                logger.warning("Could not preflight the rolling context window: %s", exc)
+
         stream_payload = {
             "messages": neutralize_control_markup_in_messages(
                 conversation, None, self.markup_profile
@@ -22011,16 +22809,9 @@ class LlamaCppBackend:
             "repeat_penalty": repetition_penalty,
             "presence_penalty": presence_penalty,
         }
-        _reasoning_kw = self._request_reasoning_kwargs(
-            enable_thinking, reasoning_effort, preserve_thinking
-        )
         if _reasoning_kw is not None:
             stream_payload["chat_template_kwargs"] = _reasoning_kw
-        stream_payload["max_tokens"] = (
-            max_tokens
-            if max_tokens is not None
-            else (self._effective_context_length or _DEFAULT_MAX_TOKENS_FLOOR)
-        )
+        stream_payload["max_tokens"] = _final_max_tokens
         if stop:
             stream_payload["stop"] = stop
         if seed is not None:
@@ -22030,6 +22821,61 @@ class LlamaCppBackend:
         if perf_callback is not None:
             stream_payload["return_progress"] = True
             stream_payload["timings_per_token"] = True
+
+        _final_respawn_truncations: list[dict] = []
+
+        def _refit_final_after_respawn() -> None:
+            nonlocal conversation
+            _before_respawn_fit = conversation
+            if (
+                _final_preflight_context_length is None
+                or not self._effective_context_length
+                or (
+                    _final_preflight_succeeded
+                    and _final_preflight_context_length == self._effective_context_length
+                )
+            ):
+                return
+            if max_tokens is None:
+                stream_payload["max_tokens"] = self._effective_context_length
+            try:
+                conversation, truncation = fit_rolling_context(
+                    conversation,
+                    context_length = self._effective_context_length,
+                    max_tokens = max_tokens,
+                    count_tokens = lambda fitted: self.count_chat_tokens(
+                        neutralize_control_markup_in_messages(fitted, None, self.markup_profile),
+                        None,
+                        None,
+                        strict = True,
+                        chat_template_kwargs = _reasoning_kw,
+                        should_abort = lambda: bool(cancel_event and cancel_event.is_set()),
+                    ),
+                    protected_message_ids = _rolling_anchor_ids,
+                )
+                if truncation and truncation["fits"]:
+                    # Archive only, for the same reason as the iteration refit above.
+                    truncation.update(
+                        _archive_and_recall(
+                            conversation,
+                            _before_respawn_fit,
+                            thread_id = thread_id,
+                            style = "inline",
+                            recall_done = True,
+                            branch_messages = _request_branch,
+                        )["counts"]
+                    )
+                stream_payload["messages"] = neutralize_control_markup_in_messages(
+                    conversation, None, self.markup_profile
+                )
+                if truncation and truncation["fits"]:
+                    truncation["boundary_messages"] = _branch_boundary(
+                        conversation, _request_branch
+                    )
+                    _final_respawn_truncations.append(truncation)
+            except Exception as exc:
+                logger.warning("Could not refit rolling context after respawn: %s", exc)
+                raise
 
         cumulative = ""
         _last_emitted = ""
@@ -22044,10 +22890,16 @@ class LlamaCppBackend:
         _stream_done = False
 
         try:
-            with self._open_chat_stream_with_respawn_retry(stream_payload, cancel_event) as (
+            with self._open_chat_stream_with_respawn_retry(
+                stream_payload,
+                cancel_event,
+                on_respawn = _refit_final_after_respawn,
+            ) as (
                 response,
                 first_token_deadline,
             ):
+                for truncation in _final_respawn_truncations:
+                    yield {"type": "context_truncated", **truncation}
                 buffer = ""
                 for raw_chunk in self._iter_text_cancellable(
                     response,
@@ -22167,6 +23019,7 @@ class LlamaCppBackend:
         tools = None,
         strict: bool = False,
         chat_template_kwargs = None,
+        continue_final_message: bool = False,
         should_abort = None,
     ) -> int:
         """Count prompt tokens for a chat request via llama-server.
@@ -22267,6 +23120,9 @@ class LlamaCppBackend:
                     # Layered over the load-time --chat-template-kwargs: only keys sent here move.
                     if chat_template_kwargs:
                         template_body["chat_template_kwargs"] = chat_template_kwargs
+                    if continue_final_message:
+                        template_body["continue_final_message"] = True
+                        template_body["add_generation_prompt"] = False
                     resp = client.post(
                         f"{self.base_url}/apply-template",
                         json = template_body,

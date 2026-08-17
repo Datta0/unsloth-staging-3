@@ -599,6 +599,8 @@ export interface OpenAIChatCompletionsRequest {
   /** Run the selected tools here rather than as the provider's hosted builtins. */
   run_tools_locally?: boolean;
   nudge_tool_calls?: boolean;
+  /** Local GGUF overflow policy. Rolling mode preserves the transcript but omits oldest turns. */
+  context_overflow?: "error" | "truncate_middle" | "truncate_oldest";
   max_tool_calls_per_message?: number;
   tool_call_timeout?: number;
   session_id?: string;
@@ -672,4 +674,32 @@ export interface OpenAIChatChunk {
     total_tokens: number;
   };
   timings?: Record<string, number>;
+  context_truncated?: {
+    dropped_messages: number;
+    prompt_tokens_before?: number;
+    prompt_tokens_after?: number;
+    context_length?: number;
+    fits: boolean;
+    // Present when the evicted turns were archived and searched. Counts only, never
+    // message text: this rides an SSE chunk that reaches the client.
+    archived_messages?: number;
+    recalled_chunks?: number;
+    // Present only when `fits` is false: what the conversation could not be reduced
+    // below, and how much of that is the message just sent. Between them they say
+    // whether the history or that single message is what does not fit, which decides
+    // whether "shorten the conversation" is useful advice or a dead end.
+    irreducible_tokens?: number;
+    latest_turn_tokens?: number;
+    // Where the compaction boundary sits in the messages THIS request was sent with.
+    // Unlike dropped_messages it is absolute, so re-sending it after a turn that refit
+    // several times cannot advance the boundary past the turns actually evicted.
+    boundary_messages?: number;
+    // Whose message that is. A tool loop refits with the tool result appended, so the
+    // last message is often a tool result rather than anything the user typed.
+    latest_turn_role?: string;
+    // The prompt's share of the window, i.e. context_length minus the reply
+    // reserve. It is what a single turn actually has to fit inside, and the
+    // client must not re-derive it: the reserve formula lives in the fit.
+    prompt_target?: number;
+  };
 }
