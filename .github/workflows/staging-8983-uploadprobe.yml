@@ -1,0 +1,156 @@
+# Disposable staging probe for PR 8983. Not for upstream.
+name: "staging-8983 upload probe"
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}-${{ github.ref == 'refs/heads/main' && github.sha || '' }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  a-upload-with-no-logs:
+    name: "A: failure() upload when no logs exist at all"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail before any smoke wrote anything
+        run: |
+          echo "logs/ does not exist:"
+          ls -la logs 2>&1 || true
+          exit 1
+      - name: Upload browser smoke artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: probe-a-no-logs
+          path: |
+            logs/playwright-*
+            logs/settings_tabs_report.json
+            logs/settings_tabs_blocked_report.json
+          retention-days: 1
+          if-no-files-found: ignore
+
+  b-old-glob-vs-new-path:
+    name: "B: bare glob vs the PR's path, same failing settings smoke"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write exactly what the five smokes write
+        run: |
+          mkdir -p logs/playwright-ansi-smoke logs/playwright-chat-autoscroll
+          echo png > logs/playwright-ansi-smoke/smoke-ansi.png
+          echo json > logs/playwright-chat-autoscroll/report.json
+          echo '{"smoke":"settings"}' > logs/settings_tabs_report.json
+          echo '{"smoke":"settings-blocked"}' > logs/settings_tabs_blocked_report.json
+          find logs -type f | sort
+      - name: The settings smoke fails
+        run: exit 1
+      - name: Upload with the OLD bare glob
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: probe-b-old-glob
+          path: logs/playwright-*
+          retention-days: 1
+          if-no-files-found: ignore
+      - name: Upload with the NEW path
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: probe-b-new-path
+          path: |
+            logs/playwright-*
+            logs/settings_tabs_report.json
+            logs/settings_tabs_blocked_report.json
+          retention-days: 1
+          if-no-files-found: ignore
+
+  b2-inspect:
+    name: "B2: list what each artifact actually contains"
+    needs: b-old-glob-vs-new-path
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53  # v7.0.0
+        with:
+          path: dl
+      - name: Contents
+        run: |
+          for d in dl/*; do
+            echo "=== $d"
+            find "$d" -type f | sort
+          done
+
+  c-continue-on-error-semantics:
+    name: "C: a continue-on-error smoke that fails does not trigger failure()"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - id: pacing
+        name: Browser smoke for chat stream pacing (continue-on-error)
+        continue-on-error: true
+        run: exit 1
+      - name: A later step still runs
+        run: echo "later step ran"
+      - name: outcome vs conclusion
+        run: |
+          echo "outcome=${{ steps.pacing.outcome }}"
+          echo "conclusion=${{ steps.pacing.conclusion }}"
+      - name: Upload browser smoke artifacts (if failure)
+        if: failure()
+        run: echo "FAILURE-UPLOAD RAN"
+      - name: Marker that always runs
+        if: always()
+        run: echo "always marker"
+
+  d-first-failure-skips-the-rest:
+    name: "D: a red smoke with no continue-on-error skips every later step"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Browser smoke for ANSI tool output
+        run: exit 1
+      - name: Browser smoke for chat autoscroll
+        run: echo "autoscroll ran"
+      - name: Build
+        run: echo "build ran"
+      - name: Biome (continue-on-error, still behind the failure)
+        continue-on-error: true
+        run: echo "biome ran"
+      - name: Upload browser smoke artifacts (if failure)
+        if: failure()
+        run: echo "FAILURE-UPLOAD RAN"
+
+  e-job-timeout:
+    name: "E: a smoke killed by the job timeout"
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Smoke that hangs past the job timeout
+        run: |
+          python3 - <<'PY'
+          import sys, time, signal
+          def handler(sig, frame):
+              print(f"[probe] got signal {sig}", flush=True)
+              raise KeyboardInterrupt
+          signal.signal(signal.SIGTERM, handler)
+          signal.signal(signal.SIGINT, handler)
+          print("[probe] entering the try that would run dump()", flush=True)
+          try:
+              time.sleep(600)
+          except Exception:
+              print("[probe] except Exception -> dump() would run here", flush=True)
+              raise
+          except BaseException as exc:
+              print(f"[probe] BaseException {type(exc).__name__} -> dump() would NOT run", flush=True)
+              raise
+          PY
+      - name: Upload browser smoke artifacts (if failure)
+        if: failure()
+        run: echo "FAILURE-UPLOAD RAN"
