@@ -51,7 +51,8 @@ jobs:
           print("password rotated")
           EOF
           BASE_URL=http://127.0.0.1:8888 STUDIO_PW="$NEW_PW" STUDIO_NEW_PW="$NEW_PW" \
-            PW_ART_DIR=logs/playwright_staging python tests/studio/playwright_settings_tabs.py
+            PW_ART_DIR=logs/playwright_staging python tests/studio/playwright_settings_tabs.py \
+              || { echo '--- settings_tabs_report.json ---'; cat logs/settings_tabs_report.json; echo '--- vite/studio tail ---'; tail -60 studio.log; exit 1; }
       - uses: actions/upload-artifact@v4
         if: always()
         with:
