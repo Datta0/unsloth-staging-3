@@ -23,7 +23,7 @@ jobs:
           python -m pip install -U pip
           python -m pip install torch transformers accelerate
           python -m pip install "mlx>=0.22" mlx-lm mlx-vlm
-          python -m pip install fastapi uvicorn structlog pydantic httpx psutil packaging \
+          python -m pip install -r requirements/studio.txt \
             pytest pytest-asyncio pytest-timeout python-multipart
           python -c "import mlx.core, mlx_lm, mlx_vlm; print('mlx stack ok')"
 
