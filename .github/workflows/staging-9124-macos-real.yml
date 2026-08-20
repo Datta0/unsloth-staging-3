@@ -1,0 +1,93 @@
+name: staging-9124 real Apple Silicon overturn
+
+on:
+  push:
+    branches: [pr-9124-xplat-ci]
+  workflow_dispatch:
+
+jobs:
+  apple-silicon-overturn:
+    name: MLX verdict overturn on real Apple Silicon
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the studio backend stack
+        working-directory: studio/backend
+        run: |
+          python -c "import platform; print(platform.system(), platform.machine())"
+          python -m pip install -U pip
+          python -m pip install torch transformers accelerate
+          python -m pip install "mlx>=0.22" mlx-lm mlx-vlm
+          python -m pip install fastapi uvicorn structlog pydantic httpx psutil packaging \
+            pytest pytest-asyncio pytest-timeout python-multipart
+          python -c "import mlx.core, mlx_lm, mlx_vlm; print('mlx stack ok')"
+
+      - name: The PR's own MLX suite, on the platform it targets
+        working-directory: studio/backend
+        run: |
+          python -m pytest tests/test_mlx_repair.py tests/test_mlx_stack_blockers.py \
+            tests/test_health_holds_verdict_during_mlx_repair.py -q -rs
+
+      - name: The real gate -- a raced verdict is overturned by a real stack measurement
+        working-directory: studio/backend
+        run: |
+          python - <<'PY'
+          import sys, threading
+          sys.path.insert(0, ".")
+          import utils.mlx_repair as mr
+          import utils.hardware.hardware as hw
+
+          assert mr.is_apple_silicon(), "not Apple Silicon; this probe proves nothing"
+          blockers = mr.mlx_stack_blockers()
+          print("mlx_stack_blockers():", blockers)
+          assert not blockers, "the runner's MLX stack is genuinely unusable: %s" % (blockers,)
+
+          # Publish the verdict a lost first-import race leaves behind (#9120).
+          settled = threading.Event(); settled.set()
+          hw.DEVICE = hw.DeviceType.CPU
+          hw.CHAT_ONLY = True
+          hw.CHAT_ONLY_REASON = "mlx_unavailable"
+          hw.DETECTION_COMPLETE = settled
+          assert hw.verdict_blames_the_mlx_stack() is True
+
+          # No monkeypatching below this line: the real measurement decides.
+          started = mr.start_mlx_autorepair_if_needed()
+          print("repair thread started:", started)
+          print("after:", hw.DEVICE, "chat_only=", hw.CHAT_ONLY, "reason=", hw.CHAT_ONLY_REASON)
+          assert started is False, "a healthy stack should start no reinstall"
+          assert hw.CHAT_ONLY is False, "the raced verdict was NOT overturned"
+          assert hw.DEVICE is hw.DeviceType.MLX, hw.DEVICE
+          print("OK: Train/Export re-enabled by the post-warm measurement")
+          PY
+
+      - name: The merge base leaves the same verdict wrong
+        run: |
+          git fetch --no-tags --depth=1 https://github.com/unslothai/unsloth.git \
+            a4fa4512140c6fbc4a5043a3ffc812d57261e790
+          git worktree add /tmp/base a4fa4512140c6fbc4a5043a3ffc812d57261e790
+          cd /tmp/base/studio/backend
+          python - <<'PY'
+          import sys, threading
+          sys.path.insert(0, ".")
+          import utils.mlx_repair as mr
+          import utils.hardware.hardware as hw
+
+          assert mr.is_apple_silicon()
+          assert not mr.mlx_stack_blockers()
+          settled = threading.Event(); settled.set()
+          hw.DEVICE = hw.DeviceType.CPU
+          hw.CHAT_ONLY = True
+          hw.CHAT_ONLY_REASON = "mlx_unavailable"
+          hw.DETECTION_COMPLETE = settled
+
+          started = mr.start_mlx_autorepair_if_needed()
+          print("merge base -> started:", started, "chat_only=", hw.CHAT_ONLY,
+                "reason=", hw.CHAT_ONLY_REASON)
+          assert hw.CHAT_ONLY is True, "the merge base already fixed this"
+          print("CONFIRMED: on the merge base the wrong verdict survives the measurement")
+          PY
