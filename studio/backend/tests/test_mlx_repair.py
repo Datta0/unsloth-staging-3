@@ -47,9 +47,16 @@ def test_uv_cmd_targets_this_interpreter_with_mlx_packages(monkeypatch):
     assert cmd is not None
     assert cmd[:5] == ["/usr/bin/uv", "pip", "install", "--python", sys.executable]
     assert set(mr.MLX_PACKAGES) <= set(cmd)
-    # Minimum versions are pinned so the resolver cannot backtrack to an old
-    # mlx-vlm that imports but breaks VLM Train/Export.
-    assert "mlx-vlm>=0.4.4" in cmd
+    # mlx-vlm keeps a floor so the resolver cannot backtrack to an old one that
+    # imports but breaks VLM Train/Export, and a ceiling so this unattended
+    # install cannot cross a major line on its own.
+    assert "mlx-vlm>=0.4.4,<0.7.0" in cmd
+    # Pinned, not floored: see _MLX_INSTALL_SPECS.
+    assert "mlx==0.32.1" in cmd
+    assert "mlx-lm==0.31.3" in cmd
+    assert not [
+        spec for spec in mr.MLX_PACKAGES if spec.startswith("mlx==") and ">=" in spec
+    ], "mlx must not be resolved against a floor"
 
 
 def test_uv_executable_finds_installer_location_when_path_is_minimal(monkeypatch, tmp_path):
@@ -206,6 +213,25 @@ def test_repair_rejects_inadequate_stack(monkeypatch):
     monkeypatch.setattr(mr.subprocess, "run", lambda *a, **k: _Result())
     monkeypatch.setattr(mr, "mlx_stack_available", lambda: False)
     assert mr.attempt_mlx_repair() is False
+
+
+def test_inadequate_stack_warning_names_the_floors_not_the_install_pins(monkeypatch):
+    # The gate this message reports on is mlx_stack_available(), which tests the
+    # floors. Quoting the install pins instead would tell an operator running a
+    # perfectly usable mlx 0.33 that they need exactly 0.32.1.
+    class _Result:
+        returncode = 0
+        stdout = ""
+
+    warnings = []
+    monkeypatch.setattr(mr.subprocess, "run", lambda *a, **k: _Result())
+    monkeypatch.setattr(mr, "mlx_stack_available", lambda: False)
+    monkeypatch.setattr(mr.logger, "warning", lambda msg, *args, **kw: warnings.append(msg % args))
+    assert mr.attempt_mlx_repair() is False
+    (message,) = [w for w in warnings if "incomplete or too-old" in w]
+    for name, floor in mr._MLX_MIN_VERSIONS.items():
+        assert f"{name}>={floor}" in message
+    assert "==" not in message
 
 
 def test_repair_invalidates_import_caches_before_stack_check(monkeypatch):
