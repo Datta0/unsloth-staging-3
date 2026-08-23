@@ -390,6 +390,20 @@ test("a turn whose own fit was refused is never resumed automatically", () => {
   );
 });
 
+test("a turn whose fit only missed the reply reserve is not resumed either", () => {
+  resetAutoContinue();
+  // A rescue reports `fits: false` too, and it is just as unresumable. The rescue branch
+  // is reached only once the eviction loop has run out of eligible turns, so its prompt
+  // is already the floor; the continuation then replays the partial as the final
+  // assistant turn, which the fit protects, asking for MORE prompt against the same
+  // window. Measured on the 460-of-500-token rescue: a 10-character partial already
+  // refuses and an 80-character one overflows the window.
+  assert.equal(
+    shouldAutoContinue("length", "parent-1", { fits: false }),
+    false,
+  );
+});
+
 test("a partial that already fills the budget is not resumed", () => {
   resetAutoContinue();
   // 3,217 tokens of partial against a 3,648-token target left no room for the system turn

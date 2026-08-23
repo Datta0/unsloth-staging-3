@@ -344,8 +344,12 @@ export function shouldAutoContinue(
     return false;
   }
   if (fits === false) {
-    // This turn's own fit was already refused. Resuming re-sends a partial that is only
-    // ever longer, so the next round cannot fit either.
+    // Neither shape of `fits: false` can be resumed. A refusal never fitted at all, and a
+    // rescue is reached only once eviction ran out of eligible turns, so its prompt is
+    // already the floor. Either way nothing is left to evict, while a continuation replays
+    // the partial as the final assistant turn, which the fit protects -- so each round
+    // asks for MORE prompt against the same window. On a 460-of-500-token rescue a
+    // 10-character partial already refuses and an 80-character one overflows.
     return false;
   }
   if (
