@@ -336,6 +336,7 @@ from core.inference.tool_call_parser import (
 from utils.native_path_leases import child_env_without_native_path_secret
 from utils.child_stdio import utf8_child_env
 from utils.hf_xet_fallback import hf_hub_download_with_xet_fallback
+from utils.log_retention import prune_log_dir
 from utils.subprocess_compat import (
     windows_hidden_subprocess_kwargs as _windows_hidden_subprocess_kwargs,
 )
@@ -11137,6 +11138,7 @@ class LlamaCppBackend:
         try:
             log_dir = _swa_cache_path().parent / "logs" / "diffusion-server"
             log_dir.mkdir(parents = True, exist_ok = True)
+            prune_log_dir(log_dir, "diffusion-*.log")
             self._llama_log_path = log_dir / f"diffusion-{int(time.time())}-port-{self._port}.log"
             self._llama_log_fh = open(self._llama_log_path, "w", encoding = "utf-8", buffering = 1)
             logger.info(f"diffusion runner stdout/stderr -> {self._llama_log_path}")
@@ -14955,6 +14957,7 @@ class LlamaCppBackend:
         try:
             log_dir = _swa_cache_path().parent / "logs" / "llama-server"
             log_dir.mkdir(parents = True, exist_ok = True)
+            prune_log_dir(log_dir, "llama-*.log")
             self._llama_log_path = log_dir / f"llama-{int(time.time())}-port-{self._port}.log"
             self._llama_log_fh = open(
                 self._llama_log_path,
@@ -19558,6 +19561,7 @@ class LlamaCppBackend:
                         try:
                             log_dir = _swa_cache_path().parent / "logs" / "llama-server"
                             log_dir.mkdir(parents = True, exist_ok = True)
+                            prune_log_dir(log_dir, "llama-*.log")
                             self._llama_log_path = log_dir / (
                                 f"llama-{int(time.time())}{label}-port-{self._port}"
                                 f"-try{_spawn_attempt}.log"
