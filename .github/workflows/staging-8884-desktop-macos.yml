@@ -1,0 +1,67 @@
+name: "staging-8884 desktop-macos"
+on:
+  push:
+    branches: ["pr-8884-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-8884-desktop-macos.yml'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build macos-aarch64 (unsigned)
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install pinned Tauri CLI
+        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+      - name: Verify pinned Tauri CLI
+        shell: bash
+        run: |
+          out="$(npx --prefix studio tauri --version)"
+          echo "$out"
+          [ "$out" = "tauri-cli 2.10.1" ] || { echo "Expected tauri-cli 2.10.1, got $out" >&2; exit 1; }
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'studio/src-tauri -> target'
+      # The release key is a repo secret this staging repo does not have, and the bundler
+      # prompts (and hangs) when the variable is absent. A throwaway key signs artifacts
+      # nothing will ever verify, which is what an unsigned packaging check wants.
+      - name: Generate a throwaway updater key
+        shell: bash
+        run: |
+          npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/staging.key" -p ''
+          echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/staging.key")" >> "$GITHUB_ENV"
+      - name: Build bundles
+        id: build
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          XDG_CACHE_HOME: ${{ runner.temp }}/tauri-tools-cache
+        with:
+          projectPath: studio
+          tauriScript: npx --prefix . tauri
+          args: -v --target aarch64-apple-darwin
+      - name: List what was produced
+        shell: bash
+        run: |
+          echo '${{ steps.build.outputs.artifactPaths }}'
+          ls -la studio/src-tauri/target/*/release/bundle/*/ 2>/dev/null || \
+            ls -la studio/src-tauri/target/release/bundle/*/ 2>/dev/null || true

@@ -1,0 +1,97 @@
+name: "staging-8884 desktop-linux"
+on:
+  push:
+    branches: ["pr-8884-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-8884-desktop-linux.yml'
+      - '.github/scripts/retry-with-apt-lock.sh'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build linux-x64 (unsigned)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Linux dependencies
+        timeout-minutes: 15
+        env:
+          RETRY_ATTEMPTS: '2'
+          RETRY_ATTEMPT_TIMEOUT: '360'
+        run: |
+          bash .github/scripts/retry-with-apt-lock.sh sudo sh -c \
+            'apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf xdg-utils xvfb gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav || { apt-get update && apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf xdg-utils xvfb gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav; }'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install pinned Tauri CLI
+        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+      - name: Verify pinned Tauri CLI
+        shell: bash
+        run: |
+          out="$(npx --prefix studio tauri --version)"
+          echo "$out"
+          [ "$out" = "tauri-cli 2.10.1" ] || { echo "Expected tauri-cli 2.10.1, got $out" >&2; exit 1; }
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ''
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'studio/src-tauri -> target'
+      # The release key is a repo secret this staging repo does not have, and the bundler
+      # prompts (and hangs) when the variable is absent. A throwaway key signs artifacts
+      # nothing will ever verify, which is what an unsigned packaging check wants.
+      - name: Generate a throwaway updater key
+        shell: bash
+        run: |
+          npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/staging.key" -p ''
+          echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/staging.key")" >> "$GITHUB_ENV"
+      - name: Pin complete AppImage toolchain
+        run: studio/src-tauri/linux/prepare-complete-appimage-tools.sh "$RUNNER_TEMP/tauri-tools-cache/tauri"
+      - name: Build bundles
+        id: build
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          XDG_CACHE_HOME: ${{ runner.temp }}/tauri-tools-cache
+        with:
+          projectPath: studio
+          tauriScript: npx --prefix . tauri
+          args: -v --bundles deb,appimage
+      - name: Verify complete Linux AppImage
+        env:
+          ARTIFACT_PATHS: ${{ steps.build.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          appimage="$(python3 - <<'PY'
+          import json, os, pathlib, sys
+          m = [pathlib.Path(p) for p in json.loads(os.environ['ARTIFACT_PATHS']) if p.endswith('.AppImage')]
+          if len(m) != 1 or not m[0].is_file():
+              sys.exit(f'Expected exactly one AppImage artifact, got {m}')
+          print(m[0])
+          PY
+          )"
+          echo "APPIMAGE=$appimage" >> "$GITHUB_ENV"
+          studio/src-tauri/linux/verify-complete-appimage.sh "$appimage"
+      # Drive the shipped bundle, not the crate: launch the AppImage under four display
+      # fixtures and read the renderer decision back out of its own startup log.
+      - name: Renderer decision in the shipped AppImage
+        run: python3 .github/scripts/renderer_fixtures.py "$APPIMAGE"
+      - name: List what was produced
+        shell: bash
+        run: |
+          echo '${{ steps.build.outputs.artifactPaths }}'
+          ls -la studio/src-tauri/target/*/release/bundle/*/ 2>/dev/null || \
+            ls -la studio/src-tauri/target/release/bundle/*/ 2>/dev/null || true
