@@ -1,0 +1,205 @@
+name: "staging-8884 desktop-linux"
+on:
+  push:
+    branches: ["pr-8884-xplat-ci"]
+    paths:
+      - 'studio/**'
+      - '.github/workflows/staging-8884-desktop-linux.yml'
+      - '.github/scripts/retry-with-apt-lock.sh'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build linux-x64 (unsigned)
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Linux dependencies
+        timeout-minutes: 15
+        env:
+          RETRY_ATTEMPTS: '2'
+          RETRY_ATTEMPT_TIMEOUT: '360'
+        run: |
+          bash .github/scripts/retry-with-apt-lock.sh sudo sh -c \
+            'apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf xdg-utils xvfb weston gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav || { apt-get update && apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev libxdo-dev libssl-dev patchelf xdg-utils xvfb weston gstreamer1.0-plugins-good gstreamer1.0-plugins-bad gstreamer1.0-libav; }'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Install pinned Tauri CLI
+        run: npm install --save-dev --prefix studio @tauri-apps/cli@2.10.1 --no-fund --no-audit
+      - name: Verify pinned Tauri CLI
+        shell: bash
+        run: |
+          out="$(npx --prefix studio tauri --version)"
+          echo "$out"
+          [ "$out" = "tauri-cli 2.10.1" ] || { echo "Expected tauri-cli 2.10.1, got $out" >&2; exit 1; }
+      - name: Install frontend dependencies
+        working-directory: studio/frontend
+        run: npm install --no-fund --no-audit
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ''
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'studio/src-tauri -> target'
+      # The release key is a repo secret this staging repo does not have, and the bundler
+      # prompts (and hangs) when the variable is absent. A throwaway key signs artifacts
+      # nothing will ever verify, which is what an unsigned packaging check wants.
+      - name: Generate a throwaway updater key
+        shell: bash
+        run: |
+          npx --prefix studio tauri signer generate -w "$RUNNER_TEMP/staging.key" -p ''
+          echo "TAURI_SIGNING_PRIVATE_KEY=$(cat "$RUNNER_TEMP/staging.key")" >> "$GITHUB_ENV"
+      - name: Pin complete AppImage toolchain
+        run: studio/src-tauri/linux/prepare-complete-appimage-tools.sh "$RUNNER_TEMP/tauri-tools-cache/tauri"
+      - name: Build bundles
+        id: build
+        uses: tauri-apps/tauri-action@v0
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ''
+          XDG_CACHE_HOME: ${{ runner.temp }}/tauri-tools-cache
+        with:
+          projectPath: studio
+          tauriScript: npx --prefix . tauri
+          args: -v --bundles deb,appimage
+      - name: Verify complete Linux AppImage
+        env:
+          ARTIFACT_PATHS: ${{ steps.build.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          appimage="$(python3 - <<'PY'
+          import json, os, pathlib, sys
+          m = [pathlib.Path(p) for p in json.loads(os.environ['ARTIFACT_PATHS']) if p.endswith('.AppImage')]
+          if len(m) != 1 or not m[0].is_file():
+              sys.exit(f'Expected exactly one AppImage artifact, got {m}')
+          print(m[0])
+          PY
+          )"
+          echo "APPIMAGE=$appimage" >> "$GITHUB_ENV"
+          studio/src-tauri/linux/verify-complete-appimage.sh "$appimage"
+      # Drive the shipped bundle, not the crate: launch the AppImage under four display
+      # fixtures and read the renderer decision back out of its own startup log.
+      - name: Renderer decision in the shipped AppImage
+        run: python3 .github/scripts/renderer_fixtures.py "$APPIMAGE"
+      # The fixtures above prove which variable gets chosen; a bare listening socket is
+      # not a compositor, so they never prove the choice WORKS on Wayland. weston headless
+      # is a real compositor, so this is the first place DISABLE_DMABUF is applied to a
+      # webview on an actual Wayland session rather than to one that fell back to X11.
+      - name: Render the AppImage on a real Wayland session
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/wl"
+          mkdir -p "$XDG_RUNTIME_DIR"; chmod 700 "$XDG_RUNTIME_DIR"
+          # Ubuntu 22.04 ships weston 9/10, which spells the backend as a .so; newer
+          # weston takes the bare name. Try both rather than pin to one distro's spelling.
+          (weston --backend=headless-backend.so --socket=wayland-1 --idle-time=0              > "$RUNNER_TEMP/weston.log" 2>&1 ||            weston --backend=headless --socket=wayland-1 --idle-time=0              > "$RUNNER_TEMP/weston.log" 2>&1) &
+          for i in $(seq 1 30); do [ -S "$XDG_RUNTIME_DIR/wayland-1" ] && break; sleep 1; done
+          if [ ! -S "$XDG_RUNTIME_DIR/wayland-1" ]; then
+            echo "::error::weston never created its socket"; cat "$RUNNER_TEMP/weston.log"; exit 1
+          fi
+          echo "compositor up: $(weston --version)"
+          # GDK_BACKEND=wayland so a failure to open Wayland is a failure, not a silent
+          # fallback to X11 that would make this test pass without testing anything.
+          WAYLAND_DISPLAY=wayland-1 GDK_BACKEND=wayland APPIMAGE_EXTRACT_AND_RUN=1             setsid "$APPIMAGE" > "$RUNNER_TEMP/studio-wayland.log" 2>&1 &
+          app=$!
+          for i in $(seq 1 60); do
+            grep -q "Unsloth desktop app starting" "$RUNNER_TEMP/studio-wayland.log" && break
+            sleep 2
+          done
+          sleep 45
+          alive=no; kill -0 "$app" 2>/dev/null && alive=yes
+          kill -9 -"$app" 2>/dev/null || true
+          echo "=== renderer decision ==="
+          grep "WebKitGTK compatibility" "$RUNNER_TEMP/studio-wayland.log" || echo "(none)"
+          echo "WAYLAND_DISPLAY=wayland-1" >> "$GITHUB_ENV"
+          echo "=== alive after 45s: $alive ==="
+          tail -40 "$RUNNER_TEMP/studio-wayland.log"
+          grep -q "Wayland session" "$RUNNER_TEMP/studio-wayland.log" || {
+            echo "::error::the app did not classify this as a Wayland session"; exit 1; }
+          [ "$alive" = yes ] || { echo "::error::the app died on a real Wayland session"; exit 1; }
+      # The poll oracle needs a SUPERVISED backend, and a GitHub runner has no Studio
+      # Python stack at all: preflight reports NotInstalled / port=None, so neither
+      # /api/inference/monitor nor /api/liveness exists to be counted. A freeze probe here
+      # could only ever return NO SIGNAL, and a step that cannot pass makes the whole run
+      # red for an unfixable reason. Freeze measurement belongs on a host with Studio
+      # installed; what this runner is genuinely good for is the step below, which checks
+      # the reporter script survives a machine that is nothing like a developer's.
+      - name: Fetch the released AppImage for the script check
+        run: |
+          set -euo pipefail
+          curl -fsSL -o "$RUNNER_TEMP/released.AppImage"             https://github.com/unslothai/unsloth/releases/download/v0.1.801-beta/Unsloth-Desktop-0_1_801_beta-Linux.AppImage
+          chmod +x "$RUNNER_TEMP/released.AppImage"
+      # The reporter is going to be asked to run this on their own machine, so it has to
+      # survive a host that is nothing like a developer's: no NVIDIA, no nvidia-smi, no
+      # installed Studio stack. This runner is exactly that host, which makes it the right
+      # place to prove the script does not crash and writes a usable report. It CANNOT
+      # validate freeze detection here, because with no backend installed neither poll loop
+      # exists; the script is expected to say NO SIGNAL and explain why, and that expected
+      # exit 1 is why this step tolerates it.
+      - name: Reporter freeze-report script runs end to end
+        run: |
+          set -euo pipefail
+          export XDG_RUNTIME_DIR="$RUNNER_TEMP/wl"
+          export WAYLAND_DISPLAY=wayland-1 GDK_BACKEND=wayland
+          export UNSLOTH_FREEZE_WARMUP=20 UNSLOTH_FREEZE_WINDOW=25
+          cd "$RUNNER_TEMP"
+          # 1. Refusal. With no Desktop anywhere and no argument, the script must STOP and
+          #    say so. It used to fall back to `unsloth studio`, which is the pip CLI and a
+          #    different program from the one that freezes, and a reporter's whole run was
+          #    spent measuring it.
+          set +e
+          python3 "$GITHUB_WORKSPACE/.github/scripts/unsloth_freeze_report.py" > refuse.txt 2>&1
+          refuse_rc=$?
+          set -e
+          echo "--- refusal path (expect rc=2) ---"; cat refuse.txt
+          [ "$refuse_rc" = 2 ] || { echo "::error::expected rc=2 with no Desktop present"; exit 1; }
+          grep -q "Could not find Unsloth Desktop" refuse.txt || {
+            echo "::error::refusal did not name the problem"; exit 1; }
+          grep -q "unsloth studio" refuse.txt || {
+            echo "::error::refusal must warn that the CLI is a different program"; exit 1; }
+          # 2. Auto-detection, which is what a reporter actually hits. Put the AppImage
+          #    where one would have it and run with NO argument.
+          mkdir -p "$HOME/Applications"
+          cp "$RUNNER_TEMP/released.AppImage" "$HOME/Applications/Unsloth-Desktop.AppImage"
+          set +e
+          python3 "$GITHUB_WORKSPACE/.github/scripts/unsloth_freeze_report.py"
+          rc=$?
+          set -e
+          echo "script exit: $rc (1 is expected here: no backend to observe)"
+          report="$(ls -1 unsloth-freeze-report-*.json 2>/dev/null | head -1 || true)"
+          [ -n "$report" ] || { echo "::error::the script wrote no report"; exit 1; }
+          python3 - "$report" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          res, host = d["results"], d["host"]
+          assert len(res) == 4, f"expected 4 candidates, got {len(res)}"
+          assert host["session_type"] or host["gpus"] is not None
+          # The scrubber has to work on a machine whose paths are not the author's.
+          blob = json.dumps(d)
+          assert "/home/runner" not in blob, "home path leaked into the report"
+          for r in res:
+              print(f"  {r['candidate']:36} {r['verdict'][:60]}")
+          print("report shape ok")
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: wayland-logs-8884
+          path: |
+            ${{ runner.temp }}/weston.log
+            ${{ runner.temp }}/studio-wayland.log
+            ~/.unsloth/studio/tauri.log*
+      - name: List what was produced
+        shell: bash
+        run: |
+          echo '${{ steps.build.outputs.artifactPaths }}'
+          ls -la studio/src-tauri/target/*/release/bundle/*/ 2>/dev/null || \
+            ls -la studio/src-tauri/target/release/bundle/*/ 2>/dev/null || true
