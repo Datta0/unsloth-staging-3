@@ -11,10 +11,12 @@ from .path_utils import (
     resolve_cached_repo_id_case,
     get_cache_case_resolution_stats,
     reset_cache_case_resolution_state,
+    reveal_in_file_manager,
 )
 from .storage_roots import (
     studio_root,
     assets_root,
+    dataset_files_in_dir,
     datasets_root,
     dataset_uploads_root,
     recipe_datasets_root,
@@ -41,15 +43,17 @@ from .storage_roots import (
     ensure_dir,
     ensure_studio_directories,
     resolve_under_root,
+    default_run_dir_name,
     resolve_output_dir,
     resolve_export_dir,
+    resolve_export_write_dir,
     resolve_tensorboard_dir,
     resolve_dataset_path,
 )
 
 # Re-export shim: mark project-path helpers as used so the import-hoist
 # safety net does not flag them as unused.
-_REEXPORTED = (documents_root, project_workspaces_root)
+_REEXPORTED = (documents_root, project_workspaces_root, resolve_export_write_dir)
 
 __all__ = [
     "normalize_path",
@@ -59,8 +63,10 @@ __all__ = [
     "resolve_cached_repo_id_case",
     "get_cache_case_resolution_stats",
     "reset_cache_case_resolution_state",
+    "reveal_in_file_manager",
     "studio_root",
     "assets_root",
+    "dataset_files_in_dir",
     "datasets_root",
     "dataset_uploads_root",
     "recipe_datasets_root",
@@ -87,8 +93,10 @@ __all__ = [
     "ensure_dir",
     "ensure_studio_directories",
     "resolve_under_root",
+    "default_run_dir_name",
     "resolve_output_dir",
     "resolve_export_dir",
+    "resolve_export_write_dir",
     "resolve_tensorboard_dir",
     "resolve_dataset_path",
 ]

@@ -8,8 +8,13 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { ToolCallSpinner } from "@/components/assistant-ui/tool-call-spinner";
+import { Spinner } from "@/components/ui/spinner";
 import { useCollapseScrollLock } from "@/hooks/use-collapse-scroll-lock";
+import {
+  formatMcpToolName,
+  mcpServerFromProvenance,
+} from "@/features/chat/utils/mcp-tool-name";
+import { stripAnsi, stringifyToolResult } from "@/lib/strip-ansi";
 import { cn } from "@/lib/utils";
 import {
   type ToolCallMessagePartComponent,
@@ -17,11 +22,12 @@ import {
 } from "@assistant-ui/react";
 import {
   AlertCircleIcon,
-  CheckIcon,
   ChevronDownIcon,
   LoaderIcon,
   XCircleIcon,
 } from "lucide-react";
+import { Tick02Icon } from "@/lib/tick-icon";
+import { HugeiconsIcon } from "@hugeicons/react";
 import {
   type CSSProperties,
   type ComponentProps,
@@ -95,31 +101,29 @@ function ToolFallbackRoot({
 
 type ToolStatus = ToolCallMessagePartStatus["type"];
 
+// The shared app tick is icon data, not a component; wrap it to slot into the
+// status map alongside the lucide icons.
+function CompleteTickIcon(props: Omit<ComponentProps<typeof HugeiconsIcon>, "icon">) {
+  return <HugeiconsIcon icon={Tick02Icon} strokeWidth={2} {...props} />;
+}
+
 const statusIconMap: Record<ToolStatus, ElementType> = {
   running: LoaderIcon,
-  complete: CheckIcon,
+  complete: CompleteTickIcon,
   incomplete: XCircleIcon,
   "requires-action": AlertCircleIcon,
 };
 
-const MCP_TOOL_PREFIX = "mcp__";
-
-function formatToolNameForDisplay(toolName: string): string {
-  if (!toolName.startsWith(MCP_TOOL_PREFIX)) return toolName;
-  const rest = toolName.slice(MCP_TOOL_PREFIX.length);
-  const sep = rest.indexOf("__");
-  if (sep <= 0) return toolName;
-  return `${rest.slice(0, sep)} · ${rest.slice(sep + 2)}`;
-}
-
 function ToolFallbackTrigger({
   toolName,
+  mcpServer,
   status,
   icon: ToolIcon,
   className,
   ...props
 }: ComponentProps<typeof CollapsibleTrigger> & {
   toolName: string;
+  mcpServer?: string;
   status?: ToolCallMessagePartStatus;
   icon?: ElementType;
 }) {
@@ -130,7 +134,7 @@ function ToolFallbackTrigger({
 
   const StatusIcon = statusIconMap[statusType];
   const label = isCancelled ? "Cancelled tool" : "Used tool";
-  const displayName = formatToolNameForDisplay(toolName);
+  const displayName = formatMcpToolName(toolName, mcpServer) ?? toolName;
 
   return (
     <CollapsibleTrigger
@@ -142,7 +146,7 @@ function ToolFallbackTrigger({
       {...props}
     >
       {isRunning ? (
-        <ToolCallSpinner className="aui-tool-fallback-trigger-icon" />
+        <Spinner className="aui-tool-fallback-trigger-icon" />
       ) : ToolIcon ? (
         <ToolIcon
           data-slot="tool-fallback-trigger-icon"
@@ -253,6 +257,30 @@ function ToolFallbackArgs({
   );
 }
 
+interface McpImageResult {
+  text: string;
+  images: { data: string; mimeType: string }[];
+}
+
+function isMcpImageResult(val: unknown): val is McpImageResult {
+  if (typeof val !== "object" || val === null) {
+    return false;
+  }
+  const v = val as { text?: unknown; images?: unknown };
+  return (
+    typeof v.text === "string" &&
+    Array.isArray(v.images) &&
+    v.images.length > 0 &&
+    v.images.every(
+      (img: unknown) =>
+        typeof img === "object" &&
+        img !== null &&
+        typeof (img as { data?: unknown }).data === "string" &&
+        typeof (img as { mimeType?: unknown }).mimeType === "string",
+    )
+  );
+}
+
 function ToolFallbackResult({
   result,
   className,
@@ -264,6 +292,12 @@ function ToolFallbackResult({
     return null;
   }
 
+  const imageResult = isMcpImageResult(result) ? result : null;
+  // Colourised CLIs (ls --color, grep --color, npm, cargo, pytest) emit SGR
+  // escapes that a plain <pre> cannot style; strip them so the pane stays
+  // readable (#7962).
+  const resultText = imageResult ? null : stringifyToolResult(result);
+
   return (
     <div
       data-slot="tool-fallback-result"
@@ -271,9 +305,30 @@ function ToolFallbackResult({
       {...props}
     >
       <p className="aui-tool-fallback-result-header font-semibold">Result:</p>
-      <pre className="aui-tool-fallback-result-content whitespace-pre-wrap">
-        {typeof result === "string" ? result : JSON.stringify(result, null, 2)}
-      </pre>
+      {imageResult ? (
+        <>
+          {imageResult.text && (
+            <pre className="aui-tool-fallback-result-content whitespace-pre-wrap">
+              {stripAnsi(imageResult.text)}
+            </pre>
+          )}
+          <div className="mt-2 flex flex-col gap-2">
+            {imageResult.images.map((img, i) => (
+              <img
+                key={i}
+                src={`data:${img.mimeType};base64,${img.data}`}
+                alt={`Tool result ${i + 1}`}
+                loading="lazy"
+                className="max-w-full rounded border border-border"
+              />
+            ))}
+          </div>
+        </>
+      ) : (
+        <pre className="aui-tool-fallback-result-content whitespace-pre-wrap">
+          {resultText}
+        </pre>
+      )}
     </div>
   );
 }
@@ -324,13 +379,24 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = ({
   argsText,
   result,
   status,
+  ...rest
 }) => {
+  // Allow/Deny confirmation controls are rendered uniformly for every tool
+  // card (built-in and fallback) by the `withToolConfirmation` wrapper in
+  // thread.tsx, so this renderer stays purely presentational.
+  const mcpServer = mcpServerFromProvenance(
+    (rest as { provenance?: unknown }).provenance,
+  );
   const isCancelled =
     status?.type === "incomplete" && status.reason === "cancelled";
 
   return (
     <ToolFallbackRoot className={cn(isCancelled && "bg-muted/30")}>
-      <ToolFallbackTrigger toolName={toolName} status={status} />
+      <ToolFallbackTrigger
+        toolName={toolName}
+        mcpServer={mcpServer}
+        status={status}
+      />
       <ToolFallbackContent>
         <ToolFallbackError status={status} />
         <ToolFallbackArgs
