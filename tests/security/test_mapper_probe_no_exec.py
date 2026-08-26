@@ -28,7 +28,10 @@ from unsloth.models import loader_utils
 from unsloth.models.mapper import build_mappers
 
 
-REAL_MAPPER = open(__import__("pathlib").Path(loader_utils.__file__).with_name("mapper.py")).read()
+REAL_MAPPER = open(
+    __import__("pathlib").Path(loader_utils.__file__).with_name("mapper.py"),
+    encoding = "utf-8",
+).read()
 
 
 class _Response:

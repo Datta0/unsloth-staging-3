@@ -27,7 +27,7 @@ import pytest
 from unsloth.models._custom_dtype import register_custom_dtype, trusted_custom_dtype
 
 
-LOADER = pathlib.Path(__import__("unsloth.models.loader", fromlist = ["x"]).__file__).read_text()
+LOADER = pathlib.Path(__import__("unsloth.models.loader", fromlist = ["x"]).__file__).read_text(encoding = "utf-8")
 
 
 def _shipped_values() -> list[str]:
@@ -64,7 +64,7 @@ def test_zoo_reader_still_parses_what_unsloth_writes():
     """
     import unsloth_zoo.compiler as zoo_compiler
 
-    source = pathlib.Path(zoo_compiler.__file__).read_text()
+    source = pathlib.Path(zoo_compiler.__file__).read_text(encoding = "utf-8")
     assert (
         'custom_datatype.count(";") >= 4' in source
     ), "unsloth_zoo changed how it validates UNSLOTH_FORCE_CUSTOM_DTYPE"
@@ -117,7 +117,7 @@ def test_unset_variable_leaves_custom_datatype_as_none():
     """
     import unsloth.models.vision as vision
 
-    source = pathlib.Path(vision.__file__).read_text()
+    source = pathlib.Path(vision.__file__).read_text(encoding = "utf-8")
     bound = set()
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Assign):
