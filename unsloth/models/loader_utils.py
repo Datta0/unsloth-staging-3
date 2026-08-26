@@ -39,8 +39,8 @@ from .mapper import (
 # the two literal strings out of the AST and applies them with these, so the fetched
 # text never supplies behaviour.
 _MAPPER_HELPERS = {
-    "_add_with_lower" : _add_with_lower,
-    "_add_lower_only" : _add_lower_only,
+    "_add_with_lower": _add_with_lower,
+    "_add_lower_only": _add_lower_only,
 }
 
 # https://github.com/huggingface/transformers/pull/26037 allows 4 bit loading!
@@ -567,19 +567,22 @@ def _get_new_mapper():
         # like everything else here: literal subscript, literal value, nothing named or
         # called is ever evaluated.
         by_name = {
-            "INT_TO_FLOAT_MAPPER"       : tables[0],
-            "FLOAT_TO_INT_MAPPER"       : tables[1],
-            "MAP_TO_UNSLOTH_16bit"      : tables[2],
-            "FLOAT_TO_FP8_BLOCK_MAPPER" : tables[3],
-            "FLOAT_TO_FP8_ROW_MAPPER"   : tables[4],
+            "INT_TO_FLOAT_MAPPER": tables[0],
+            "FLOAT_TO_INT_MAPPER": tables[1],
+            "MAP_TO_UNSLOTH_16bit": tables[2],
+            "FLOAT_TO_FP8_BLOCK_MAPPER": tables[3],
+            "FLOAT_TO_FP8_ROW_MAPPER": tables[4],
         }
         for node in ast.walk(tree):
             if isinstance(node, ast.Assign):
                 for target in node.targets:
-                    if not isinstance(target, ast.Subscript): continue
-                    if not isinstance(target.value, ast.Name): continue
+                    if not isinstance(target, ast.Subscript):
+                        continue
+                    if not isinstance(target.value, ast.Name):
+                        continue
                     table = by_name.get(target.value.id)
-                    if table is None: continue
+                    if table is None:
+                        continue
                     try:
                         table[ast.literal_eval(target.slice)] = ast.literal_eval(node.value)
                     except ValueError:
@@ -597,11 +600,14 @@ def _get_new_mapper():
                 # literal arguments only, so the fetched text still supplies nothing but
                 # data.
                 helper = _MAPPER_HELPERS.get(node.func.id)
-                if helper is None or len(node.args) != 3: continue
+                if helper is None or len(node.args) != 3:
+                    continue
                 destination, key, value = node.args
-                if not isinstance(destination, ast.Name): continue
+                if not isinstance(destination, ast.Name):
+                    continue
                 table = by_name.get(destination.id)
-                if table is None: continue
+                if table is None:
+                    continue
                 try:
                     helper(table, ast.literal_eval(key), ast.literal_eval(value))
                 except ValueError:

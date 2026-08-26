@@ -36,7 +36,9 @@ from unsloth.models._custom_dtype import (
 )
 
 
-LOADER = pathlib.Path(__import__("unsloth.models.loader", fromlist = ["x"]).__file__).read_text(encoding = "utf-8")
+LOADER = pathlib.Path(__import__("unsloth.models.loader", fromlist = ["x"]).__file__).read_text(
+    encoding = "utf-8"
+)
 
 
 def _shipped_values():
@@ -154,7 +156,9 @@ def test_unset_is_empty(monkeypatch):
 
 
 def test_vision_does_not_eval_the_dtype_fields():
-    source = pathlib.Path(__import__("unsloth.models.vision", fromlist = ["x"]).__file__).read_text(encoding = "utf-8")
+    source = pathlib.Path(__import__("unsloth.models.vision", fromlist = ["x"]).__file__).read_text(
+        encoding = "utf-8"
+    )
     assert "eval(_dtype)" not in source
     assert "eval(_bnb_compute_dtype)" not in source
     # The remaining exec is the code field, and it is gated.

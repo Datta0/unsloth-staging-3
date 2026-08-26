@@ -45,7 +45,6 @@ _ROW_ONLY = "zeta-org/Zeta-9B-Row-Only-FP8"
 def _loader_utils_globals():
     """The real loader_utils module globals, for anything the stand-in needs verbatim."""
     import unsloth.models.loader_utils as loader_utils
-
     return vars(loader_utils)
 
 

@@ -69,8 +69,10 @@ def test_live_tree_passes():
             'compile(source = f"y = {x}", filename = "<x>", mode = "exec")',
             "compile source= keyword",
         ),
-        ('builtins.compile(source = f"y = {x}", filename = "<x>", mode = "exec")',
-         "builtins.compile source= keyword"),
+        (
+            'builtins.compile(source = f"y = {x}", filename = "<x>", mode = "exec")',
+            "builtins.compile source= keyword",
+        ),
     ],
 )
 def test_a_new_interpolated_call_fails(body, description, tmp_path):
@@ -92,7 +94,7 @@ def test_a_new_interpolated_call_fails(body, description, tmp_path):
         # sink call carrying no source at all, both stay quiet.
         'compile(source = "literal", filename = "<x>", mode = "exec")',
         'compile(filename = "<x>", mode = "exec")',
-        'exec(**kwargs)',
+        "exec(**kwargs)",
     ],
 )
 def test_non_interpolated_calls_are_not_flagged(body, tmp_path):

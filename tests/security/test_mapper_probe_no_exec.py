@@ -116,9 +116,7 @@ def test_probe_does_not_call_exec_or_eval(no_dynamic_execution, monkeypatch):
     """
     with _serving(REAL_MAPPER, monkeypatch):
         result = loader_utils._get_new_mapper()
-    assert no_dynamic_execution == [], (
-        f"the probe reached {no_dynamic_execution}"
-    )
+    assert no_dynamic_execution == [], f"the probe reached {no_dynamic_execution}"
     # And it still did the work, rather than falling into the except and returning
     # empties, which is the other way this test could pass for the wrong reason.
     assert len(result) == 5

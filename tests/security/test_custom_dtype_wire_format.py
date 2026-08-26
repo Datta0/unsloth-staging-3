@@ -27,7 +27,9 @@ import pytest
 from unsloth.models._custom_dtype import register_custom_dtype, trusted_custom_dtype
 
 
-LOADER = pathlib.Path(__import__("unsloth.models.loader", fromlist = ["x"]).__file__).read_text(encoding = "utf-8")
+LOADER = pathlib.Path(__import__("unsloth.models.loader", fromlist = ["x"]).__file__).read_text(
+    encoding = "utf-8"
+)
 
 
 def _shipped_values() -> list[str]:

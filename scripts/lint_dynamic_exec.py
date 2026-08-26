@@ -49,7 +49,12 @@ ALLOWLIST_PATH = Path(__file__).resolve().parent / "dynamic_exec_allowlist.json"
 # already cover; leaving it out meant an interpolated call added there was never
 # visited by the security gate at all.
 DEFAULT_TARGETS = (
-    "unsloth", "studio", "unsloth_cli", "scripts", "cli.py", "unsloth-cli.py",
+    "unsloth",
+    "studio",
+    "unsloth_cli",
+    "scripts",
+    "cli.py",
+    "unsloth-cli.py",
 )
 
 
@@ -279,7 +284,8 @@ def collect_paths(targets: list[str]) -> list[Path]:
             # `is_file()` on each hit, so a directory named `foo.py` and a symlink that
             # points at one are skipped rather than read.
             paths.extend(
-                p for p in root.rglob("*.py")
+                p
+                for p in root.rglob("*.py")
                 if p.is_file() and "tests" not in _exclusion_parts(p, root)
             )
     return paths
@@ -394,9 +400,14 @@ def self_test() -> int:
         findings = scan_file(bad)
         kinds = sorted(f["reason"] for f in findings)
         expected = [
-            "%-format", ".format()", ".format_map()",
-            "f-string", "f-string", "f-string",
-            "f-string via `annotated`", "string concatenation",
+            "%-format",
+            ".format()",
+            ".format_map()",
+            "f-string",
+            "f-string",
+            "f-string",
+            "f-string via `annotated`",
+            "string concatenation",
         ]
         if kinds != expected:
             failures.append(f"expected {expected}, got {kinds}")
@@ -427,9 +438,7 @@ def self_test() -> int:
         # An AST too deep to walk must fail the gate, not report the file clean.
         deep = Path(directory) / "deep.py"
         deep.write_text(
-            "def f(user):\n"
-            "    x = " + "not " * 500 + "True\n"
-            '    exec(f"import {user}")\n'
+            "def f(user):\n    x = " + "not " * 500 + "True\n" '    exec(f"import {user}")\n'
         )
         try:
             scan_file(deep)
@@ -482,7 +491,10 @@ def main() -> int:
         if errors:
             for error in errors:
                 print(f"scan error: {error}", file = sys.stderr)
-            print("\nFAIL: refusing to rewrite the allowlist from an incomplete scan.", file = sys.stderr)
+            print(
+                "\nFAIL: refusing to rewrite the allowlist from an incomplete scan.",
+                file = sys.stderr,
+            )
             return 1
         write_allowlist(findings, reason = "REVIEW ME")
         print(f"wrote {len(findings)} entries to {ALLOWLIST_PATH.name}")
