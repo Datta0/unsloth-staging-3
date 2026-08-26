@@ -30,7 +30,18 @@ from .mapper import (
     FLOAT_TO_FP8_BLOCK_MAPPER,
     FLOAT_TO_FP8_ROW_MAPPER,
     build_mappers,
+    _add_with_lower,
+    _add_lower_only,
 )
+
+# The alias helpers a fetched mapper.py may call, resolved to the INSTALLED
+# implementations. `_get_new_mapper` reads such calls as data: it takes the table and
+# the two literal strings out of the AST and applies them with these, so the fetched
+# text never supplies behaviour.
+_MAPPER_HELPERS = {
+    "_add_with_lower" : _add_with_lower,
+    "_add_lower_only" : _add_lower_only,
+}
 
 # https://github.com/huggingface/transformers/pull/26037 allows 4 bit loading!
 from transformers import __version__ as transformers_version
@@ -555,27 +566,45 @@ def _get_new_mapper():
         # dropping them would quietly take the row half of the probe down. They are data
         # like everything else here: literal subscript, literal value, nothing named or
         # called is ever evaluated.
-        fp8_tables = {
-            "FLOAT_TO_FP8_BLOCK_MAPPER": tables[3],
-            "FLOAT_TO_FP8_ROW_MAPPER": tables[4],
+        by_name = {
+            "INT_TO_FLOAT_MAPPER"       : tables[0],
+            "FLOAT_TO_INT_MAPPER"       : tables[1],
+            "MAP_TO_UNSLOTH_16bit"      : tables[2],
+            "FLOAT_TO_FP8_BLOCK_MAPPER" : tables[3],
+            "FLOAT_TO_FP8_ROW_MAPPER"   : tables[4],
         }
-        for node in tree.body:
-            if not isinstance(node, ast.Assign):
-                continue
-            for target in node.targets:
-                if not isinstance(target, ast.Subscript):
-                    continue
-                if not isinstance(target.value, ast.Name):
-                    continue
-                table = fp8_tables.get(target.value.id)
-                if table is None:
-                    continue
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if not isinstance(target, ast.Subscript): continue
+                    if not isinstance(target.value, ast.Name): continue
+                    table = by_name.get(target.value.id)
+                    if table is None: continue
+                    try:
+                        table[ast.literal_eval(target.slice)] = ast.literal_eval(node.value)
+                    except ValueError:
+                        # Not a literal, so not data we can read. Skip it rather than
+                        # failing the whole probe.
+                        continue
+                pass
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                # `_add_with_lower(MAP_TO_UNSLOTH_16bit, "vendor/X", "unsloth/X")` is the
+                # established way mapper.py records an alias that is not derivable from
+                # the source table, and there are two in the shipped file today. Running
+                # the INSTALLED builder alone would silently miss any new one, so an
+                # older install would stop offering the upgrade notice for exactly the
+                # models main had just added. Apply them with the installed helper, from
+                # literal arguments only, so the fetched text still supplies nothing but
+                # data.
+                helper = _MAPPER_HELPERS.get(node.func.id)
+                if helper is None or len(node.args) != 3: continue
+                destination, key, value = node.args
+                if not isinstance(destination, ast.Name): continue
+                table = by_name.get(destination.id)
+                if table is None: continue
                 try:
-                    key = ast.literal_eval(target.slice)
-                    table[key] = ast.literal_eval(node.value)
+                    helper(table, ast.literal_eval(key), ast.literal_eval(value))
                 except ValueError:
-                    # Not a literal, so not data we can read. Skip it rather than
-                    # failing the whole probe.
                     continue
             pass
         pass

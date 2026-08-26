@@ -20,6 +20,14 @@
     {
       "path": "unsloth/models/_utils.py",
       "qualname": "<module>",
+      "sink": "eval",
+      "kind": "f-string via `config_filename`",
+      "hash": "6f65bd10ad34f535",
+      "reason": "`config_filename` is built from `model_architectures`, a hardcoded list of 9 names literal in this file (line 2059). No downloaded or user value reaches it, and the whole loop is skipped on transformers >= 5.0.0."
+    },
+    {
+      "path": "unsloth/models/_utils.py",
+      "qualname": "<module>",
       "sink": "exec",
       "kind": "f-string",
       "hash": "73395828db366a08",
@@ -200,6 +208,14 @@
       "kind": "f-string",
       "hash": "ffde228dbcc08d6e",
       "reason": "`trainer_file` comes from dir(trl.trainer) filtered to lowercase names ending in '_trainer'; RLTrainer_name / RLConfig_name come from dir() of that module filtered to names ending in 'Trainer' / 'Config'; config_module_name is trainer_file with '_trainer' replaced by '_config'. All names of the installed TRL, none from user input or a downloaded artifact."
+    },
+    {
+      "path": "unsloth/save.py",
+      "qualname": "patch_saving_functions",
+      "sink": "exec",
+      "kind": "f-string via `push_to_hub_text`",
+      "hash": "a2cfaff818bc9d0a",
+      "reason": "`push_to_hub_text` is a template built from `inspect.signature` and `__doc__` of the INSTALLED push_to_hub. Self-generated source, same category as the other compiler sites: nothing downloaded or user supplied is interpolated."
     },
     {
       "path": "unsloth/save.py",

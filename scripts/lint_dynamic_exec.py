@@ -45,7 +45,12 @@ ALLOWLIST_PATH = Path(__file__).resolve().parent / "dynamic_exec_allowlist.json"
 
 # Directories scanned by default. Tests are excluded: they legitimately keep the
 # removed exec/eval around as an oracle to prove the replacement matches it.
-DEFAULT_TARGETS = ("unsloth", "studio", "unsloth_cli", "scripts", "cli.py")
+# `unsloth-cli.py` is a tracked entrypoint that the adjacent compile and ruff steps
+# already cover; leaving it out meant an interpolated call added there was never
+# visited by the security gate at all.
+DEFAULT_TARGETS = (
+    "unsloth", "studio", "unsloth_cli", "scripts", "cli.py", "unsloth-cli.py",
+)
 
 
 def _relative(path: Path) -> str:
@@ -79,34 +84,75 @@ def _is_interpolated(node: ast.AST) -> str | None:
     return None
 
 
+def _sink_name(function: ast.AST) -> str | None:
+    """The sink this call target names, if any.
+
+    Both `exec(...)` and `builtins.exec(...)` execute. Matching only `ast.Name` meant
+    the second form passed the lint with zero findings.
+    """
+    if isinstance(function, ast.Name) and function.id in SINKS:
+        return function.id
+    if isinstance(function, ast.Attribute) and function.attr in SINKS:
+        if isinstance(function.value, ast.Name) and function.value.id == "builtins":
+            return f"builtins.{function.attr}"
+    return None
+
+
 class _Visitor(ast.NodeVisitor):
     def __init__(self, path: Path):
         self.path = path
         self.scope: list[str] = []
         self.findings: list[dict] = []
+        # name -> reason, for locals bound to a built string in the current scope.
+        self.tainted: list[dict[str, str]] = [{}]
 
     def _qualname(self) -> str:
         return ".".join(self.scope) if self.scope else "<module>"
 
     def _enter(self, node):
         self.scope.append(node.name)
+        # A fresh scope: a name built in one function says nothing about the same name
+        # in another.
+        self.tainted.append({})
         self.generic_visit(node)
+        self.tainted.pop()
         self.scope.pop()
 
     visit_FunctionDef = _enter
     visit_AsyncFunctionDef = _enter
     visit_ClassDef = _enter
 
+    def visit_Assign(self, node: ast.Assign):
+        """Tracks `payload = f"...{x}..."` so `exec(payload)` is still caught.
+
+        One level of local indirection, which is all it took to defeat the previous
+        version: moving the interpolation onto the line above is a two-line refactor
+        that leaves the vulnerability shape exactly as it was. Rebinding a tracked name
+        to something that is not a built string clears it, so this does not accumulate
+        false positives.
+        """
+        reason = _is_interpolated(node.value)
+        for target in node.targets:
+            if not isinstance(target, ast.Name): continue
+            if reason is None:
+                self.tainted[-1].pop(target.id, None)
+            else:
+                self.tainted[-1][target.id] = f"{reason} via `{target.id}`"
+        self.generic_visit(node)
+
     def visit_Call(self, node: ast.Call):
-        function = node.func
-        if isinstance(function, ast.Name) and function.id in SINKS and node.args:
-            reason = _is_interpolated(node.args[0])
+        sink = _sink_name(node.func)
+        if sink is not None and node.args:
+            argument = node.args[0]
+            reason = _is_interpolated(argument)
+            if reason is None and isinstance(argument, ast.Name):
+                reason = self.tainted[-1].get(argument.id)
             if reason is not None:
                 self.findings.append(
                     {
                         "path": _relative(self.path),
                         "qualname": self._qualname(),
-                        "sink": function.id,
+                        "sink": sink,
                         "reason": reason,
                         "line": node.lineno,
                         "hash": _call_hash(node),
@@ -161,11 +207,19 @@ def load_allowlist() -> dict[str, dict]:
     if not ALLOWLIST_PATH.exists():
         return {}
     data = json.loads(ALLOWLIST_PATH.read_text())
-    return {entry["hash"]: entry for entry in data.get("allowed", [])}
+    return {key_of(entry): entry for entry in data.get("allowed", [])}
 
 
 def key_of(finding: dict) -> str:
-    return finding["hash"]
+    """Identity of a reviewed call: where it is, and what it is.
+
+    The hash alone is not an identity. Two different call sites with byte-identical
+    source share a hash, so approving one approved the other, and copying an
+    allowlisted call into a function with attacker-controlled inputs inherited its
+    justification without review. The location is half of what was reviewed, so it is
+    half of the key.
+    """
+    return f"{finding['path']}::{finding['qualname']}::{finding['hash']}"
 
 
 def write_allowlist(findings: list[dict], reason: str) -> None:

@@ -42,6 +42,13 @@ _ANCHOR = '    "unsloth/Kimi-K2-Instruct-BF16" : ('
 _ROW_ONLY = "zeta-org/Zeta-9B-Row-Only-FP8"
 
 
+def _loader_utils_globals():
+    """The real loader_utils module globals, for anything the stand-in needs verbatim."""
+    import unsloth.models.loader_utils as loader_utils
+
+    return vars(loader_utils)
+
+
 def _mapper_source():
     with open(os.path.join(_MODELS, "mapper.py"), encoding = "utf-8") as f:
         return f.read()
@@ -114,6 +121,9 @@ def _load_resolver(installed_source):
         "FLOAT_TO_FP8_BLOCK_MAPPER": mapper_ns["FLOAT_TO_FP8_BLOCK_MAPPER"],
         "FLOAT_TO_FP8_ROW_MAPPER": mapper_ns["FLOAT_TO_FP8_ROW_MAPPER"],
         "build_mappers": build_mappers,
+        # Imported from loader_utils rather than rebuilt, so a new helper added there
+        # cannot silently drop out of this stand-in and make the probe look broken.
+        "_MAPPER_HELPERS": _loader_utils_globals()["_MAPPER_HELPERS"],
         "SUPPORTS_FOURBIT": True,
         "transformers_version": Version("4.57.6"),
         "Version": Version,

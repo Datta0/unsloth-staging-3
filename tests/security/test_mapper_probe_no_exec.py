@@ -53,16 +53,26 @@ def _serving(body, monkeypatch):
 
 @pytest.fixture
 def no_dynamic_execution(monkeypatch):
-    """Turns any exec/eval/compile during the probe into a failure."""
+    """Records any exec/eval reached during the probe.
+
+    It RECORDS rather than raises. `_get_new_mapper` catches every exception, so an
+    AssertionError raised here is swallowed and the probe returns its five empty
+    tables - which then satisfies a `len(result) == 5` assertion just as well as the
+    fixed implementation does. A tripwire the caller can eat is not a tripwire, so the
+    test asserts on this list instead.
+    """
+    calls = []
 
     def _forbidden(name):
-        def _raise(*args, **kwargs):
+        def _record(*args, **kwargs):
+            calls.append(name)
             raise AssertionError(f"_get_new_mapper called {name}()")
 
-        return _raise
+        return _record
 
     monkeypatch.setattr(builtins, "exec", _forbidden("exec"))
     monkeypatch.setattr(builtins, "eval", _forbidden("eval"))
+    return calls
 
 
 # --- the payload cannot run --------------------------------------------------
@@ -95,10 +105,21 @@ def test_payload_in_the_response_is_never_executed(payload, monkeypatch, tmp_pat
 
 
 def test_probe_does_not_call_exec_or_eval(no_dynamic_execution, monkeypatch):
-    """Stronger than the marker: the builtins are not reachable at all."""
+    """Stronger than the marker: the builtins are not reached at all.
+
+    The assertion is on the recorded calls. Asserting only the returned shape would
+    also hold for the pre-change implementation, since the AssertionError the fixture
+    raises is caught by the probe's own bare except.
+    """
     with _serving(REAL_MAPPER, monkeypatch):
         result = loader_utils._get_new_mapper()
+    assert no_dynamic_execution == [], (
+        f"the probe reached {no_dynamic_execution}"
+    )
+    # And it still did the work, rather than falling into the except and returning
+    # empties, which is the other way this test could pass for the wrong reason.
     assert len(result) == 5
+    assert all(result[:3]), "the probe returned nothing, so it proved nothing"
 
 
 def test_a_body_that_is_not_python_is_survivable(monkeypatch):
