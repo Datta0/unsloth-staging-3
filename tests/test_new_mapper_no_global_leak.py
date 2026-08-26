@@ -32,6 +32,14 @@ def _mapper_source():
 
 
 def _extract_get_new_mapper(namespace):
+    # loader_utils imports this from .mapper, so the stand-in module globals need it
+    # too. Without it the probe raises NameError into its own bare except and hands
+    # back empty tables, which looks exactly like "the fetch did not run".
+    from unsloth.models.mapper import build_mappers
+    import unsloth.models.loader_utils as loader_utils
+
+    namespace.setdefault("build_mappers", build_mappers)
+    namespace.setdefault("_MAPPER_HELPERS", loader_utils._MAPPER_HELPERS)
     with open(os.path.join(_MODELS, "loader_utils.py"), encoding = "utf-8") as f:
         tree = ast.parse(f.read())
     for node in tree.body:

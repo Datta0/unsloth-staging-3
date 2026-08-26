@@ -42,6 +42,12 @@ _ANCHOR = '    "unsloth/Kimi-K2-Instruct-BF16" : ('
 _ROW_ONLY = "zeta-org/Zeta-9B-Row-Only-FP8"
 
 
+def _loader_utils_globals():
+    """The real loader_utils module globals, for anything the stand-in needs verbatim."""
+    import unsloth.models.loader_utils as loader_utils
+    return vars(loader_utils)
+
+
 def _mapper_source():
     with open(os.path.join(_MODELS, "mapper.py"), encoding = "utf-8") as f:
         return f.read()
@@ -99,6 +105,11 @@ def _load_resolver(installed_source):
     """Stand-in for loader_utils' module globals, built from `installed_source`."""
     from unsloth_zoo.utils import Version
 
+    # loader_utils imports this from .mapper; _get_new_mapper derives the fetched tables
+    # with it, so the stand-in globals need it or the probe NameErrors into its own bare
+    # except and returns empty tables.
+    from unsloth.models.mapper import build_mappers
+
     mapper_ns = {}
     exec(compile(installed_source, "mapper.py", "exec"), mapper_ns)
 
@@ -108,6 +119,10 @@ def _load_resolver(installed_source):
         "MAP_TO_UNSLOTH_16bit": mapper_ns["MAP_TO_UNSLOTH_16bit"],
         "FLOAT_TO_FP8_BLOCK_MAPPER": mapper_ns["FLOAT_TO_FP8_BLOCK_MAPPER"],
         "FLOAT_TO_FP8_ROW_MAPPER": mapper_ns["FLOAT_TO_FP8_ROW_MAPPER"],
+        "build_mappers": build_mappers,
+        # Imported from loader_utils rather than rebuilt, so a new helper added there
+        # cannot silently drop out of this stand-in and make the probe look broken.
+        "_MAPPER_HELPERS": _loader_utils_globals()["_MAPPER_HELPERS"],
         "SUPPORTS_FOURBIT": True,
         "transformers_version": Version("4.57.6"),
         "Version": Version,
@@ -162,9 +177,9 @@ def test_probe_survives_a_fetched_mapper_without_the_fp8_tables(monkeypatch):
 
     int_to_float, float_to_int, map_to_16bit = namespace["_get_new_mapper"]()[:3]
 
-    assert (
-        int_to_float and float_to_int and map_to_16bit
-    ), "a fetched mapper.py without the fp8 tables must not take the 4bit upgrade check down"
+    assert int_to_float and float_to_int and map_to_16bit, (
+        "a fetched mapper.py without the fp8 tables must not take the 4bit upgrade check down"
+    )
 
 
 def test_fbgemm_prefers_the_row_table_over_the_block_one(monkeypatch):
