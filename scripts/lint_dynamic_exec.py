@@ -91,6 +91,14 @@ _CONVERSIONS = ("encode", "decode")
 # "utf-8"))`, `exec(bytearray(...))` and `exec(memoryview(...))` all import.
 _CONSTRUCTORS = ("bytes", "bytearray", "str", "memoryview")
 
+# Each constructor also takes its source by keyword, verified on CPython 3.13:
+# `bytes(source = ..., encoding = ...)` and `str(object = ...)` both build the same
+# value a positional call would, so reading only `args[0]` missed them.
+_CONSTRUCTOR_SOURCE_KEYWORD = {
+    "bytes": "source", "bytearray": "source",
+    "str": "object", "memoryview": "object",
+}
+
 
 def _constructor_name(function: ast.AST) -> str | None:
     """`bytes` for both `bytes(...)` and `builtins.bytes(...)`, else None."""
@@ -99,6 +107,17 @@ def _constructor_name(function: ast.AST) -> str | None:
     if isinstance(function, ast.Attribute) and function.attr in _CONSTRUCTORS:
         if isinstance(function.value, ast.Name) and function.value.id == "builtins":
             return function.attr
+    return None
+
+
+def _constructor_source(node: ast.Call, name: str) -> ast.AST | None:
+    """The value a constructor is converting, positional or by keyword."""
+    if node.args:
+        return node.args[0]
+    wanted = _CONSTRUCTOR_SOURCE_KEYWORD.get(name)
+    for keyword in node.keywords:
+        if keyword.arg == wanted:
+            return keyword.value
     return None
 
 
@@ -130,11 +149,23 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
         if isinstance(function, ast.Attribute):
             if function.attr in _BUILDERS:
                 return f".{function.attr}()"
-            # Unwrap the receiver: the conversion changes the type, not the syntax.
             if function.attr in _CONVERSIONS:
+                # `str.encode(s)` is the unbound descriptor spelling of `s.encode()`.
+                # There the source is the first argument and the receiver is the type,
+                # so unwrapping the receiver looked at the name `str` and found nothing.
+                if isinstance(function.value, ast.Name):
+                    if function.value.id in _CONSTRUCTORS:
+                        return (
+                            _is_interpolated(node.args[0], resolve)
+                            if node.args else None
+                        )
+                # Unwrap the receiver: the conversion changes the type, not the syntax.
                 return _is_interpolated(function.value, resolve)
-        if _constructor_name(function) is not None and node.args:
-            return _is_interpolated(node.args[0], resolve)
+        constructor = _constructor_name(function)
+        if constructor is not None:
+            source = _constructor_source(node, constructor)
+            if source is not None:
+                return _is_interpolated(source, resolve)
         # `exec("import MODULE".replace("MODULE", name))` splices a value into a
         # template that is right there in the file, which is the `.format()` shape
         # spelled differently. Restricted to a literal receiver on purpose: the
@@ -216,12 +247,15 @@ class _Visitor(ast.NodeVisitor):
         false positives.
         """
         reason = _is_interpolated(node.value)
-        # Children first: the right hand side is evaluated before the target is
-        # bound, so `payload = f"...{x}..."` followed by `payload = exec(payload)`
-        # executes the tainted value and only then rebinds. Binding first cleared
-        # the taint before the sink inside this very statement was ever visited.
-        self.generic_visit(node)
+        # Runtime order, not source order. The right hand side is evaluated first,
+        # then the targets are assigned left to right, and a target that is not a
+        # plain name has expressions of its own that run at its turn. So in
+        # `payload = table[exec(payload)] = f"import {name}"` the f-string reaches
+        # `payload` before the subscript is evaluated, and the `exec` sees it.
+        # Visiting every target before binding any of them missed that.
+        self.visit(node.value)
         for target in node.targets:
+            self.visit(target)
             self._bind(target, reason)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
@@ -234,9 +268,15 @@ class _Visitor(ast.NodeVisitor):
         rather than clear it.
         """
         reason = _is_interpolated(node.value) if node.value is not None else None
-        self.generic_visit(node)
         if node.value is not None:
+            self.visit(node.value)
             self._bind(node.target, reason)
+        # The annotation is evaluated AFTER the store, so at module or class scope,
+        # where annotations are evaluated at all, a runtime annotation observes the
+        # new binding: `payload: exec(payload) = f"import {name}"` executes the value
+        # that was just assigned. Confirmed on CPython 3.13.
+        self.visit(node.annotation)
+        self.visit(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr):
         """`(payload := f"import {name}")` as a statement, then `exec(payload)`.
@@ -472,6 +512,17 @@ def i(name):
 def j(name):
     (payload := f"import {name}")
     exec(payload)
+
+def k(name):
+    table = {}
+    payload = table[exec(payload)] = f"import {name}"
+
+def l(name):
+    exec(bytes(source = f"import {name}", encoding = "utf-8"))
+    exec(str(object = f"import {name}"))
+    exec(str.encode(f"import {name}"))
+
+annotated_at_module: exec(annotated_at_module) = f"import {NAME}"
 """
 
 _GOOD = """
@@ -508,15 +559,24 @@ def self_test() -> int:
             "f-string",
             "f-string",
             "f-string",
+            "f-string",
+            "f-string",
+            "f-string",
+            "f-string via `annotated_at_module`",
             "f-string via `annotated`",
             "f-string via `payload`",
             "f-string via `payload`",
             "f-string via `payload`",
-            "f-string via `payload`", "string concatenation",
+            "f-string via `payload`",
+            "f-string via `payload`",
+            "string concatenation",
         ]
         if kinds != expected:
             failures.append(f"expected {expected}, got {kinds}")
-        if any(f["qualname"] not in ("f", "g", "h", "i", "j") for f in findings):
+        if any(
+            f["qualname"] not in ("f", "g", "h", "i", "j", "k", "l", "<module>")
+            for f in findings
+        ):
             failures.append(f"qualname wrong: {[f['qualname'] for f in findings]}")
 
         good = Path(directory) / "good.py"
