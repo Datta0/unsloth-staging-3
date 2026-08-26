@@ -84,9 +84,37 @@ _BUILDERS = ("format", "format_map", "join")
 # executes exactly the payload the f-string built.
 _CONVERSIONS = ("encode", "decode")
 
+# Constructors that hand the same source on in another type. Same argument as
+# `_CONVERSIONS`, spelled as a call instead of a method: `bytes(s, "utf-8")` is
+# documented as `s.encode("utf-8")`, `str(s)` on a str is the str, and `exec`
+# compiles any of them. Verified on CPython 3.13: `exec(bytes(f"import {name}",
+# "utf-8"))`, `exec(bytearray(...))` and `exec(memoryview(...))` all import.
+_CONSTRUCTORS = ("bytes", "bytearray", "str", "memoryview")
 
-def _is_interpolated(node: ast.AST) -> str | None:
-    """Returns why `node` is a built string, or None if it is not one."""
+
+def _constructor_name(function: ast.AST) -> str | None:
+    """`bytes` for both `bytes(...)` and `builtins.bytes(...)`, else None."""
+    if isinstance(function, ast.Name) and function.id in _CONSTRUCTORS:
+        return function.id
+    if isinstance(function, ast.Attribute) and function.attr in _CONSTRUCTORS:
+        if isinstance(function.value, ast.Name) and function.value.id == "builtins":
+            return function.attr
+    return None
+
+
+def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
+    """Returns why `node` is a built string, or None if it is not one.
+
+    `resolve` maps a bare name to the reason it is tainted, or None. It is passed
+    at a sink and not while binding, so this stays one level of indirection: a
+    name is resolved where it is executed, never chained into another binding.
+    """
+    # `exec(payload := f"import {name}")` executes the f-string; the walrus is an
+    # `ast.NamedExpr` wrapper around it, not a different value.
+    while isinstance(node, ast.NamedExpr):
+        node = node.value
+    if isinstance(node, ast.Name):
+        return resolve(node.id) if resolve is not None else None
     if isinstance(node, ast.JoinedStr):
         # An f-string with no placeholders is just a literal.
         if any(isinstance(v, ast.FormattedValue) for v in node.values):
@@ -104,7 +132,19 @@ def _is_interpolated(node: ast.AST) -> str | None:
                 return f".{function.attr}()"
             # Unwrap the receiver: the conversion changes the type, not the syntax.
             if function.attr in _CONVERSIONS:
-                return _is_interpolated(function.value)
+                return _is_interpolated(function.value, resolve)
+        if _constructor_name(function) is not None and node.args:
+            return _is_interpolated(node.args[0], resolve)
+        # `exec("import MODULE".replace("MODULE", name))` splices a value into a
+        # template that is right there in the file, which is the `.format()` shape
+        # spelled differently. Restricted to a literal receiver on purpose: the
+        # `exec(inspect.getsource(f).replace(...))` idiom this repo is built on has a
+        # variable receiver and is not this shape. Verified: adding plain "replace"
+        # to _BUILDERS instead raises 5 findings here and 5 in unsloth, all of them
+        # that idiom; this branch raises none.
+        if isinstance(function, ast.Attribute) and function.attr == "replace":
+            if isinstance(function.value, ast.Constant) and isinstance(function.value.value, str):
+                return ".replace() on a literal"
     return None
 
 
@@ -176,9 +216,13 @@ class _Visitor(ast.NodeVisitor):
         false positives.
         """
         reason = _is_interpolated(node.value)
+        # Children first: the right hand side is evaluated before the target is
+        # bound, so `payload = f"...{x}..."` followed by `payload = exec(payload)`
+        # executes the tainted value and only then rebinds. Binding first cleared
+        # the taint before the sink inside this very statement was ever visited.
+        self.generic_visit(node)
         for target in node.targets:
             self._bind(target, reason)
-        self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
         """Same tracking for `payload: str = f"...{x}..."`.
@@ -189,9 +233,10 @@ class _Visitor(ast.NodeVisitor):
         optional: a bare `payload: str` declares nothing and must leave taint alone
         rather than clear it.
         """
-        if node.value is not None:
-            self._bind(node.target, _is_interpolated(node.value))
+        reason = _is_interpolated(node.value) if node.value is not None else None
         self.generic_visit(node)
+        if node.value is not None:
+            self._bind(node.target, reason)
 
     def _bind(self, target: ast.AST, reason: str | None) -> None:
         if not isinstance(target, ast.Name):
@@ -205,9 +250,11 @@ class _Visitor(ast.NodeVisitor):
         sink = _sink_name(node.func)
         argument = _source_argument(node, sink) if sink is not None else None
         if argument is not None:
-            reason = _is_interpolated(argument)
-            if reason is None and isinstance(argument, ast.Name):
-                reason = self.tainted[-1].get(argument.id)
+            # The taint lookup has to happen wherever the unwrapping stops, not only
+            # when the argument is a bare name: `payload = f"import {name}"` followed
+            # by `exec(payload.encode())` executes the same bytes and used to unwrap
+            # to an `ast.Name` that nothing then looked up.
+            reason = _is_interpolated(argument, self.tainted[-1].get)
             if reason is not None:
                 self.findings.append(
                     {
@@ -375,6 +422,21 @@ def f(model_type):
     exec(f"import {name}".encode())
     annotated: str = f"import {name}"
     exec(annotated)
+    exec(bytes(f"import {name}", "utf-8"))
+    exec(payload := f"import {name}")
+    exec("import MODULE".replace("MODULE", name))
+
+def g(name):
+    payload = f"import {name}"
+    exec(payload.encode())
+
+def h(name):
+    payload = f"import {name}"
+    payload: object = exec(payload)
+
+def i(name):
+    payload = f"import {name}"
+    payload = exec(payload)
 """
 
 _GOOD = """
@@ -387,6 +449,8 @@ def f(cls):
     exec(f"plain f-string with no placeholders")
     module.exec(f"{name}")          # not the builtin
     exec()                          # no arguments
+    exec(source.replace("def a", "def b"), globals())   # variable receiver
+    exec(str(source))               # str() of a name is not interpolation
 """
 
 
@@ -403,15 +467,21 @@ def self_test() -> int:
             "%-format",
             ".format()",
             ".format_map()",
+            ".replace() on a literal",
+            "f-string",
+            "f-string",
             "f-string",
             "f-string",
             "f-string",
             "f-string via `annotated`",
+            "f-string via `payload`",
+            "f-string via `payload`",
+            "f-string via `payload`",
             "string concatenation",
         ]
         if kinds != expected:
             failures.append(f"expected {expected}, got {kinds}")
-        if any(f["qualname"] != "f" for f in findings):
+        if any(f["qualname"] not in ("f", "g", "h", "i") for f in findings):
             failures.append(f"qualname wrong: {[f['qualname'] for f in findings]}")
 
         good = Path(directory) / "good.py"
