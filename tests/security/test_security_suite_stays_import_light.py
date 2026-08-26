@@ -98,7 +98,6 @@ def test_the_guard_is_not_vacuous():
     ignored = _ignored_by_the_workflow()
     assert ignored, "the workflow names no --ignore, so this suite is not being checked"
     with_heavy = [
-        path.name for path in _HERE.glob("test_*.py")
-        if _module_level_heavy_imports(path)
+        path.name for path in _HERE.glob("test_*.py") if _module_level_heavy_imports(path)
     ]
     assert with_heavy, "no file imports a heavy dep, so the ignore list should be empty"
