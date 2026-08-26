@@ -29,6 +29,7 @@ from .mapper import (
     MAP_TO_UNSLOTH_16bit,
     FLOAT_TO_FP8_BLOCK_MAPPER,
     FLOAT_TO_FP8_ROW_MAPPER,
+    build_mappers,
 )
 
 # https://github.com/huggingface/transformers/pull/26037 allows 4 bit loading!
@@ -507,34 +508,33 @@ def _get_new_mapper():
         )
         with requests.get(new_mapper, timeout = 3) as new_mapper:
             new_mapper = new_mapper.text
-        new_mapper = new_mapper[new_mapper.find("__INT_TO_FLOAT_MAPPER") :]
-        new_mapper = (
-            new_mapper.replace("INT_TO_FLOAT_MAPPER", "NEW_INT_TO_FLOAT_MAPPER")
-            .replace("FLOAT_TO_INT_MAPPER", "NEW_FLOAT_TO_INT_MAPPER")
-            .replace("MAP_TO_UNSLOTH_16bit", "NEW_MAP_TO_UNSLOTH_16bit")
-        )
+        # Never exec the response. This is a plain HTTPS GET, so the body is whatever
+        # the endpoint served, and exec'ing it would make any compromise of that path
+        # - or of anything that can answer for it - arbitrary code execution inside
+        # every `from_pretrained` that hits an unmapped model name. Only one thing in
+        # that file is data: `__INT_TO_FLOAT_MAPPER`. Parse that single dict literal
+        # out with ast.literal_eval (which evaluates literals only, never calls), then
+        # derive the five tables with the INSTALLED builder.
+        #
+        # This is only a probe for "would a newer Unsloth support this name?", so it
+        # must not change what the installed version resolves - hence the tables are
+        # returned to the caller rather than written into this module's globals.
+        import ast
+        tree = ast.parse(new_mapper)
+        source_table = None
+        for node in tree.body:
+            if not isinstance(node, ast.Assign): continue
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if "__INT_TO_FLOAT_MAPPER" in targets:
+                source_table = ast.literal_eval(node.value)
+                break
+        pass
+        if not source_table:
+            return {}, {}, {}, {}, {}
 
-        # Exec into a throwaway namespace, never globals(). The slice also carries
-        # FLOAT_TO_FP8_BLOCK_MAPPER / FLOAT_TO_FP8_ROW_MAPPER, the _add_* helpers
-        # and the builder's loop variables, so exec'ing into globals() would swap
-        # the FP8 tables this module imported from the installed mapper for the
-        # ones on GitHub main. This is only a probe for "would a newer Unsloth
-        # support this name?", so it must not change what the installed version
-        # resolves; the fetched FP8 tables are returned for the probe to use
-        # instead of being written over the installed ones.
-        namespace = {}
-        exec(new_mapper, namespace)
-        return (
-            namespace["NEW_INT_TO_FLOAT_MAPPER"],
-            namespace["NEW_FLOAT_TO_INT_MAPPER"],
-            namespace["NEW_MAP_TO_UNSLOTH_16bit"],
-            # .get, not []: these two come from the fetched file under its own names (unlike
-            # the NEW_ names above, renamed here), so an older or renamed mapper.py would
-            # KeyError into the bare except and take the 4bit half of the probe down too.
-            # {} is safe: the probe runs only after the installed tables already missed.
-            namespace.get("FLOAT_TO_FP8_BLOCK_MAPPER", {}),
-            namespace.get("FLOAT_TO_FP8_ROW_MAPPER", {}),
-        )
+        # A newer mapper.py may carry entry shapes this builder does not know; the
+        # caller already treats an empty result as "the probe found nothing".
+        return build_mappers(source_table)
     except:
         return {}, {}, {}, {}, {}
 
