@@ -34,6 +34,7 @@ import argparse
 import ast
 import hashlib
 import json
+import re
 import sys
 import warnings
 from pathlib import Path
@@ -277,13 +278,55 @@ class _Visitor(ast.NodeVisitor):
         inner = ".".join(self.scope) if self.scope else "<module>"
         return f"{self.qualname_prefix}::{inner}" if self.qualname_prefix else inner
 
+    def _outer_parts(self, node):
+        """The pieces of a `def`/`class` that run in the *enclosing* scope.
+
+        A definition statement is not one atomic thing. Decorators, default values,
+        base classes and (unless deferred) parameter and return annotations are all
+        evaluated where the `def` or `class` appears, before the new scope exists.
+        Only the body runs later, in the new scope. Visiting the whole node inside the
+        fresh taint map therefore lost real findings: `payload = f"import {user}"`
+        followed by `def f(x = exec(payload)): ...` executes the built string at
+        definition time, in the scope that built it.
+
+        This is scope *accuracy*, not the taint-inheritance-into-nested-scopes idea
+        that stays rejected: nothing here lets a name bound in one scope be trusted or
+        distrusted in another. It only puts each expression in the scope that actually
+        evaluates it.
+        """
+        parts = list(node.decorator_list)
+        if isinstance(node, ast.ClassDef):
+            parts.extend(node.bases)
+            parts.extend(node.keywords)
+            return parts
+        args = node.args
+        parts.extend(d for d in args.defaults)
+        parts.extend(d for d in args.kw_defaults if d is not None)
+        if not self.annotations_deferred:
+            for arg in (
+                *args.posonlyargs, *args.args, *args.kwonlyargs,
+                args.vararg, args.kwarg,
+            ):
+                if arg is not None and arg.annotation is not None:
+                    parts.append(arg.annotation)
+            if node.returns is not None:
+                parts.append(node.returns)
+        return parts
+
     def _enter(self, node):
+        # Evaluated in the scope we are still in, before the new one exists.
+        for part in self._outer_parts(node):
+            self.visit(part)
+
         self.scope.append(node.name)
-        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
+        self.scope_kinds.append(
+            "class" if isinstance(node, ast.ClassDef) else "function"
+        )
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
-        self.generic_visit(node)
+        for statement in node.body:
+            self.visit(statement)
         self.tainted.pop()
         self.scope.pop()
         self.scope_kinds.pop()
@@ -514,6 +557,69 @@ def _magic_argument(rest: str) -> str:
     return rest
 
 
+# `out = !ls`, `files, err = !ls`, `t = %timeit -o f()`. IPython's capture syntax is an
+# assignment whose right hand side is a magic or a shell escape, so the `!` or `%` is not
+# at the start of the line and the plain check below never fired. Neither the raw text
+# nor the neutralised text parsed, so the whole cell - including any sink after it - was
+# skipped. The target list is restricted to names, attributes, subscripts and the commas
+# and brackets that separate them, so an ordinary `x = y != z` cannot match.
+_CAPTURE = re.compile(r"^(\s*)([\w.,()\[\]\s]+?)\s*=\s*[!%](?!=)")
+
+
+def _string_open_lines(source: str) -> frozenset:
+    """Indices of physical lines that begin inside an unterminated string literal.
+
+    Text inside a triple-quoted string is data, not code, and a line of it may well
+    begin with `%` or `!`. Rewriting such a line to `pass` can delete the string's own
+    closing delimiter, which turns a parseable cell into a skipped one and loses every
+    sink below it. Scanning for the quote state first keeps the rewrite to real code.
+
+    This is a scanner, not a tokenizer, because the input is by definition not valid
+    Python - it is a cell with magics in it, which is why it reached this function at
+    all. It handles escapes, comments and both quote characters; it is not asked to do
+    more than decide, per line, "are we inside a triple-quoted string here".
+    """
+    inside = set()
+    delimiter = ""
+    index, line_number = 0, 0
+    while index < len(source):
+        character = source[index]
+        if character == "\n":
+            line_number += 1
+            if delimiter:
+                inside.add(line_number)
+            index += 1
+            continue
+        if delimiter:
+            if character == "\\":
+                index += 2
+                continue
+            if source.startswith(delimiter, index):
+                index += len(delimiter)
+                delimiter = ""
+                continue
+            index += 1
+            continue
+        if character == "#":
+            index = source.find("\n", index)
+            if index == -1:
+                break
+            continue
+        if character in "\"'":
+            triple = source[index : index + 3]
+            if triple in ('"""', "'''"):
+                delimiter = triple
+                index += 3
+            else:
+                # A single-quoted string cannot span lines except by continuation, and
+                # a line inside one still is not a magic, so it is enough to skip it.
+                delimiter = character
+                index += 1
+            continue
+        index += 1
+    return frozenset(inside)
+
+
 def _neutralised(source: str) -> str:
     """The cell with IPython magics and shell escapes replaced by `pass`.
 
@@ -523,7 +629,19 @@ def _neutralised(source: str) -> str:
     Python further down the same cell was thrown away with the shell command.
     """
     out, continuing = [], False
-    for line in source.splitlines():
+    in_string = _string_open_lines(source)
+    for number, line in enumerate(source.splitlines()):
+        if number in in_string:
+            out.append(line)
+            continuing = False
+            continue
+        capture = _CAPTURE.match(line)
+        if capture:
+            # The shell or magic result is opaque, so binding None both keeps the
+            # statement parseable and correctly leaves the target untracked.
+            out.append(f"{capture.group(1)}{capture.group(2)} = None")
+            continuing = line.rstrip().endswith("\\")
+            continue
         if continuing:
             out.append("")
             continuing = line.rstrip().endswith("\\")
@@ -544,6 +662,26 @@ def _neutralised(source: str) -> str:
         else:
             out.append(line)
     return "\n".join(out)
+
+
+def _foreign_cell_magic(code: str) -> str | None:
+    """The `%%magic` name when it makes the whole cell stop being Python.
+
+    `%%bash`, `%%sh`, `%%html`, `%%writefile` and friends mean every line below is
+    another language, so failing to parse such a cell is the expected outcome rather
+    than a gap in coverage - reporting it as "did not parse" only trained readers to
+    ignore the notice. `%%time`, `%%capture` and the rest of `_CODE_MAGICS` are the
+    opposite: the body is ordinary Python and must still be checked, so they are not
+    foreign and only their first line is dropped.
+    """
+    for line in code.splitlines():
+        if not line.strip():
+            continue
+        if not line.startswith("%%"):
+            return None
+        magic = line[2:].split(maxsplit = 1)[0] if line[2:].strip() else ""
+        return None if magic in _CODE_MAGICS or magic in ("python", "python3") else magic
+    return None
 
 
 def _parse_cell(code: str, filename: str):
@@ -584,6 +722,10 @@ def _scan_notebook(path: Path) -> list[dict]:
     visitor = _Visitor(path)
     skipped = 0
     for index, code in _notebook_code_cells(path):
+        if _foreign_cell_magic(code) is not None:
+            # Positively identified as another language, so it is not an unchecked
+            # Python cell and does not belong in the count.
+            continue
         tree = _parse_cell(code, f"{path}#cell{index}")
         if tree is None:
             skipped += 1
