@@ -556,16 +556,20 @@ def _get_new_mapper():
         # like everything else here: literal subscript, literal value, nothing named or
         # called is ever evaluated.
         fp8_tables = {
-            "FLOAT_TO_FP8_BLOCK_MAPPER" : tables[3],
-            "FLOAT_TO_FP8_ROW_MAPPER"   : tables[4],
+            "FLOAT_TO_FP8_BLOCK_MAPPER": tables[3],
+            "FLOAT_TO_FP8_ROW_MAPPER": tables[4],
         }
         for node in tree.body:
-            if not isinstance(node, ast.Assign): continue
+            if not isinstance(node, ast.Assign):
+                continue
             for target in node.targets:
-                if not isinstance(target, ast.Subscript): continue
-                if not isinstance(target.value, ast.Name): continue
+                if not isinstance(target, ast.Subscript):
+                    continue
+                if not isinstance(target.value, ast.Name):
+                    continue
                 table = fp8_tables.get(target.value.id)
-                if table is None: continue
+                if table is None:
+                    continue
                 try:
                     key = ast.literal_eval(target.slice)
                     table[key] = ast.literal_eval(node.value)

@@ -78,15 +78,11 @@ def resolve_dtype(text):
     return DTYPE_ALIASES[key]
 
 
-
-
 def register_custom_dtype(value):
     """Sets `UNSLOTH_FORCE_CUSTOM_DTYPE` and records it as ours"""
     _REGISTERED.add(value)
     os.environ[_ENV_KEY] = value
     return value
-
-
 
 
 def trusted_custom_dtype():
@@ -99,5 +95,3 @@ def trusted_custom_dtype():
     if value == "":
         return "", False
     return value, value in _REGISTERED
-
-

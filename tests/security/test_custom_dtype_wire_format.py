@@ -120,11 +120,13 @@ def test_unset_variable_leaves_custom_datatype_as_none():
     source = pathlib.Path(vision.__file__).read_text()
     bound = set()
     for node in ast.walk(ast.parse(source)):
-        if not isinstance(node, ast.Assign): continue
+        if not isinstance(node, ast.Assign):
+            continue
         value = node.value
         if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)):
             continue
-        if value.func.id != "trusted_custom_dtype": continue
+        if value.func.id != "trusted_custom_dtype":
+            continue
         for target in node.targets:
             if isinstance(target, ast.Tuple):
                 bound.update(e.id for e in target.elts if isinstance(e, ast.Name))
@@ -134,9 +136,7 @@ def test_unset_variable_leaves_custom_datatype_as_none():
         "the raw value must not be bound to `custom_datatype`, which is gated on "
         "`is not None` further down"
     )
-    assert "if custom_datatype is not None:" in source, (
-        "the consumer this test protects has moved"
-    )
+    assert "if custom_datatype is not None:" in source, "the consumer this test protects has moved"
 
 
 def test_unset_variable_reads_as_empty_and_untrusted(monkeypatch):
