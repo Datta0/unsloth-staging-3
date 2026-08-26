@@ -134,6 +134,10 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
         node = node.value
     if isinstance(node, ast.Name):
         return resolve(node.id) if resolve is not None else None
+    if isinstance(node, ast.IfExp):
+        # `exec(f"import {name}" if flag else "import os")` executes whichever branch
+        # is taken, so either one being built is enough.
+        return _is_interpolated(node.body, resolve) or _is_interpolated(node.orelse, resolve)
     if isinstance(node, ast.JoinedStr):
         # An f-string with no placeholders is just a literal.
         if any(isinstance(v, ast.FormattedValue) for v in node.values):
@@ -174,8 +178,24 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
         # to _BUILDERS instead raises 5 findings here and 5 in unsloth, all of them
         # that idiom; this branch raises none.
         if isinstance(function, ast.Attribute) and function.attr == "replace":
-            if isinstance(function.value, ast.Constant) and isinstance(function.value.value, str):
-                return ".replace() on a literal"
+            receiver = function.value
+            if isinstance(receiver, ast.Constant):
+                if isinstance(receiver.value, (str, bytes)):
+                    return ".replace() on a literal"
+            # `exec(f"import {model_type}".replace("-", "_"))` is the shape from the
+            # original report with a normalisation step bolted on. The receiver is the
+            # f-string itself, so recursing into it keeps that visible. This does not
+            # catch the `exec(inspect.getsource(f).replace(...))` idiom, whose receiver
+            # is a call that is not interpolated and yields None here.
+            inner = _is_interpolated(receiver, resolve)
+            if inner is not None:
+                return inner
+            # `str.replace(template, old, new)` is the unbound spelling; the template
+            # is the first argument rather than the receiver.
+            if isinstance(receiver, ast.Name) and receiver.id in ("str", "bytes"):
+                if node.args and isinstance(node.args[0], ast.Constant):
+                    if isinstance(node.args[0].value, (str, bytes)):
+                        return ".replace() on a literal"
     return None
 
 
@@ -216,13 +236,17 @@ def _source_argument(node: ast.Call, sink: str) -> ast.AST | None:
 class _Visitor(ast.NodeVisitor):
     def __init__(self, path: Path):
         self.path = path
+        # Set for a notebook cell, so two cells defining the same function name are
+        # separate allowlist entries rather than colliding on one key.
+        self.qualname_prefix = ""
         self.scope: list[str] = []
         self.findings: list[dict] = []
         # name -> reason, for locals bound to a built string in the current scope.
         self.tainted: list[dict[str, str]] = [{}]
 
     def _qualname(self) -> str:
-        return ".".join(self.scope) if self.scope else "<module>"
+        inner = ".".join(self.scope) if self.scope else "<module>"
+        return f"{self.qualname_prefix}::{inner}" if self.qualname_prefix else inner
 
     def _enter(self, node):
         self.scope.append(node.name)
@@ -278,6 +302,21 @@ class _Visitor(ast.NodeVisitor):
         self.visit(node.annotation)
         self.visit(node.target)
 
+    def visit_AugAssign(self, node: ast.AugAssign):
+        """`payload += f"{x}"` builds a string just as `payload = a + f"{x}"` does.
+
+        `payload` is read, combined, and stored back, so an augmented assignment whose
+        right hand side is interpolated makes the name interpolated. Only `+=` is
+        treated this way: it is the operator that concatenates, and the others do not
+        build source out of a value.
+        """
+        self.visit(node.value)
+        if isinstance(node.op, ast.Add):
+            reason = _is_interpolated(node.value)
+            if reason is not None:
+                self._bind(node.target, f"{reason} appended")
+        self.visit(node.target)
+
     def visit_NamedExpr(self, node: ast.NamedExpr):
         """`(payload := f"import {name}")` as a statement, then `exec(payload)`.
 
@@ -330,13 +369,92 @@ def _call_hash(node: ast.Call) -> str:
     return hashlib.sha256(ast.unparse(node).encode("utf-8")).hexdigest()[:16]
 
 
+NOTEBOOK_SUFFIX = ".ipynb"
+
+
+def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
+    """(index, python source) for each code cell, with magics neutralised.
+
+    A `%magic` or `!shell` line is not Python. Replacing it with `pass` at the same
+    indentation, rather than blanking it, keeps a magic that is the only statement in
+    an `if:` body from leaving an empty block. Measured over the 113 template
+    notebooks that takes the cells which parse from 2182 to 2192 of 2202.
+    """
+    try:
+        document = json.loads(path.read_bytes().decode("utf-8", errors = "replace"))
+    except (ValueError, UnicodeError) as error:
+        raise ScanError(
+            f"{_relative(path)}: could not be read as a notebook "
+            f"({error.__class__.__name__}), so its code cells were not checked"
+        ) from None
+    cells = []
+    for index, cell in enumerate(document.get("cells", [])):
+        if cell.get("cell_type") != "code":
+            continue
+        source = cell.get("source", "")
+        if isinstance(source, list):
+            source = "".join(source)
+        lines = []
+        for line in source.splitlines():
+            stripped = line.lstrip()
+            if stripped.startswith(("%", "!")):
+                lines.append(line[: len(line) - len(stripped)] + "pass")
+            else:
+                lines.append(line)
+        cells.append((index, "\n".join(lines)))
+    return cells
+
+
+def _scan_notebook(path: Path) -> list[dict]:
+    """Findings across a notebook's code cells.
+
+    A cell that will not parse is SKIPPED, which is the opposite of what a `.py` file
+    gets, and the difference is deliberate. A `.py` file claims to be a Python module,
+    so failing to parse it means the gate did not check something it was supposed to.
+    A notebook cell routinely is not Python at all - a shell command with a line
+    continuation, a partial snippet - and failing the build on those would reject the
+    repository's own notebooks. The count is printed so the gap stays visible rather
+    than silent.
+    """
+    findings, skipped = [], 0
+    for index, code in _notebook_code_cells(path):
+        try:
+            tree = ast.parse(code, filename = f"{path}#cell{index}")
+        except (SyntaxError, ValueError):
+            skipped += 1
+            continue
+        visitor = _Visitor(path)
+        visitor.qualname_prefix = f"cell{index}"
+        try:
+            visitor.visit(tree)
+        except RecursionError:
+            raise ScanError(
+                f"{_relative(path)}#cell{index}: too deeply nested to walk"
+            ) from None
+        findings.extend(visitor.findings)
+    if skipped:
+        NOTEBOOK_SKIPPED.append((_relative(path), skipped))
+    return findings
+
+
+NOTEBOOK_SKIPPED: list[tuple[str, int]] = []
+
+
 def scan_file(path: Path) -> list[dict]:
     # A hard CI gate must not fall over on something that is not a readable file. A
     # dangling symlink, a directory named `*.py`, or a symlink to one all reach here
     # through rglob and raise out of read_text, failing the build for a reason that has
     # nothing to do with dynamic execution.
+    if path.suffix == NOTEBOOK_SUFFIX:
+        return _scan_notebook(path)
     try:
-        source = path.read_text(encoding = "utf-8", errors = "replace")
+        # Bytes, not text. `ast.parse` applies the PEP 263 coding declaration itself,
+        # while decoding here as UTF-8 with errors = "replace" corrupted any file that
+        # declares another encoding. That was harmless while an unparseable file was
+        # reported clean, but now that it fails the gate it turned a valid module into
+        # a build failure: a latin-1 file with a non-ASCII identifier decoded to U+FFFD
+        # and raised `invalid character`, even though py_compile accepts it.
+        source = path.read_bytes()
     except OSError:
         return []
     try:
@@ -391,16 +509,17 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
     paths, missing = [], []
     for target in targets:
         root = REPO_ROOT / target
-        if root.is_file() and root.suffix == ".py":
+        if root.is_file() and root.suffix in (".py", NOTEBOOK_SUFFIX):
             paths.append(root)
         elif root.is_dir():
             # `is_file()` on each hit, so a directory named `foo.py` and a symlink that
             # points at one are skipped rather than read.
-            paths.extend(
-                p
-                for p in root.rglob("*.py")
-                if p.is_file() and "tests" not in _exclusion_parts(p, root)
-            )
+            for pattern in ("*.py", f"*{NOTEBOOK_SUFFIX}"):
+                paths.extend(
+                    p
+                    for p in root.rglob(pattern)
+                    if p.is_file() and "tests" not in _exclusion_parts(p, root)
+                )
         else:
             missing.append(
                 f"{target}: requested scan target does not exist, so nothing under it "
@@ -635,6 +754,17 @@ def self_test() -> int:
         except ScanError:
             pass
 
+        # A file declaring a non-UTF-8 encoding is valid Python and must not fail the
+        # gate. Decoding it as UTF-8 with errors = "replace" turned a latin-1
+        # identifier into U+FFFD and made a good module unscannable.
+        latin1 = Path(directory) / "latin1.py"
+        latin1.write_bytes("# -*- coding: latin-1 -*-\ncaf\xe9 = 1\n".encode("latin-1"))
+        try:
+            if scan_file(latin1) != []:
+                failures.append("the latin-1 file produced findings it should not have")
+        except ScanError:
+            failures.append("a valid latin-1 module was reported unscannable")
+
         # ast.parse rejects a NUL byte with ValueError rather than SyntaxError.
         nul = Path(directory) / "nul.py"
         nul.write_bytes(b"x = 1\x00\n")
@@ -731,6 +861,12 @@ def main() -> int:
         )
     for error in errors:
         print(f"scan error: {error}", file = sys.stderr)
+    for notebook, count in NOTEBOOK_SKIPPED:
+        print(
+            f"note: {notebook}: {count} code cell(s) did not parse and were not "
+            f"checked (shell or partial cells)",
+            file = sys.stderr,
+        )
 
     if unreviewed or pending or stale or errors:
         print(
