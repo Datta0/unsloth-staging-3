@@ -35,6 +35,7 @@ import ast
 import hashlib
 import json
 import sys
+import warnings
 from pathlib import Path
 
 
@@ -95,8 +96,10 @@ _CONSTRUCTORS = ("bytes", "bytearray", "str", "memoryview")
 # `bytes(source = ..., encoding = ...)` and `str(object = ...)` both build the same
 # value a positional call would, so reading only `args[0]` missed them.
 _CONSTRUCTOR_SOURCE_KEYWORD = {
-    "bytes": "source", "bytearray": "source",
-    "str": "object", "memoryview": "object",
+    "bytes": "source",
+    "bytearray": "source",
+    "str": "object",
+    "memoryview": "object",
 }
 
 
@@ -168,10 +171,7 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
                 # `str.encode(s)` and `builtins.str.encode(s)` alike: the receiver
                 # names the type, so the source is the first argument.
                 if _constructor_name(function.value) is not None:
-                    return (
-                        _is_interpolated(node.args[0], resolve)
-                        if node.args else None
-                    )
+                    return _is_interpolated(node.args[0], resolve) if node.args else None
                 # Unwrap the receiver: the conversion changes the type, not the syntax.
                 return _is_interpolated(function.value, resolve)
         constructor = _constructor_name(function)
@@ -271,9 +271,7 @@ class _Visitor(ast.NodeVisitor):
 
     def _enter(self, node):
         self.scope.append(node.name)
-        self.scope_kinds.append(
-            "class" if isinstance(node, ast.ClassDef) else "function"
-        )
+        self.scope_kinds.append("class" if isinstance(node, ast.ClassDef) else "function")
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
@@ -434,7 +432,17 @@ NOTEBOOK_SUFFIX = ".ipynb"
 def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
     """(index, raw source) for each code cell, exactly as written."""
     try:
-        document = json.loads(path.read_bytes().decode("utf-8", errors = "replace"))
+        raw = path.read_bytes()
+    except OSError as error:
+        # `.py` files return [] here, but a notebook named on the command line has been
+        # asked for explicitly, and silently skipping it is the reduced coverage the
+        # rest of this file exists to report.
+        raise ScanError(
+            f"{_relative(path)}: could not be read ({error.__class__.__name__}), so "
+            f"its code cells were not checked"
+        ) from None
+    try:
+        document = json.loads(raw.decode("utf-8", errors = "replace"))
     except (ValueError, UnicodeError) as error:
         raise ScanError(
             f"{_relative(path)}: could not be read as a notebook "
@@ -449,6 +457,11 @@ def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
             source = "".join(source)
         cells.append((index, source))
     return cells
+
+
+# Line magics whose argument is ordinary Python, so replacing the whole line would
+# throw away real code: `%time exec(payload)` executes exactly what it says.
+_CODE_MAGICS = ("time", "timeit", "prun", "debug", "capture")
 
 
 def _neutralised(source: str) -> str:
@@ -467,7 +480,16 @@ def _neutralised(source: str) -> str:
             continue
         stripped = line.lstrip()
         if stripped.startswith(("%", "!")):
-            out.append(line[: len(line) - len(stripped)] + "pass")
+            indent = line[: len(line) - len(stripped)]
+            # A line magic that takes code keeps its argument; the magic itself is not
+            # Python but what follows it is, and dropping the line hid the sink.
+            if stripped.startswith("%") and not stripped.startswith("%%"):
+                magic, _, rest = stripped[1:].partition(" ")
+                if magic in _CODE_MAGICS and rest.strip():
+                    out.append(indent + rest)
+                    continuing = line.rstrip().endswith("\\")
+                    continue
+            out.append(indent + "pass")
             continuing = line.rstrip().endswith("\\")
         else:
             out.append(line)
@@ -482,11 +504,16 @@ def _parse_cell(code: str, filename: str):
     `pass` corrupted a cell that was valid Python to begin with. Only a cell that
     genuinely will not parse is put through `_neutralised`.
     """
-    for candidate in (code, _neutralised(code)):
-        try:
-            return ast.parse(candidate, filename = filename)
-        except (SyntaxError, ValueError):
-            continue
+    # Notebook prose regularly contains things like `\\(` in a regex written without a
+    # raw string. That is the notebook author's business, not this gate's, and letting
+    # the warning through buries the findings in noise.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", SyntaxWarning)
+        for candidate in (code, _neutralised(code)):
+            try:
+                return ast.parse(candidate, filename = filename)
+            except (SyntaxError, ValueError):
+                continue
     return None
 
 
@@ -517,9 +544,7 @@ def _scan_notebook(path: Path) -> list[dict]:
         try:
             visitor.visit(tree)
         except RecursionError:
-            raise ScanError(
-                f"{_relative(path)}#cell{index}: too deeply nested to walk"
-            ) from None
+            raise ScanError(f"{_relative(path)}#cell{index}: too deeply nested to walk") from None
     if skipped:
         NOTEBOOK_SKIPPED.append((_relative(path), skipped))
     return visitor.findings
@@ -615,7 +640,8 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
             before = len(paths)
             for pattern in ("*.py", f"*{NOTEBOOK_SUFFIX}"):
                 paths.extend(
-                    p for p in root.rglob(pattern)
+                    p
+                    for p in root.rglob(pattern)
                     if p.is_file() and "tests" not in _exclusion_parts(p, root)
                 )
             if len(paths) == before:
@@ -629,8 +655,7 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
                 )
         else:
             missing.append(
-                f"{target}: requested scan target does not exist, so nothing under it "
-                f"was checked"
+                f"{target}: requested scan target does not exist, so nothing under it was checked"
             )
     return paths, missing
 
@@ -848,7 +873,7 @@ def self_test() -> int:
         # An AST too deep to walk must fail the gate, not report the file clean.
         deep = Path(directory) / "deep.py"
         deep.write_text(
-            "def f(user):\n    x = " + "not " * 500 + "True\n" '    exec(f"import {user}")\n'
+            "def f(user):\n    x = " + "not " * 500 + 'True\n    exec(f"import {user}")\n'
         )
         try:
             scan_file(deep)
@@ -907,8 +932,7 @@ def self_test() -> int:
             ("inert_local.py", 'def f(name):\n    x: exec(f"import {name}") = 1\n'),
             (
                 "inert_future.py",
-                "from __future__ import annotations\n"
-                'name = "os"\ny: exec(f"import {name}") = 1\n',
+                'from __future__ import annotations\nname = "os"\ny: exec(f"import {name}") = 1\n',
             ),
         ):
             inert = Path(directory) / name
@@ -924,20 +948,37 @@ def self_test() -> int:
         # A notebook's cells share one namespace, and a `%`-leading continuation of a
         # modulo expression is not a magic.
         import json as _json
+
         def _nb(cells):
-            return _json.dumps({
-                "cells": [{"cell_type": "code", "source": c} for c in cells],
-                "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
-            })
+            return _json.dumps(
+                {
+                    "cells": [{"cell_type": "code", "source": c} for c in cells],
+                    "metadata": {},
+                    "nbformat": 4,
+                    "nbformat_minor": 5,
+                }
+            )
+
         for name, cells in (
             # payload built in one cell, executed in the next
-            ("cross.ipynb", [['name = "os"\n', 'payload = f"import {name}"\n'],
-                             ["exec(payload)\n"]]),
+            (
+                "cross.ipynb",
+                [['name = "os"\n', 'payload = f"import {name}"\n'], ["exec(payload)\n"]],
+            ),
             # a continuation line starting with `%` is modulo, not a magic
             ("modulo.ipynb", [['name = "os"\n', 'exec("import %s"\n', "     % name)\n"]]),
             # ordinary Python after a multi-line shell command must still be read
-            ("mixed.ipynb", [["!pip install x \\\n", "  --quiet\n",
-                              'name = "os"\n', 'exec(f"import {name}")\n']]),
+            (
+                "mixed.ipynb",
+                [
+                    [
+                        "!pip install x \\\n",
+                        "  --quiet\n",
+                        'name = "os"\n',
+                        'exec(f"import {name}")\n',
+                    ]
+                ],
+            ),
         ):
             notebook = Path(directory) / name
             notebook.write_text(_nb(cells))
