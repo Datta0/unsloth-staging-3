@@ -106,6 +106,44 @@ def test_trust_decision_is_on_the_value_we_set(monkeypatch):
     assert trusted
 
 
+def test_unset_variable_leaves_custom_datatype_as_none():
+    """`trusted_custom_dtype()` returns "" when unset, and "" is not None.
+
+    Further down, `vision.py` gates the per-module dtype pass on
+    `if custom_datatype is not None`. Binding the raw return value to that name makes
+    the unset case - which is nearly every model - walk every module of the model to
+    `exec("")` under `no_grad`. The old code kept the raw value in a separate name and
+    left `custom_datatype` as None, so this pins the two apart.
+    """
+    import unsloth.models.vision as vision
+
+    source = pathlib.Path(vision.__file__).read_text()
+    bound = set()
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Assign): continue
+        value = node.value
+        if not (isinstance(value, ast.Call) and isinstance(value.func, ast.Name)):
+            continue
+        if value.func.id != "trusted_custom_dtype": continue
+        for target in node.targets:
+            if isinstance(target, ast.Tuple):
+                bound.update(e.id for e in target.elts if isinstance(e, ast.Name))
+
+    assert bound, "trusted_custom_dtype() is no longer assigned in vision.py"
+    assert "custom_datatype" not in bound, (
+        "the raw value must not be bound to `custom_datatype`, which is gated on "
+        "`is not None` further down"
+    )
+    assert "if custom_datatype is not None:" in source, (
+        "the consumer this test protects has moved"
+    )
+
+
+def test_unset_variable_reads_as_empty_and_untrusted(monkeypatch):
+    monkeypatch.delenv("UNSLOTH_FORCE_CUSTOM_DTYPE", raising = False)
+    assert trusted_custom_dtype() == ("", False)
+
+
 def test_no_producer_bypasses_the_registry():
     """A direct os.environ write would set the variable without registering it, so
     its own code fields would then be dropped as untrusted."""

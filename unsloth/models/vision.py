@@ -1143,11 +1143,14 @@ class FastBaseModel:
         # Check for custom data-types
         custom_datatype = None
         correct_dtype = None
-        custom_datatype, _code_is_trusted = trusted_custom_dtype()
-        if custom_datatype != "":
-            assert custom_datatype.count(";") >= 4
+        # The raw value is kept in its own name. `custom_datatype` has to stay None when
+        # the variable is unset, because the consumer further down tests `is not None`
+        # and would otherwise walk every module of every model to exec an empty string.
+        _raw_custom_dtype, _code_is_trusted = trusted_custom_dtype()
+        if _raw_custom_dtype != "":
+            assert _raw_custom_dtype.count(";") >= 4
             checker, _dtype, _bnb_compute_dtype, _custom_datatype, execute_code = (
-                custom_datatype.split(";", 4)
+                _raw_custom_dtype.split(";", 4)
             )
             # Allow custom dtypes on all runs
             allow_all_runs = checker == "all"
