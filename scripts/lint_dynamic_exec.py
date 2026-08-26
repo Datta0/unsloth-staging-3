@@ -137,11 +137,16 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
     while isinstance(node, ast.NamedExpr):
         node = node.value
     if isinstance(node, ast.Starred):
-        # `exec(*(f"import {name}",))` spreads a literal one-element container, so the
-        # source is right there. A starred NAME is left alone: nothing here knows what
-        # it holds, and flagging every `exec(*args)` would be noise.
+        # `exec(*(f"import {name}",))` spreads a literal container, so the source is
+        # right there. The source is always the FIRST element, because that is the
+        # position it occupies in a normal call, so a longer container is read the same
+        # way: `exec(*(f"import {name}", globals()))` and
+        # `compile(*(f"x = {name}", "<x>", "exec"))` are ordinary calls that happen to
+        # pass their later arguments through the same star. Requiring exactly one
+        # element dropped both. A starred NAME is still left alone: nothing here knows
+        # what it holds, and flagging every `exec(*args)` would be noise.
         inner = node.value
-        if isinstance(inner, (ast.Tuple, ast.List)) and len(inner.elts) == 1:
+        if isinstance(inner, (ast.Tuple, ast.List)) and inner.elts:
             return _is_interpolated(inner.elts[0], resolve)
         return None
     if isinstance(node, ast.Name):
@@ -392,13 +397,19 @@ class _Visitor(ast.NodeVisitor):
         `payload = "import "; payload += model_type; exec(payload)` pass while the
         one-line `exec("import " + model_type)` was caught, which is the same code.
 
-        Only `+=`: it is the operator that concatenates, and the others do not build
-        source out of a value.
+        `%=` is the same argument in the other spelling: `_is_interpolated` already
+        reports a binary `"import %s" % name` as `%-format`, and
+        `payload = "import %s"; payload %= name` is that expression written as two
+        statements. The remaining augmented operators do not build source out of a
+        value, so they are left alone.
         """
         self.visit(node.value)
-        if isinstance(node.op, ast.Add):
-            reason = _is_interpolated(node.value) or "string concatenation"
-            self._bind(node.target, f"{reason} appended")
+        if isinstance(node.op, (ast.Add, ast.Mod)):
+            if isinstance(node.op, ast.Mod):
+                reason, verb = "%-format", "applied"
+            else:
+                reason, verb = _is_interpolated(node.value) or "string concatenation", "appended"
+            self._bind(node.target, f"{reason} {verb}")
         self.visit(node.target)
 
     def visit_For(self, node: ast.For):
@@ -408,13 +419,18 @@ class _Visitor(ast.NodeVisitor):
         one stays at the same level of indirection: only a literal tuple or list is
         looked into, so `for payload in build(): ...` reports nothing because nothing
         here knows what `build()` yields.
+
+        A literal iterable also REBINDS: every element is statically visible, so if
+        none of them is built then the target is clean afterwards no matter what it
+        held before. Binding only on the interpolated elements left a stale reason on
+        `payload = f"import {name}"; for payload in ("pass",): exec(payload)`, which
+        executes the literal and nothing else. An empty literal never runs its body and
+        never rebinds, so it clears nothing.
         """
         self.visit(node.iter)
-        if isinstance(node.iter, (ast.Tuple, ast.List)):
-            for element in node.iter.elts:
-                reason = _is_interpolated(element)
-                if reason is not None:
-                    self._bind(node.target, reason)
+        if isinstance(node.iter, (ast.Tuple, ast.List)) and node.iter.elts:
+            reasons = [_is_interpolated(element) for element in node.iter.elts]
+            self._bind(node.target, next((r for r in reasons if r is not None), None))
         self.visit(node.target)
         for statement in node.body + node.orelse:
             self.visit(statement)
@@ -545,13 +561,26 @@ def _magic_argument(rest: str) -> str:
     means a genuine argument is never truncated.
     """
     candidate = rest.strip()
+    after_option = False
     while candidate:
         try:
             ast.parse(candidate)
             return candidate
         except SyntaxError:
             head, separator, tail = candidate.partition(" ")
-            if not separator or not head.startswith("-") and not head.lstrip("-").isdigit():
+            if not separator:
+                break
+            if head.startswith("-"):
+                # An option may carry a value of any shape: `%timeit -s "x=1" exec(...)`
+                # leaves a quoted string at the front, which is not option-looking and
+                # is not numeric, so the loop used to stop there and the whole cell was
+                # skipped. One value per option is consumed, and only immediately after
+                # the option that introduced it, so a genuine argument is still never
+                # truncated.
+                after_option = True
+            elif after_option or head.lstrip("-").isdigit():
+                after_option = False
+            else:
                 break
             candidate = tail.strip()
     return rest
