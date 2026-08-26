@@ -521,6 +521,15 @@ def _get_new_mapper():
         # returned to the caller rather than written into this module's globals.
         import ast
 
+        # literal_eval evaluates literals only, so the body can no longer execute. It
+        # is not a guarantee against resource exhaustion though: ast.parse builds the
+        # whole tree before any literal-only check runs, and CPython dropped the safety
+        # wording from the docs for that reason (python/cpython#95588). The bare except
+        # below already turns the resulting RecursionError into "the probe found
+        # nothing", and `requests`' timeout is per-read rather than total, so cap the
+        # body as well. The real file is around 50KB.
+        if len(new_mapper) > 10_000_000:
+            return {}, {}, {}, {}, {}
         tree = ast.parse(new_mapper)
         source_table = None
         for node in tree.body:

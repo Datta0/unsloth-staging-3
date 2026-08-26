@@ -112,6 +112,34 @@ def test_a_body_without_the_source_table_returns_nothing(monkeypatch):
         assert loader_utils._get_new_mapper() == ({}, {}, {}, {}, {})
 
 
+def test_a_deeply_nested_body_is_survivable(monkeypatch):
+    """literal_eval evaluates literals only, but it is not DoS-safe.
+
+    ast.parse builds the whole tree before any literal-only check runs, so nesting past
+    the compiler's recursion limit raises RecursionError, which is not a ValueError.
+    The probe's bare except catches it; this pins that it stays caught.
+    """
+    body = "__INT_TO_FLOAT_MAPPER = " + "[" * 20000 + "]" * 20000
+    with _serving(body, monkeypatch):
+        assert loader_utils._get_new_mapper() == ({}, {}, {}, {}, {})
+
+
+def test_an_oversized_body_is_not_parsed_at_all(monkeypatch):
+    """The size cap, which bounds parse cost rather than correctness.
+
+    `requests`' timeout is per-read, not total, so a body can be arbitrarily large. The
+    real mapper.py is around 50KB against a 10MB cap.
+    """
+    body = "__INT_TO_FLOAT_MAPPER = {'a' : ('b',)}\n" + ("# padding\n" * 1_100_000)
+    assert len(body) > 10_000_000
+    with _serving(body, monkeypatch):
+        assert loader_utils._get_new_mapper() == ({}, {}, {}, {}, {})
+
+
+def test_the_real_mapper_is_far_below_the_cap():
+    assert len(REAL_MAPPER) < 10_000_000 / 10
+
+
 # --- the probe still works ---------------------------------------------------
 
 
