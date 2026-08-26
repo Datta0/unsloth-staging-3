@@ -193,9 +193,14 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
             # `str.replace(template, old, new)` is the unbound spelling; the template
             # is the first argument rather than the receiver.
             if isinstance(receiver, ast.Name) and receiver.id in ("str", "bytes"):
-                if node.args and isinstance(node.args[0], ast.Constant):
-                    if isinstance(node.args[0].value, (str, bytes)):
-                        return ".replace() on a literal"
+                if node.args:
+                    template = node.args[0]
+                    if isinstance(template, ast.Constant):
+                        if isinstance(template.value, (str, bytes)):
+                            return ".replace() on a literal"
+                    # The template can be built rather than literal, same as for the
+                    # bound spelling handled just above.
+                    return _is_interpolated(template, resolve)
     return None
 
 
@@ -317,18 +322,21 @@ class _Visitor(ast.NodeVisitor):
         self.visit(node.target)
 
     def visit_AugAssign(self, node: ast.AugAssign):
-        """`payload += f"{x}"` builds a string just as `payload = a + f"{x}"` does.
+        """`payload += anything` builds a string the same way `a + b` does.
 
-        `payload` is read, combined, and stored back, so an augmented assignment whose
-        right hand side is interpolated makes the name interpolated. Only `+=` is
-        treated this way: it is the operator that concatenates, and the others do not
-        build source out of a value.
+        `_is_interpolated` reports a plain `a + b` as concatenation without caring what
+        the operands are, so `payload += model_type` has to be treated the same way.
+        Requiring the right hand side to be interpolated made
+        `payload = "import "; payload += model_type; exec(payload)` pass while the
+        one-line `exec("import " + model_type)` was caught, which is the same code.
+
+        Only `+=`: it is the operator that concatenates, and the others do not build
+        source out of a value.
         """
         self.visit(node.value)
         if isinstance(node.op, ast.Add):
-            reason = _is_interpolated(node.value)
-            if reason is not None:
-                self._bind(node.target, f"{reason} appended")
+            reason = _is_interpolated(node.value) or "string concatenation"
+            self._bind(node.target, f"{reason} appended")
         self.visit(node.target)
 
     def visit_NamedExpr(self, node: ast.NamedExpr):
@@ -390,13 +398,7 @@ NOTEBOOK_SUFFIX = ".ipynb"
 
 
 def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
-    """(index, python source) for each code cell, with magics neutralised.
-
-    A `%magic` or `!shell` line is not Python. Replacing it with `pass` at the same
-    indentation, rather than blanking it, keeps a magic that is the only statement in
-    an `if:` body from leaving an empty block. Measured over the 113 template
-    notebooks that takes the cells which parse from 2182 to 2192 of 2202.
-    """
+    """(index, raw source) for each code cell, exactly as written."""
     try:
         document = json.loads(path.read_bytes().decode("utf-8", errors = "replace"))
     except (ValueError, UnicodeError) as error:
@@ -411,48 +413,82 @@ def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
         source = cell.get("source", "")
         if isinstance(source, list):
             source = "".join(source)
-        lines = []
-        for line in source.splitlines():
-            stripped = line.lstrip()
-            if stripped.startswith(("%", "!")):
-                lines.append(line[: len(line) - len(stripped)] + "pass")
-            else:
-                lines.append(line)
-        cells.append((index, "\n".join(lines)))
+        cells.append((index, source))
     return cells
 
 
-def _scan_notebook(path: Path) -> list[dict]:
-    """Findings across a notebook's code cells.
+def _neutralised(source: str) -> str:
+    """The cell with IPython magics and shell escapes replaced by `pass`.
 
-    A cell that will not parse is SKIPPED, which is the opposite of what a `.py` file
-    gets, and the difference is deliberate. A `.py` file claims to be a Python module,
-    so failing to parse it means the gate did not check something it was supposed to.
-    A notebook cell routinely is not Python at all - a shell command with a line
-    continuation, a partial snippet - and failing the build on those would reject the
-    repository's own notebooks. The count is printed so the gap stays visible rather
-    than silent.
+    A `%magic` becomes `pass` at the same indentation rather than a blank line, so a
+    magic alone in an `if:` body does not leave an empty block. A `!cmd \\` continues
+    onto the following physical lines, and those are blanked too - otherwise ordinary
+    Python further down the same cell was thrown away with the shell command.
     """
-    findings, skipped = [], 0
-    for index, code in _notebook_code_cells(path):
+    out, continuing = [], False
+    for line in source.splitlines():
+        if continuing:
+            out.append("")
+            continuing = line.rstrip().endswith("\\")
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith(("%", "!")):
+            out.append(line[: len(line) - len(stripped)] + "pass")
+            continuing = line.rstrip().endswith("\\")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _parse_cell(code: str, filename: str):
+    """The cell's AST, trying it verbatim before neutralising anything.
+
+    Parsing the raw text first matters: a line may begin with `%` and be an ordinary
+    continuation of a modulo expression rather than a magic, and rewriting that to
+    `pass` corrupted a cell that was valid Python to begin with. Only a cell that
+    genuinely will not parse is put through `_neutralised`.
+    """
+    for candidate in (code, _neutralised(code)):
         try:
-            tree = ast.parse(code, filename = f"{path}#cell{index}")
+            return ast.parse(candidate, filename = filename)
         except (SyntaxError, ValueError):
+            continue
+    return None
+
+
+def _scan_notebook(path: Path) -> list[dict]:
+    """Findings across a notebook's code cells, which share one namespace.
+
+    A single visitor spans the cells, because a notebook's cells run in order against
+    the same globals: a payload built in one cell and executed in a later one is the
+    natural way to write it, and a fresh visitor per cell threw that away. Only the
+    qualname prefix changes per cell, so findings stay attributable.
+
+    A cell that will not parse either way is SKIPPED, which is the opposite of what a
+    `.py` file gets, and the difference is deliberate. A `.py` file claims to be a
+    Python module, so failing to parse it means the gate did not check something it was
+    supposed to. A notebook cell routinely is not Python at all. The count is printed
+    so the gap stays visible rather than silent.
+    """
+    visitor = _Visitor(path)
+    skipped = 0
+    for index, code in _notebook_code_cells(path):
+        tree = _parse_cell(code, f"{path}#cell{index}")
+        if tree is None:
             skipped += 1
             continue
-        visitor = _Visitor(path)
+        if _annotations_deferred(tree):
+            visitor.annotations_deferred = True
         visitor.qualname_prefix = f"cell{index}"
-        visitor.annotations_deferred = _annotations_deferred(tree)
         try:
             visitor.visit(tree)
         except RecursionError:
             raise ScanError(
                 f"{_relative(path)}#cell{index}: too deeply nested to walk"
             ) from None
-        findings.extend(visitor.findings)
     if skipped:
         NOTEBOOK_SKIPPED.append((_relative(path), skipped))
-    return findings
+    return visitor.findings
 
 
 NOTEBOOK_SKIPPED: list[tuple[str, int]] = []
@@ -669,6 +705,11 @@ def j(name):
     (payload := f"import {name}")
     exec(payload)
 
+def m(model_type):
+    payload = "import "
+    payload += model_type
+    exec(payload)
+
 def k(name):
     table = {}
     payload = table[exec(payload)] = f"import {name}"
@@ -726,11 +767,12 @@ def self_test() -> int:
             "f-string via `payload`",
             "f-string via `payload`",
             "string concatenation",
+            "string concatenation appended via `payload`",
         ]
         if kinds != expected:
             failures.append(f"expected {expected}, got {kinds}")
         if any(
-            f["qualname"] not in ("f", "g", "h", "i", "j", "k", "l", "<module>")
+            f["qualname"] not in ("f", "g", "h", "i", "j", "k", "l", "m", "<module>")
             for f in findings
         ):
             failures.append(f"qualname wrong: {[f['qualname'] for f in findings]}")
@@ -831,6 +873,29 @@ def self_test() -> int:
         live.write_text('name = "os"\npayload: exec(payload) = f"import {name}"\n')
         if not scan_file(live):
             failures.append("a module-scope runtime annotation was not reported")
+
+        # A notebook's cells share one namespace, and a `%`-leading continuation of a
+        # modulo expression is not a magic.
+        import json as _json
+        def _nb(cells):
+            return _json.dumps({
+                "cells": [{"cell_type": "code", "source": c} for c in cells],
+                "metadata": {}, "nbformat": 4, "nbformat_minor": 5,
+            })
+        for name, cells in (
+            # payload built in one cell, executed in the next
+            ("cross.ipynb", [['name = "os"\n', 'payload = f"import {name}"\n'],
+                             ["exec(payload)\n"]]),
+            # a continuation line starting with `%` is modulo, not a magic
+            ("modulo.ipynb", [['name = "os"\n', 'exec("import %s"\n', "     % name)\n"]]),
+            # ordinary Python after a multi-line shell command must still be read
+            ("mixed.ipynb", [["!pip install x \\\n", "  --quiet\n",
+                              'name = "os"\n', 'exec(f"import {name}")\n']]),
+        ):
+            notebook = Path(directory) / name
+            notebook.write_text(_nb(cells))
+            if not scan_file(notebook):
+                failures.append(f"{name}: notebook payload was not reported")
 
         # An existing but empty directory is reduced coverage, not a clean run.
         hollow = Path(directory) / "hollow"
