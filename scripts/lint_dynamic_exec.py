@@ -102,14 +102,16 @@ class _Visitor(ast.NodeVisitor):
         if isinstance(function, ast.Name) and function.id in SINKS and node.args:
             reason = _is_interpolated(node.args[0])
             if reason is not None:
-                self.findings.append({
-                    "path": _relative(self.path),
-                    "qualname": self._qualname(),
-                    "sink": function.id,
-                    "reason": reason,
-                    "line": node.lineno,
-                    "hash": _call_hash(node),
-                })
+                self.findings.append(
+                    {
+                        "path": _relative(self.path),
+                        "qualname": self._qualname(),
+                        "sink": function.id,
+                        "reason": reason,
+                        "line": node.lineno,
+                        "hash": _call_hash(node),
+                    }
+                )
         self.generic_visit(node)
 
 
@@ -150,8 +152,7 @@ def collect_paths(targets: list[str]) -> list[Path]:
             paths.append(root)
         elif root.is_dir():
             paths.extend(
-                p for p in root.rglob("*.py")
-                if "tests" not in p.relative_to(REPO_ROOT).parts
+                p for p in root.rglob("*.py") if "tests" not in p.relative_to(REPO_ROOT).parts
             )
     return paths
 
@@ -172,14 +173,16 @@ def write_allowlist(findings: list[dict], reason: str) -> None:
     allowed = []
     for finding in findings:
         previous = existing.get(key_of(finding), {})
-        allowed.append({
-            "path": finding["path"],
-            "qualname": finding["qualname"],
-            "sink": finding["sink"],
-            "kind": finding["reason"],
-            "hash": finding["hash"],
-            "reason": previous.get("reason", reason),
-        })
+        allowed.append(
+            {
+                "path": finding["path"],
+                "qualname": finding["qualname"],
+                "sink": finding["sink"],
+                "kind": finding["reason"],
+                "hash": finding["hash"],
+                "reason": previous.get("reason", reason),
+            }
+        )
     allowed.sort(key = lambda e: (e["path"], e["qualname"], e["hash"]))
     ALLOWLIST_PATH.write_text(
         json.dumps(
@@ -194,21 +197,22 @@ def write_allowlist(findings: list[dict], reason: str) -> None:
                 "allowed": allowed,
             },
             indent = 2,
-        ) + "\n"
+        )
+        + "\n"
     )
 
 
 # --- self test ---------------------------------------------------------------
 
-_BAD = '''
+_BAD = """
 def f(model_type):
     exec(f"import transformers.models.{model_type}")
     eval("torch." + name)
     compile("x = %s" % value, "<x>", "exec")
     exec("a.{}.b".format(name))
-'''
+"""
 
-_GOOD = '''
+_GOOD = """
 import inspect
 
 def f(cls):
@@ -218,7 +222,7 @@ def f(cls):
     exec(f"plain f-string with no placeholders")
     module.exec(f"{name}")          # not the builtin
     exec()                          # no arguments
-'''
+"""
 
 
 def self_test() -> int:
@@ -268,10 +272,15 @@ def self_test() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description = __doc__)
     parser.add_argument("--self-test", action = "store_true")
-    parser.add_argument("--update", action = "store_true",
-                        help = "rewrite the allowlist from the current tree")
-    parser.add_argument("--paths", nargs = "*", default = None,
-                        help = "files or directories to scan (default: the package)")
+    parser.add_argument(
+        "--update", action = "store_true", help = "rewrite the allowlist from the current tree"
+    )
+    parser.add_argument(
+        "--paths",
+        nargs = "*",
+        default = None,
+        help = "files or directories to scan (default: the package)",
+    )
     args = parser.parse_args()
 
     if args.self_test:
@@ -288,16 +297,14 @@ def main() -> int:
     allowlist = load_allowlist()
     unreviewed = [f for f in findings if key_of(f) not in allowlist]
     pending = [
-        entry for entry in allowlist.values()
+        entry
+        for entry in allowlist.values()
         if entry.get("reason", "").strip().upper() in ("", "REVIEW ME")
     ]
     # Staleness is only meaningful over the whole tree: with --paths the scan is a
     # subset, so every entry outside it would look stale.
     seen = {key_of(f) for f in findings}
-    stale = (
-        [] if args.paths
-        else [entry for key, entry in allowlist.items() if key not in seen]
-    )
+    stale = [] if args.paths else [entry for key, entry in allowlist.items() if key not in seen]
 
     for finding in unreviewed:
         print(

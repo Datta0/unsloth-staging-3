@@ -29,7 +29,9 @@ ALLOWLIST = REPO_ROOT / "scripts" / "dynamic_exec_allowlist.json"
 def _run(*args) -> subprocess.CompletedProcess:
     return subprocess.run(
         [sys.executable, str(SCRIPT), *args],
-        capture_output = True, text = True, cwd = REPO_ROOT,
+        capture_output = True,
+        text = True,
+        cwd = REPO_ROOT,
     )
 
 
@@ -46,19 +48,23 @@ def test_self_test_passes():
 def test_live_tree_passes():
     """Every interpolated dynamic-execution call in the tree is reviewed."""
     proc = _run()
-    assert proc.returncode == 0, (
-        f"the live tree fails the lint:\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
-    )
+    assert (
+        proc.returncode == 0
+    ), f"the live tree fails the lint:\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
 
 
 # --- the lint actually catches things ----------------------------------------
 
-@pytest.mark.parametrize("body, description", [
-    ('exec(f"import {x}")', "f-string"),
-    ('eval("torch." + x)', "concatenation"),
-    ('compile("y = %s" % x, "<x>", "exec")', "%-format"),
-    ('exec("a.{}".format(x))', ".format()"),
-])
+
+@pytest.mark.parametrize(
+    "body, description",
+    [
+        ('exec(f"import {x}")', "f-string"),
+        ('eval("torch." + x)', "concatenation"),
+        ('compile("y = %s" % x, "<x>", "exec")', "%-format"),
+        ('exec("a.{}".format(x))', ".format()"),
+    ],
+)
 def test_a_new_interpolated_call_fails(body, description, tmp_path):
     offender = tmp_path / "offender.py"
     offender.write_text(f"def f(x):\n    {body}\n")
@@ -67,12 +73,15 @@ def test_a_new_interpolated_call_fails(body, description, tmp_path):
     assert "offender.py" in proc.stderr
 
 
-@pytest.mark.parametrize("body", [
-    "exec(source, globals())",
-    "eval(name)",
-    'exec("literal source")',
-    'module.exec(f"{x}")',
-])
+@pytest.mark.parametrize(
+    "body",
+    [
+        "exec(source, globals())",
+        "eval(name)",
+        'exec("literal source")',
+        'module.exec(f"{x}")',
+    ],
+)
 def test_non_interpolated_calls_are_not_flagged(body, tmp_path):
     """Bare exec of generated source is the normal case here and must stay quiet."""
     clean = tmp_path / "clean.py"
@@ -83,14 +92,12 @@ def test_non_interpolated_calls_are_not_flagged(body, tmp_path):
 
 # --- the allowlist has to stay honest ----------------------------------------
 
+
 def test_every_allowlist_entry_has_a_justification():
     # An empty allowlist is a legitimate state: it means no interpolated dynamic
     # execution is left in this repo at all.
     entries = json.loads(ALLOWLIST.read_text())["allowed"]
-    unjustified = [
-        e for e in entries
-        if e.get("reason", "").strip().upper() in ("", "REVIEW ME")
-    ]
+    unjustified = [e for e in entries if e.get("reason", "").strip().upper() in ("", "REVIEW ME")]
     assert not unjustified, unjustified
 
 
@@ -131,14 +138,27 @@ def _isolated_lint(tmp_path, allowlist):
 
 def test_a_stale_allowlist_entry_fails(tmp_path):
     """An entry matching nothing means the tree moved on; --update is required."""
-    script = _isolated_lint(tmp_path, {"allowed": [{
-        "path": "gone.py", "qualname": "f", "sink": "exec",
-        "kind": "f-string", "hash": "0" * 16, "reason": "was reviewed once",
-    }]})
+    script = _isolated_lint(
+        tmp_path,
+        {
+            "allowed": [
+                {
+                    "path": "gone.py",
+                    "qualname": "f",
+                    "sink": "exec",
+                    "kind": "f-string",
+                    "hash": "0" * 16,
+                    "reason": "was reviewed once",
+                }
+            ]
+        },
+    )
     # A full scan, not --paths: staleness is only meaningful over the whole tree,
     # and this copy's tree contains none of the package directories.
     proc = subprocess.run(
-        [sys.executable, str(script)], capture_output = True, text = True,
+        [sys.executable, str(script)],
+        capture_output = True,
+        text = True,
     )
     assert proc.returncode == 1
     assert "no longer matches any call" in proc.stderr
@@ -164,14 +184,25 @@ def test_an_unjustified_allowlist_entry_fails(tmp_path):
         sys.path.pop(0)
     finding = lint.scan_file(offender)[0]
 
-    script = _isolated_lint(tmp_path, {"allowed": [{
-        "path": finding["path"], "qualname": finding["qualname"],
-        "sink": finding["sink"], "kind": finding["reason"],
-        "hash": finding["hash"], "reason": "REVIEW ME",
-    }]})
+    script = _isolated_lint(
+        tmp_path,
+        {
+            "allowed": [
+                {
+                    "path": finding["path"],
+                    "qualname": finding["qualname"],
+                    "sink": finding["sink"],
+                    "kind": finding["reason"],
+                    "hash": finding["hash"],
+                    "reason": "REVIEW ME",
+                }
+            ]
+        },
+    )
     proc = subprocess.run(
         [sys.executable, str(script), "--paths", str(offender)],
-        capture_output = True, text = True,
+        capture_output = True,
+        text = True,
     )
     assert proc.returncode == 1
     assert "no justification" in proc.stderr

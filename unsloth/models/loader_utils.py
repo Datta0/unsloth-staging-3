@@ -520,10 +520,12 @@ def _get_new_mapper():
         # must not change what the installed version resolves - hence the tables are
         # returned to the caller rather than written into this module's globals.
         import ast
+
         tree = ast.parse(new_mapper)
         source_table = None
         for node in tree.body:
-            if not isinstance(node, ast.Assign): continue
+            if not isinstance(node, ast.Assign):
+                continue
             targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
             if "__INT_TO_FLOAT_MAPPER" in targets:
                 source_table = ast.literal_eval(node.value)

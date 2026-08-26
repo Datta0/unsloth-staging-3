@@ -28,21 +28,25 @@ from unsloth.models import loader_utils
 from unsloth.models.mapper import build_mappers
 
 
-REAL_MAPPER = open(
-    __import__("pathlib").Path(loader_utils.__file__).with_name("mapper.py")
-).read()
+REAL_MAPPER = open(__import__("pathlib").Path(loader_utils.__file__).with_name("mapper.py")).read()
 
 
 class _Response:
-    def __init__(self, text): self.text = text
-    def __enter__(self): return self
-    def __exit__(self, *exception): return False
+    def __init__(self, text):
+        self.text = text
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        return False
 
 
 @contextmanager
 def _serving(body, monkeypatch):
     """Makes the probe's `requests.get` return `body`."""
     import requests
+
     monkeypatch.setattr(requests, "get", lambda *a, **k: _Response(body))
     yield
 
@@ -50,9 +54,11 @@ def _serving(body, monkeypatch):
 @pytest.fixture
 def no_dynamic_execution(monkeypatch):
     """Turns any exec/eval/compile during the probe into a failure."""
+
     def _forbidden(name):
         def _raise(*args, **kwargs):
             raise AssertionError(f"_get_new_mapper called {name}()")
+
         return _raise
 
     monkeypatch.setattr(builtins, "exec", _forbidden("exec"))
@@ -68,15 +74,16 @@ PAYLOADS = [
     f"__INT_TO_FLOAT_MAPPER = {{}}\nimport os\nos.system('touch {MARKER}')\n",
     f"open({MARKER!r}, 'w').close()\n__INT_TO_FLOAT_MAPPER = {{}}\n",
     "__INT_TO_FLOAT_MAPPER = __import__('os').environ\n",
-    "class X:\n    def __init__(self): __import__('os').getpid()\n"
-    "__INT_TO_FLOAT_MAPPER = X()\n",
+    "class X:\n    def __init__(self): __import__('os').getpid()\n__INT_TO_FLOAT_MAPPER = X()\n",
 ]
 
 
 @pytest.mark.parametrize("payload", PAYLOADS)
 def test_payload_in_the_response_is_never_executed(payload, monkeypatch, tmp_path):
     import os
-    if os.path.exists(MARKER): os.remove(MARKER)
+
+    if os.path.exists(MARKER):
+        os.remove(MARKER)
 
     with _serving(payload, monkeypatch):
         result = loader_utils._get_new_mapper()
@@ -107,12 +114,14 @@ def test_a_body_without_the_source_table_returns_nothing(monkeypatch):
 
 # --- the probe still works ---------------------------------------------------
 
+
 def test_real_mapper_body_reproduces_the_installed_tables(monkeypatch):
     """Serving the installed mapper.py back must reproduce the installed tables."""
     with _serving(REAL_MAPPER, monkeypatch):
         result = loader_utils._get_new_mapper()
 
     from unsloth.models import mapper
+
     expected = (
         mapper.INT_TO_FLOAT_MAPPER,
         mapper.FLOAT_TO_INT_MAPPER,

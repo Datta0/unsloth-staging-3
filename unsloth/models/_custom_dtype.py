@@ -44,20 +44,20 @@ import torch
 # loader.py uses `None`, `torch.float16` or `torch.bfloat16`. A table instead of
 # `eval` means the field names a dtype rather than being an arbitrary expression.
 DTYPE_ALIASES = {
-    "None"           : None,
-    "none"           : None,
-    ""               : None,
-    "torch.float16"  : torch.float16,
-    "torch.bfloat16" : torch.bfloat16,
-    "torch.float32"  : torch.float32,
-    "torch.float64"  : torch.float64,
-    "float16"        : torch.float16,
-    "bfloat16"       : torch.bfloat16,
-    "float32"        : torch.float32,
-    "float64"        : torch.float64,
-    "fp16"           : torch.float16,
-    "bf16"           : torch.bfloat16,
-    "fp32"           : torch.float32,
+    "None": None,
+    "none": None,
+    "": None,
+    "torch.float16": torch.float16,
+    "torch.bfloat16": torch.bfloat16,
+    "torch.float32": torch.float32,
+    "torch.float64": torch.float64,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+    "float32": torch.float32,
+    "float64": torch.float64,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
+    "fp32": torch.float32,
 }
 
 _ENV_KEY = "UNSLOTH_FORCE_CUSTOM_DTYPE"
@@ -68,7 +68,7 @@ _REGISTERED = set()
 
 
 def resolve_dtype(text):
-    """ Maps a dtype field of `UNSLOTH_FORCE_CUSTOM_DTYPE` onto a torch dtype """
+    """Maps a dtype field of `UNSLOTH_FORCE_CUSTOM_DTYPE` onto a torch dtype"""
     key = str(text).strip()
     if key not in DTYPE_ALIASES:
         raise ValueError(
@@ -76,24 +76,28 @@ def resolve_dtype(text):
             f"Supported: {sorted(x for x in DTYPE_ALIASES if x)}"
         )
     return DTYPE_ALIASES[key]
-pass
+
+
 
 
 def register_custom_dtype(value):
-    """ Sets `UNSLOTH_FORCE_CUSTOM_DTYPE` and records it as ours """
+    """Sets `UNSLOTH_FORCE_CUSTOM_DTYPE` and records it as ours"""
     _REGISTERED.add(value)
     os.environ[_ENV_KEY] = value
     return value
-pass
+
+
 
 
 def trusted_custom_dtype():
-    """ Returns (value, code_is_trusted).
+    """Returns (value, code_is_trusted).
 
     `code_is_trusted` is False for a value this process did not set, which is the
     signal to honour the dtype fields but drop the two code fields.
     """
     value = os.environ.get(_ENV_KEY, "")
-    if value == "": return "", False
+    if value == "":
+        return "", False
     return value, value in _REGISTERED
-pass
+
+

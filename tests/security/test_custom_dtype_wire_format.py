@@ -27,9 +27,7 @@ import pytest
 from unsloth.models._custom_dtype import register_custom_dtype, trusted_custom_dtype
 
 
-LOADER = pathlib.Path(
-    __import__("unsloth.models.loader", fromlist = ["x"]).__file__
-).read_text()
+LOADER = pathlib.Path(__import__("unsloth.models.loader", fromlist = ["x"]).__file__).read_text()
 
 
 def _shipped_values() -> list[str]:
@@ -65,15 +63,17 @@ def test_zoo_reader_still_parses_what_unsloth_writes():
     unsloth_zoo is imported rather than copied so a layout change there fails here.
     """
     import unsloth_zoo.compiler as zoo_compiler
+
     source = pathlib.Path(zoo_compiler.__file__).read_text()
-    assert 'custom_datatype.count(";") >= 4' in source, (
-        "unsloth_zoo changed how it validates UNSLOTH_FORCE_CUSTOM_DTYPE"
-    )
-    assert 'custom_datatype.split(";", 4)' in source, (
-        "unsloth_zoo changed the field split for UNSLOTH_FORCE_CUSTOM_DTYPE"
-    )
+    assert (
+        'custom_datatype.count(";") >= 4' in source
+    ), "unsloth_zoo changed how it validates UNSLOTH_FORCE_CUSTOM_DTYPE"
+    assert (
+        'custom_datatype.split(";", 4)' in source
+    ), "unsloth_zoo changed the field split for UNSLOTH_FORCE_CUSTOM_DTYPE"
 
     from unsloth_zoo.utils import _get_dtype
+
     for value in _shipped_values():
         _, dtype, _, _, _ = value.split(";", 4)
         resolved = _get_dtype(dtype.strip().removeprefix("torch."))
@@ -96,8 +96,8 @@ def test_trust_decision_is_on_the_value_we_set(monkeypatch):
     inherited = ";".join([checker, dtype, bnb, custom, "import os; os.system('x')"])
     monkeypatch.setenv("UNSLOTH_FORCE_CUSTOM_DTYPE", inherited)
     value, trusted = trusted_custom_dtype()
-    assert value == inherited          # dtype fields still readable
-    assert not trusted                 # code fields are not
+    assert value == inherited  # dtype fields still readable
+    assert not trusted  # code fields are not
 
     ours = ";".join([checker, dtype, bnb, custom, "pass  # only this test sets this"])
     register_custom_dtype(ours)

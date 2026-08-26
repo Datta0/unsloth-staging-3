@@ -36,9 +36,7 @@ from unsloth.models._custom_dtype import (
 )
 
 
-LOADER = pathlib.Path(
-    __import__("unsloth.models.loader", fromlist = ["x"]).__file__
-).read_text()
+LOADER = pathlib.Path(__import__("unsloth.models.loader", fromlist = ["x"]).__file__).read_text()
 
 
 def _shipped_values():
@@ -50,7 +48,8 @@ def _shipped_values():
     tree = ast.parse(LOADER)
     values = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call): continue
+        if not isinstance(node, ast.Call):
+            continue
         function = node.func
         if not (isinstance(function, ast.Name) and function.id == "register_custom_dtype"):
             continue
@@ -72,14 +71,14 @@ def test_the_producers_were_all_found():
 
 # --- every shipped dtype field must resolve ----------------------------------
 
+
 @pytest.mark.parametrize("value", _shipped_values())
 def test_shipped_dtype_fields_resolve(value):
     """A false rejection here breaks loading one of the six model families."""
     checker, dtype, bnb_compute_dtype, custom_datatype, execute_code = value.split(";", 4)
     assert resolve_dtype(dtype) is None or isinstance(resolve_dtype(dtype), torch.dtype)
-    assert (
-        resolve_dtype(bnb_compute_dtype) is None
-        or isinstance(resolve_dtype(bnb_compute_dtype), torch.dtype)
+    assert resolve_dtype(bnb_compute_dtype) is None or isinstance(
+        resolve_dtype(bnb_compute_dtype), torch.dtype
     )
 
 
@@ -94,15 +93,19 @@ def test_shipped_dtype_fields_match_the_old_eval(value):
 
 # --- a dtype field is no longer an expression --------------------------------
 
-@pytest.mark.parametrize("payload", [
-    "__import__('os').system('touch /tmp/pwned')",
-    "torch.float16 if __import__('os') else None",
-    "open('/etc/passwd').read()",
-    "exec('x=1')",
-    "torch.cuda.synchronize()",
-    "[].__class__",
-    "torch.float8_e4m3fn",   # a real dtype, but not one this channel supports
-])
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "__import__('os').system('touch /tmp/pwned')",
+        "torch.float16 if __import__('os') else None",
+        "open('/etc/passwd').read()",
+        "exec('x=1')",
+        "torch.cuda.synchronize()",
+        "[].__class__",
+        "torch.float8_e4m3fn",  # a real dtype, but not one this channel supports
+    ],
+)
 def test_hostile_dtype_field_rejected(payload):
     with pytest.raises(ValueError, match = "unsupported dtype"):
         resolve_dtype(payload)
@@ -114,6 +117,7 @@ def test_table_covers_only_dtypes():
 
 
 # --- the code fields are only ours -------------------------------------------
+
 
 def test_a_value_we_set_is_trusted(monkeypatch):
     monkeypatch.delenv("UNSLOTH_FORCE_CUSTOM_DTYPE", raising = False)
@@ -129,8 +133,8 @@ def test_an_inherited_value_is_not_trusted(monkeypatch):
     payload = "all;None;None;pass;import os; os.system('touch /tmp/pwned')"
     monkeypatch.setenv("UNSLOTH_FORCE_CUSTOM_DTYPE", payload)
     got, trusted = trusted_custom_dtype()
-    assert got == payload      # dtype fields still readable
-    assert not trusted         # code fields are not
+    assert got == payload  # dtype fields still readable
+    assert not trusted  # code fields are not
 
 
 def test_an_inherited_value_that_mimics_ours_is_still_not_trusted(monkeypatch):
@@ -148,10 +152,9 @@ def test_unset_is_empty(monkeypatch):
 
 # --- vision.py no longer evaluates the fields --------------------------------
 
+
 def test_vision_does_not_eval_the_dtype_fields():
-    source = pathlib.Path(
-        __import__("unsloth.models.vision", fromlist = ["x"]).__file__
-    ).read_text()
+    source = pathlib.Path(__import__("unsloth.models.vision", fromlist = ["x"]).__file__).read_text()
     assert "eval(_dtype)" not in source
     assert "eval(_bnb_compute_dtype)" not in source
     # The remaining exec is the code field, and it is gated.
