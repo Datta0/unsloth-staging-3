@@ -63,6 +63,14 @@ def test_live_tree_passes():
         ('eval("torch." + x)', "concatenation"),
         ('compile("y = %s" % x, "<x>", "exec")', "%-format"),
         ('exec("a.{}".format(x))', ".format()"),
+        # `compile`'s source is not positional-only, so an interpolated payload can
+        # reach it with `node.args` empty.
+        (
+            'compile(source = f"y = {x}", filename = "<x>", mode = "exec")',
+            "compile source= keyword",
+        ),
+        ('builtins.compile(source = f"y = {x}", filename = "<x>", mode = "exec")',
+         "builtins.compile source= keyword"),
     ],
 )
 def test_a_new_interpolated_call_fails(body, description, tmp_path):
@@ -80,12 +88,17 @@ def test_a_new_interpolated_call_fails(body, description, tmp_path):
         "eval(name)",
         'exec("literal source")',
         'module.exec(f"{x}")',
+        # Keyword resolution must not invent findings: a literal source, and a
+        # sink call carrying no source at all, both stay quiet.
+        'compile(source = "literal", filename = "<x>", mode = "exec")',
+        'compile(filename = "<x>", mode = "exec")',
+        'exec(**kwargs)',
     ],
 )
 def test_non_interpolated_calls_are_not_flagged(body, tmp_path):
     """Bare exec of generated source is the normal case here and must stay quiet."""
     clean = tmp_path / "clean.py"
-    clean.write_text(f"def f(source, name, x, module):\n    {body}\n")
+    clean.write_text(f"def f(source, name, x, module, **kwargs):\n    {body}\n")
     proc = _run("--paths", str(clean))
     assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
 

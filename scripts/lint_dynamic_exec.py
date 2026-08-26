@@ -98,6 +98,26 @@ def _sink_name(function: ast.AST) -> str | None:
     return None
 
 
+def _source_argument(node: ast.Call, sink: str) -> ast.AST | None:
+    """The source argument of a sink call, whether positional or by keyword.
+
+    `exec` and `eval` take their source positional-only, so for those it is always
+    `args[0]`. `compile` does not: its signature is
+    `compile(source, filename, mode, ...)` with no `/`, so
+    `compile(source = f"y = {x}", filename = "<x>", mode = "exec")` compiles exactly
+    the same payload with `node.args` empty. Checking only `args[0]` meant that call
+    was skipped entirely. `studio/backend/core/inference/tools.py` already resolves
+    sink arguments this way.
+    """
+    if node.args:
+        return node.args[0]
+    if sink.rpartition(".")[2] == "compile":
+        for keyword in node.keywords:
+            if keyword.arg == "source":
+                return keyword.value
+    return None
+
+
 class _Visitor(ast.NodeVisitor):
     def __init__(self, path: Path):
         self.path = path
@@ -142,8 +162,8 @@ class _Visitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call):
         sink = _sink_name(node.func)
-        if sink is not None and node.args:
-            argument = node.args[0]
+        argument = _source_argument(node, sink) if sink is not None else None
+        if argument is not None:
             reason = _is_interpolated(argument)
             if reason is None and isinstance(argument, ast.Name):
                 reason = self.tainted[-1].get(argument.id)
@@ -172,14 +192,28 @@ def _call_hash(node: ast.Call) -> str:
 
 
 def scan_file(path: Path) -> list[dict]:
-    source = path.read_text(encoding = "utf-8", errors = "replace")
+    # A hard CI gate must not fall over on something that is not a readable file. A
+    # dangling symlink, a directory named `*.py`, or a symlink to one all reach here
+    # through rglob and raise out of read_text, failing the build for a reason that has
+    # nothing to do with dynamic execution.
+    try:
+        source = path.read_text(encoding = "utf-8", errors = "replace")
+    except OSError:
+        return []
     try:
         tree = ast.parse(source, filename = str(path))
-    except SyntaxError:
-        # compileall in the same lint job is what reports unparseable files.
+    except (SyntaxError, ValueError):
+        # compileall in the same lint job is what reports unparseable files. ValueError
+        # covers a source containing a NUL byte, which ast.parse rejects separately.
         return []
     visitor = _Visitor(path)
-    visitor.visit(tree)
+    try:
+        visitor.visit(tree)
+    except RecursionError:
+        # A deeply nested literal can exhaust the stack during the walk, after parse
+        # succeeded. Report nothing rather than taking the gate down; compileall still
+        # sees the file.
+        return []
     return visitor.findings
 
 
@@ -197,8 +231,11 @@ def collect_paths(targets: list[str]) -> list[Path]:
         if root.is_file() and root.suffix == ".py":
             paths.append(root)
         elif root.is_dir():
+            # `is_file()` on each hit, so a directory named `foo.py` and a symlink that
+            # points at one are skipped rather than read.
             paths.extend(
-                p for p in root.rglob("*.py") if "tests" not in p.relative_to(REPO_ROOT).parts
+                p for p in root.rglob("*.py")
+                if p.is_file() and "tests" not in p.relative_to(REPO_ROOT).parts
             )
     return paths
 
@@ -264,6 +301,7 @@ def f(model_type):
     eval("torch." + name)
     compile("x = %s" % value, "<x>", "exec")
     exec("a.{}.b".format(name))
+    compile(source = f"y = {value}", filename = "<x>", mode = "exec")
 """
 
 _GOOD = """
@@ -288,8 +326,8 @@ def self_test() -> int:
         bad.write_text(_BAD)
         findings = scan_file(bad)
         kinds = sorted(f["reason"] for f in findings)
-        if kinds != ["%-format", ".format()", "f-string", "string concatenation"]:
-            failures.append(f"expected all four shapes, got {kinds}")
+        if kinds != ["%-format", ".format()", "f-string", "f-string", "string concatenation"]:
+            failures.append(f"expected all four shapes plus the keyword call, got {kinds}")
         if any(f["qualname"] != "f" for f in findings):
             failures.append(f"qualname wrong: {[f['qualname'] for f in findings]}")
 
