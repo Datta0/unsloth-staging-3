@@ -98,6 +98,10 @@ def _install_fake_vllm_absent(monkeypatch, namespace):
 def _load_resolver(installed_source):
     """Stand-in for loader_utils' module globals, built from `installed_source`."""
     from unsloth_zoo.utils import Version
+    # loader_utils imports this from .mapper; _get_new_mapper derives the fetched tables
+    # with it, so the stand-in globals need it or the probe NameErrors into its own bare
+    # except and returns empty tables.
+    from unsloth.models.mapper import build_mappers
 
     mapper_ns = {}
     exec(compile(installed_source, "mapper.py", "exec"), mapper_ns)
@@ -108,6 +112,7 @@ def _load_resolver(installed_source):
         "MAP_TO_UNSLOTH_16bit": mapper_ns["MAP_TO_UNSLOTH_16bit"],
         "FLOAT_TO_FP8_BLOCK_MAPPER": mapper_ns["FLOAT_TO_FP8_BLOCK_MAPPER"],
         "FLOAT_TO_FP8_ROW_MAPPER": mapper_ns["FLOAT_TO_FP8_ROW_MAPPER"],
+        "build_mappers": build_mappers,
         "SUPPORTS_FOURBIT": True,
         "transformers_version": Version("4.57.6"),
         "Version": Version,

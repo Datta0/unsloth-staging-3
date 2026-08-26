@@ -545,7 +545,37 @@ def _get_new_mapper():
 
         # A newer mapper.py may carry entry shapes this builder does not know; the
         # caller already treats an empty result as "the probe found nothing".
-        return build_mappers(source_table)
+        tables = build_mappers(source_table)
+
+        # The fp8 tables can also gain entries as plain subscript assignments rather
+        # than through the source table, e.g.
+        # `FLOAT_TO_FP8_ROW_MAPPER["org/model-fp8"] = "unsloth/model-fp8-row"`. The exec
+        # this replaced picked those up, and a row-scaled entry in particular cannot be
+        # expressed through the source table without also creating a block entry, so
+        # dropping them would quietly take the row half of the probe down. They are data
+        # like everything else here: literal subscript, literal value, nothing named or
+        # called is ever evaluated.
+        fp8_tables = {
+            "FLOAT_TO_FP8_BLOCK_MAPPER" : tables[3],
+            "FLOAT_TO_FP8_ROW_MAPPER"   : tables[4],
+        }
+        for node in tree.body:
+            if not isinstance(node, ast.Assign): continue
+            for target in node.targets:
+                if not isinstance(target, ast.Subscript): continue
+                if not isinstance(target.value, ast.Name): continue
+                table = fp8_tables.get(target.value.id)
+                if table is None: continue
+                try:
+                    key = ast.literal_eval(target.slice)
+                    table[key] = ast.literal_eval(node.value)
+                except ValueError:
+                    # Not a literal, so not data we can read. Skip it rather than
+                    # failing the whole probe.
+                    continue
+            pass
+        pass
+        return tables
     except:
         return {}, {}, {}, {}, {}
 
