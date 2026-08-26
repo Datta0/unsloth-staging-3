@@ -239,6 +239,10 @@ class _Visitor(ast.NodeVisitor):
         # Set for a notebook cell, so two cells defining the same function name are
         # separate allowlist entries rather than colliding on one key.
         self.qualname_prefix = ""
+        # An annotation only runs at module or class scope, and only when the module
+        # has not deferred annotations. Set by the caller from the parsed tree.
+        self.annotations_deferred = False
+        self.function_depth = 0
         self.scope: list[str] = []
         self.findings: list[dict] = []
         # name -> reason, for locals bound to a built string in the current scope.
@@ -250,12 +254,16 @@ class _Visitor(ast.NodeVisitor):
 
     def _enter(self, node):
         self.scope.append(node.name)
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.function_depth += 1
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
         self.generic_visit(node)
         self.tainted.pop()
         self.scope.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            self.function_depth -= 1
 
     visit_FunctionDef = _enter
     visit_AsyncFunctionDef = _enter
@@ -295,11 +303,17 @@ class _Visitor(ast.NodeVisitor):
         if node.value is not None:
             self.visit(node.value)
             self._bind(node.target, reason)
-        # The annotation is evaluated AFTER the store, so at module or class scope,
-        # where annotations are evaluated at all, a runtime annotation observes the
-        # new binding: `payload: exec(payload) = f"import {name}"` executes the value
-        # that was just assigned. Confirmed on CPython 3.13.
-        self.visit(node.annotation)
+        # The annotation is evaluated AFTER the store, so a runtime annotation
+        # observes the new binding: `payload: exec(payload) = f"import {name}"`
+        # executes the value that was just assigned. Confirmed on CPython 3.13.
+        #
+        # But only where the annotation runs at all. A function-local annotation is
+        # never evaluated, and neither is a module or class one under
+        # `from __future__ import annotations`. Visiting those unconditionally
+        # reported code that cannot execute, which is a false CI failure rather than
+        # a missed detection - verified both cases against the interpreter.
+        if self._annotation_executes():
+            self.visit(node.annotation)
         self.visit(node.target)
 
     def visit_AugAssign(self, node: ast.AugAssign):
@@ -327,6 +341,9 @@ class _Visitor(ast.NodeVisitor):
         """
         self.generic_visit(node)
         self._bind(node.target, _is_interpolated(node.value))
+
+    def _annotation_executes(self) -> bool:
+        return not self.annotations_deferred and self.function_depth == 0
 
     def _bind(self, target: ast.AST, reason: str | None) -> None:
         if not isinstance(target, ast.Name):
@@ -425,6 +442,7 @@ def _scan_notebook(path: Path) -> list[dict]:
             continue
         visitor = _Visitor(path)
         visitor.qualname_prefix = f"cell{index}"
+        visitor.annotations_deferred = _annotations_deferred(tree)
         try:
             visitor.visit(tree)
         except RecursionError:
@@ -438,6 +456,15 @@ def _scan_notebook(path: Path) -> list[dict]:
 
 
 NOTEBOOK_SKIPPED: list[tuple[str, int]] = []
+
+
+def _annotations_deferred(tree: ast.AST) -> bool:
+    """True when the module carries `from __future__ import annotations`."""
+    for node in getattr(tree, "body", []):
+        if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+            if any(alias.name == "annotations" for alias in node.names):
+                return True
+    return False
 
 
 def scan_file(path: Path) -> list[dict]:
@@ -471,6 +498,7 @@ def scan_file(path: Path) -> list[dict]:
             f"it was not checked for interpolated dynamic execution"
         ) from None
     visitor = _Visitor(path)
+    visitor.annotations_deferred = _annotations_deferred(tree)
     try:
         visitor.visit(tree)
     except RecursionError:
@@ -514,11 +542,20 @@ def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
         elif root.is_dir():
             # `is_file()` on each hit, so a directory named `foo.py` and a symlink that
             # points at one are skipped rather than read.
+            before = len(paths)
             for pattern in ("*.py", f"*{NOTEBOOK_SUFFIX}"):
                 paths.extend(
-                    p
-                    for p in root.rglob(pattern)
+                    p for p in root.rglob(pattern)
                     if p.is_file() and "tests" not in _exclusion_parts(p, root)
+                )
+            if len(paths) == before:
+                # An existing but empty directory resolved "successfully" while
+                # contributing nothing, which is the same reduced coverage a missing
+                # target gives and was the one way left to exit 0 having checked
+                # nothing.
+                missing.append(
+                    f"{target}: scan target contains no Python files or notebooks, "
+                    f"so nothing under it was checked"
                 )
         else:
             missing.append(
@@ -773,6 +810,34 @@ def self_test() -> int:
             failures.append("a file containing a NUL byte was reported clean")
         except ScanError:
             pass
+
+        # An annotation that cannot execute must not be reported. A function-local
+        # annotation is never evaluated, and neither is a module one under
+        # `from __future__ import annotations`.
+        for name, body in (
+            ("inert_local.py", 'def f(name):\n    x: exec(f"import {name}") = 1\n'),
+            (
+                "inert_future.py",
+                "from __future__ import annotations\n"
+                'name = "os"\ny: exec(f"import {name}") = 1\n',
+            ),
+        ):
+            inert = Path(directory) / name
+            inert.write_text(body)
+            if scan_file(inert):
+                failures.append(f"{name}: reported an annotation that never runs")
+        # ... while the module-scope one that does run is still reported.
+        live = Path(directory) / "live_annotation.py"
+        live.write_text('name = "os"\npayload: exec(payload) = f"import {name}"\n')
+        if not scan_file(live):
+            failures.append("a module-scope runtime annotation was not reported")
+
+        # An existing but empty directory is reduced coverage, not a clean run.
+        hollow = Path(directory) / "hollow"
+        hollow.mkdir()
+        _, nothing = collect_paths([str(hollow)])
+        if len(nothing) != 1:
+            failures.append(f"an empty scan directory was accepted: {nothing}")
 
         # A target that resolves to nothing means reduced coverage, not a clean run.
         _, absent = collect_paths(["no_such_target_xyz.py"])
