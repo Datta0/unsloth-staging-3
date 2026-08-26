@@ -29,7 +29,19 @@ from .mapper import (
     MAP_TO_UNSLOTH_16bit,
     FLOAT_TO_FP8_BLOCK_MAPPER,
     FLOAT_TO_FP8_ROW_MAPPER,
+    build_mappers,
+    _add_with_lower,
+    _add_lower_only,
 )
+
+# The alias helpers a fetched mapper.py may call, resolved to the INSTALLED
+# implementations. `_get_new_mapper` reads such calls as data: it takes the table and
+# the two literal strings out of the AST and applies them with these, so the fetched
+# text never supplies behaviour.
+_MAPPER_HELPERS = {
+    "_add_with_lower": _add_with_lower,
+    "_add_lower_only": _add_lower_only,
+}
 
 # https://github.com/huggingface/transformers/pull/26037 allows 4 bit loading!
 from transformers import __version__ as transformers_version
@@ -507,34 +519,102 @@ def _get_new_mapper():
         )
         with requests.get(new_mapper, timeout = 3) as new_mapper:
             new_mapper = new_mapper.text
-        new_mapper = new_mapper[new_mapper.find("__INT_TO_FLOAT_MAPPER") :]
-        new_mapper = (
-            new_mapper.replace("INT_TO_FLOAT_MAPPER", "NEW_INT_TO_FLOAT_MAPPER")
-            .replace("FLOAT_TO_INT_MAPPER", "NEW_FLOAT_TO_INT_MAPPER")
-            .replace("MAP_TO_UNSLOTH_16bit", "NEW_MAP_TO_UNSLOTH_16bit")
-        )
+        # Never exec the response. This is a plain HTTPS GET, so the body is whatever
+        # the endpoint served, and exec'ing it would make any compromise of that path
+        # - or of anything that can answer for it - arbitrary code execution inside
+        # every `from_pretrained` that hits an unmapped model name. Only one thing in
+        # that file is data: `__INT_TO_FLOAT_MAPPER`. Parse that single dict literal
+        # out with ast.literal_eval (which evaluates literals only, never calls), then
+        # derive the five tables with the INSTALLED builder.
+        #
+        # This is only a probe for "would a newer Unsloth support this name?", so it
+        # must not change what the installed version resolves - hence the tables are
+        # returned to the caller rather than written into this module's globals.
+        import ast
 
-        # Exec into a throwaway namespace, never globals(). The slice also carries
-        # FLOAT_TO_FP8_BLOCK_MAPPER / FLOAT_TO_FP8_ROW_MAPPER, the _add_* helpers
-        # and the builder's loop variables, so exec'ing into globals() would swap
-        # the FP8 tables this module imported from the installed mapper for the
-        # ones on GitHub main. This is only a probe for "would a newer Unsloth
-        # support this name?", so it must not change what the installed version
-        # resolves; the fetched FP8 tables are returned for the probe to use
-        # instead of being written over the installed ones.
-        namespace = {}
-        exec(new_mapper, namespace)
-        return (
-            namespace["NEW_INT_TO_FLOAT_MAPPER"],
-            namespace["NEW_FLOAT_TO_INT_MAPPER"],
-            namespace["NEW_MAP_TO_UNSLOTH_16bit"],
-            # .get, not []: these two come from the fetched file under its own names (unlike
-            # the NEW_ names above, renamed here), so an older or renamed mapper.py would
-            # KeyError into the bare except and take the 4bit half of the probe down too.
-            # {} is safe: the probe runs only after the installed tables already missed.
-            namespace.get("FLOAT_TO_FP8_BLOCK_MAPPER", {}),
-            namespace.get("FLOAT_TO_FP8_ROW_MAPPER", {}),
-        )
+        # literal_eval evaluates literals only, so the body can no longer execute. It
+        # is not a guarantee against resource exhaustion though: ast.parse builds the
+        # whole tree before any literal-only check runs, and CPython dropped the safety
+        # wording from the docs for that reason (python/cpython#95588). The bare except
+        # below already turns the resulting RecursionError into "the probe found
+        # nothing", and `requests`' timeout is per-read rather than total, so cap the
+        # body as well. The real file is around 50KB.
+        if len(new_mapper) > 10_000_000:
+            return {}, {}, {}, {}, {}
+        tree = ast.parse(new_mapper)
+        source_table = None
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            targets = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            if "__INT_TO_FLOAT_MAPPER" in targets:
+                source_table = ast.literal_eval(node.value)
+                break
+        pass
+        if not source_table:
+            return {}, {}, {}, {}, {}
+
+        # A newer mapper.py may carry entry shapes this builder does not know; the
+        # caller already treats an empty result as "the probe found nothing".
+        tables = build_mappers(source_table)
+
+        # The fp8 tables can also gain entries as plain subscript assignments rather
+        # than through the source table, e.g.
+        # `FLOAT_TO_FP8_ROW_MAPPER["org/model-fp8"] = "unsloth/model-fp8-row"`. The exec
+        # this replaced picked those up, and a row-scaled entry in particular cannot be
+        # expressed through the source table without also creating a block entry, so
+        # dropping them would quietly take the row half of the probe down. They are data
+        # like everything else here: literal subscript, literal value, nothing named or
+        # called is ever evaluated.
+        by_name = {
+            "INT_TO_FLOAT_MAPPER": tables[0],
+            "FLOAT_TO_INT_MAPPER": tables[1],
+            "MAP_TO_UNSLOTH_16bit": tables[2],
+            "FLOAT_TO_FP8_BLOCK_MAPPER": tables[3],
+            "FLOAT_TO_FP8_ROW_MAPPER": tables[4],
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if not isinstance(target, ast.Subscript):
+                        continue
+                    if not isinstance(target.value, ast.Name):
+                        continue
+                    table = by_name.get(target.value.id)
+                    if table is None:
+                        continue
+                    try:
+                        table[ast.literal_eval(target.slice)] = ast.literal_eval(node.value)
+                    except ValueError:
+                        # Not a literal, so not data we can read. Skip it rather than
+                        # failing the whole probe.
+                        continue
+                pass
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                # `_add_with_lower(MAP_TO_UNSLOTH_16bit, "vendor/X", "unsloth/X")` is the
+                # established way mapper.py records an alias that is not derivable from
+                # the source table, and there are two in the shipped file today. Running
+                # the INSTALLED builder alone would silently miss any new one, so an
+                # older install would stop offering the upgrade notice for exactly the
+                # models main had just added. Apply them with the installed helper, from
+                # literal arguments only, so the fetched text still supplies nothing but
+                # data.
+                helper = _MAPPER_HELPERS.get(node.func.id)
+                if helper is None or len(node.args) != 3:
+                    continue
+                destination, key, value = node.args
+                if not isinstance(destination, ast.Name):
+                    continue
+                table = by_name.get(destination.id)
+                if table is None:
+                    continue
+                try:
+                    helper(table, ast.literal_eval(key), ast.literal_eval(value))
+                except ValueError:
+                    continue
+            pass
+        pass
+        return tables
     except:
         return {}, {}, {}, {}, {}
 
