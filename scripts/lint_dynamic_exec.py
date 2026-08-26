@@ -238,6 +238,17 @@ class _Visitor(ast.NodeVisitor):
         if node.value is not None:
             self._bind(node.target, reason)
 
+    def visit_NamedExpr(self, node: ast.NamedExpr):
+        """`(payload := f"import {name}")` as a statement, then `exec(payload)`.
+
+        Unwrapping the walrus at the sink only helps when the named expression is
+        handed straight to it. Standing on its own it is exactly the one level of
+        local indirection already tracked for `payload = f"..."`, and it is a
+        parenthesis away from that spelling, so it has to bind the same way.
+        """
+        self.generic_visit(node)
+        self._bind(node.target, _is_interpolated(node.value))
+
     def _bind(self, target: ast.AST, reason: str | None) -> None:
         if not isinstance(target, ast.Name):
             return
@@ -290,10 +301,17 @@ def scan_file(path: Path) -> list[dict]:
         return []
     try:
         tree = ast.parse(source, filename = str(path))
-    except (SyntaxError, ValueError):
-        # compileall in the same lint job is what reports unparseable files. ValueError
-        # covers a source containing a NUL byte, which ast.parse rejects separately.
-        return []
+    except (SyntaxError, ValueError) as error:
+        # A file that cannot be parsed has not been checked, and reporting it as clean
+        # is the same bypass as swallowing a RecursionError. The comment here used to
+        # defer to compileall in the same job, but both syntax-reporting steps in
+        # lint-ci.yml are `continue-on-error: true`, so nothing else fails the build.
+        # ValueError covers a source containing a NUL byte, which ast.parse rejects
+        # separately from a syntax error.
+        raise ScanError(
+            f"{_relative(path)}: could not be parsed ({error.__class__.__name__}), so "
+            f"it was not checked for interpolated dynamic execution"
+        ) from None
     visitor = _Visitor(path)
     try:
         visitor.visit(tree)
@@ -321,8 +339,16 @@ def scan(paths: list[Path]) -> tuple[list[dict], list[str]]:
     return findings, errors
 
 
-def collect_paths(targets: list[str]) -> list[Path]:
-    paths = []
+def collect_paths(targets: list[str]) -> tuple[list[Path], list[str]]:
+    """Files to scan, plus the targets that resolved to nothing.
+
+    A target that is neither a Python file nor a directory used to be dropped in
+    silence, so renaming a file in `DEFAULT_TARGETS` or mistyping a `--paths`
+    argument left the gate passing over less code than it claims to cover. Reduced
+    coverage that still exits 0 is the failure this whole checker exists to avoid,
+    so an unresolvable target is reported rather than skipped.
+    """
+    paths, missing = [], []
     for target in targets:
         root = REPO_ROOT / target
         if root.is_file() and root.suffix == ".py":
@@ -335,7 +361,12 @@ def collect_paths(targets: list[str]) -> list[Path]:
                 for p in root.rglob("*.py")
                 if p.is_file() and "tests" not in _exclusion_parts(p, root)
             )
-    return paths
+        else:
+            missing.append(
+                f"{target}: requested scan target does not exist, so nothing under it "
+                f"was checked"
+            )
+    return paths, missing
 
 
 def _exclusion_parts(path: Path, root: Path) -> tuple[str, ...]:
@@ -437,6 +468,10 @@ def h(name):
 def i(name):
     payload = f"import {name}"
     payload = exec(payload)
+
+def j(name):
+    (payload := f"import {name}")
+    exec(payload)
 """
 
 _GOOD = """
@@ -477,11 +512,11 @@ def self_test() -> int:
             "f-string via `payload`",
             "f-string via `payload`",
             "f-string via `payload`",
-            "string concatenation",
+            "f-string via `payload`", "string concatenation",
         ]
         if kinds != expected:
             failures.append(f"expected {expected}, got {kinds}")
-        if any(f["qualname"] not in ("f", "g", "h", "i") for f in findings):
+        if any(f["qualname"] not in ("f", "g", "h", "i", "j") for f in findings):
             failures.append(f"qualname wrong: {[f['qualname'] for f in findings]}")
 
         good = Path(directory) / "good.py"
@@ -523,9 +558,39 @@ def self_test() -> int:
         external = Path(directory) / "external"
         external.mkdir()
         (external / "x.py").write_text('def f(m):\n    exec(f"import {m}")\n')
-        found, errors = scan(collect_paths([str(external)]))
+        collected, missing = collect_paths([str(external)])
+        found, errors = scan(collected)
+        errors += missing
         if len(found) != 1 or errors:
             failures.append(f"external directory not scanned: {found}, {errors}")
+
+        # A file that cannot be parsed has not been checked, so it must not read as
+        # clean. Both syntax-reporting steps in lint-ci.yml are continue-on-error, so
+        # nothing else in the job would fail the build for it.
+        broken = Path(directory) / "broken.py"
+        broken.write_text("def f(:\n")
+        try:
+            scan_file(broken)
+            failures.append("a file that does not parse was reported clean")
+        except ScanError:
+            pass
+
+        # ast.parse rejects a NUL byte with ValueError rather than SyntaxError.
+        nul = Path(directory) / "nul.py"
+        nul.write_bytes(b"x = 1\x00\n")
+        try:
+            scan_file(nul)
+            failures.append("a file containing a NUL byte was reported clean")
+        except ScanError:
+            pass
+
+        # A target that resolves to nothing means reduced coverage, not a clean run.
+        _, absent = collect_paths(["no_such_target_xyz.py"])
+        if len(absent) != 1:
+            failures.append(f"a missing scan target was skipped in silence: {absent}")
+        _, present = collect_paths([str(external)])
+        if present:
+            failures.append(f"an existing target was reported missing: {present}")
 
     for failure in failures:
         print(f"self-test: {failure}", file = sys.stderr)
@@ -554,7 +619,11 @@ def main() -> int:
         return self_test()
 
     targets = args.paths if args.paths else list(DEFAULT_TARGETS)
-    findings, errors = scan(collect_paths(targets))
+    collected, missing = collect_paths(targets)
+    findings, errors = scan(collected)
+    # A target that resolved to nothing is reported with the unscannable files: in
+    # both cases the gate looked at less code than it was asked to.
+    errors += missing
 
     if args.update:
         # An allowlist written from an incomplete scan would bake in the gap.
