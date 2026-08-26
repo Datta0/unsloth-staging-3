@@ -697,6 +697,7 @@ export async function ensureThreadRecord({
   pairId,
   projectId,
   incognito,
+  neverSent,
   modelId,
   createdAt,
 }: {
@@ -706,6 +707,8 @@ export async function ensureThreadRecord({
   projectId?: string | null;
   /** Snapshot from the send this row belongs to, so a retry cannot read a since-flipped toggle. */
   incognito?: boolean;
+  /** True only from initialize(), which runs once for a thread that has never been sent to. */
+  neverSent?: boolean;
   /** Snapshot from the send this row belongs to, so retries cannot adopt a later checkpoint. */
   modelId?: string;
   /** Snapshot from the send this row belongs to, so retries retain its original creation time. */
@@ -721,9 +724,12 @@ export async function ensureThreadRecord({
   const incognitoAtInit = incognito ?? runtimeStateAtInit.incognito;
   const modelIdAtInit = modelId ?? runtimeStateAtInit.params.checkpoint ?? "";
   const createdAtInit = createdAt ?? Date.now();
-  // Fresh assistant-ui threads are local ids. Temporary chats can skip the
-  // history list entirely so a storage outage cannot block the first send.
-  if (incognitoAtInit && isAssistantLocalThreadId(threadId)) {
+  // A temporary chat skips the history list so a storage outage cannot block its first send.
+  // Gated on the caller knowing the thread is new, not on its id: a `__LOCALID_` id is the
+  // permanent primary key of every chat the app creates, so testing the prefix here tagged
+  // SAVED chats incognito whenever the toggle was on and a caller passed the open chat's id
+  // (openai-code-exec-section does, three times). A tagged chat stops persisting.
+  if (incognitoAtInit && neverSent) {
     markThreadIncognito(threadId);
     return;
   }
@@ -732,9 +738,8 @@ export async function ensureThreadRecord({
   if (existing) {
     return;
   }
-  // For non-local ids, keep the existing check first so an already-persisted
-  // thread is never tagged -- that's what keeps a real thread saving normally
-  // even if the toggle flips on while its run is still streaming.
+  // After the row check, so an already-persisted thread is never tagged: that is what keeps
+  // a real chat saving normally when the toggle flips on mid-stream.
   if (incognitoAtInit) {
     markThreadIncognito(threadId);
     return;
@@ -840,6 +845,9 @@ function createStudioDbAdapter(
           pairId,
           projectId: projectIdAtInit,
           incognito: incognitoAtInit,
+          // The one caller that can promise this: assistant-ui runs initialize() once, for
+          // the id it just minted. Others hand in whatever chat is open.
+          neverSent: true,
           modelId: modelIdAtInit,
           createdAt: createdAtInit,
         }),
