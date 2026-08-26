@@ -76,11 +76,25 @@ def test_zoo_reader_still_parses_what_unsloth_writes():
 
     from unsloth_zoo.utils import _get_dtype
 
+    import torch
+
+    checked = 0
     for value in _shipped_values():
         _, dtype, _, _, _ = value.split(";", 4)
-        resolved = _get_dtype(dtype.strip().removeprefix("torch."))
-        expected = None if dtype.strip() == "None" else resolved
-        assert resolved == expected
+        name = dtype.strip().removeprefix("torch.")
+        resolved = _get_dtype(name)
+        # The oracle is torch, not the value under test. Deriving `expected` from
+        # `resolved` made this assertion tautological for every non-None dtype, so a
+        # separately released unsloth_zoo that started resolving `float16` to the
+        # wrong thing would still have passed.
+        if dtype.strip() == "None":
+            expected = None
+        else:
+            expected = getattr(torch, name)
+            assert isinstance(expected, torch.dtype), (name, expected)
+            checked += 1
+        assert resolved == expected, (name, resolved, expected)
+    assert checked, "no non-None dtype was checked, so this proves nothing"
 
 
 def test_trust_decision_is_on_the_value_we_set(monkeypatch):

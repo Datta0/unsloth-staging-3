@@ -134,6 +134,14 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
         node = node.value
     if isinstance(node, ast.Name):
         return resolve(node.id) if resolve is not None else None
+    if isinstance(node, ast.BoolOp):
+        # `exec(enabled and f"import {name}")` executes the interpolated operand
+        # whenever the guard lets it through: same conditional-source shape as IfExp.
+        for operand in node.values:
+            reason = _is_interpolated(operand, resolve)
+            if reason is not None:
+                return reason
+        return None
     if isinstance(node, ast.IfExp):
         # `exec(f"import {name}" if flag else "import os")` executes whichever branch
         # is taken, so either one being built is enough.
@@ -157,12 +165,13 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
                 # `str.encode(s)` is the unbound descriptor spelling of `s.encode()`.
                 # There the source is the first argument and the receiver is the type,
                 # so unwrapping the receiver looked at the name `str` and found nothing.
-                if isinstance(function.value, ast.Name):
-                    if function.value.id in _CONSTRUCTORS:
-                        return (
-                            _is_interpolated(node.args[0], resolve)
-                            if node.args else None
-                        )
+                # `str.encode(s)` and `builtins.str.encode(s)` alike: the receiver
+                # names the type, so the source is the first argument.
+                if _constructor_name(function.value) is not None:
+                    return (
+                        _is_interpolated(node.args[0], resolve)
+                        if node.args else None
+                    )
                 # Unwrap the receiver: the conversion changes the type, not the syntax.
                 return _is_interpolated(function.value, resolve)
         constructor = _constructor_name(function)
@@ -247,7 +256,10 @@ class _Visitor(ast.NodeVisitor):
         # An annotation only runs at module or class scope, and only when the module
         # has not deferred annotations. Set by the caller from the parsed tree.
         self.annotations_deferred = False
-        self.function_depth = 0
+        # Kind of each enclosing scope, innermost last. What decides whether an
+        # annotation runs is the scope it sits in directly, not whether a function
+        # appears anywhere above it.
+        self.scope_kinds: list[str] = ["module"]
         self.scope: list[str] = []
         self.findings: list[dict] = []
         # name -> reason, for locals bound to a built string in the current scope.
@@ -259,16 +271,16 @@ class _Visitor(ast.NodeVisitor):
 
     def _enter(self, node):
         self.scope.append(node.name)
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            self.function_depth += 1
+        self.scope_kinds.append(
+            "class" if isinstance(node, ast.ClassDef) else "function"
+        )
         # A fresh scope: a name built in one function says nothing about the same name
         # in another.
         self.tainted.append({})
         self.generic_visit(node)
         self.tainted.pop()
         self.scope.pop()
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            self.function_depth -= 1
+        self.scope_kinds.pop()
 
     visit_FunctionDef = _enter
     visit_AsyncFunctionDef = _enter
@@ -294,6 +306,7 @@ class _Visitor(ast.NodeVisitor):
         for target in node.targets:
             self.visit(target)
             self._bind(target, reason)
+            self._bind_unpacked(target, node.value)
 
     def visit_AnnAssign(self, node: ast.AnnAssign):
         """Same tracking for `payload: str = f"...{x}..."`.
@@ -351,7 +364,28 @@ class _Visitor(ast.NodeVisitor):
         self._bind(node.target, _is_interpolated(node.value))
 
     def _annotation_executes(self) -> bool:
-        return not self.annotations_deferred and self.function_depth == 0
+        return not self.annotations_deferred and self.scope_kinds[-1] != "function"
+
+    def _bind_unpacked(self, target: ast.AST, value: ast.AST) -> None:
+        """`payload, ignored = f"import {name}", None` binds each element separately.
+
+        `_is_interpolated` looks at the tuple as a whole and reports nothing, and
+        `_bind` ignores a target that is not a Name, so unpacking hid the same one
+        level of local indirection the tracking exists to cover. Only the shapes that
+        line up element for element are paired; a starred target or a mismatched
+        length is left alone rather than guessed at.
+        """
+        if not isinstance(target, (ast.Tuple, ast.List)):
+            return
+        if not isinstance(value, (ast.Tuple, ast.List)):
+            return
+        if len(target.elts) != len(value.elts):
+            return
+        if any(isinstance(e, ast.Starred) for e in target.elts + value.elts):
+            return
+        for element, item in zip(target.elts, value.elts):
+            self._bind(element, _is_interpolated(item))
+            self._bind_unpacked(element, item)
 
     def _bind(self, target: ast.AST, reason: str | None) -> None:
         if not isinstance(target, ast.Name):
@@ -705,6 +739,15 @@ def j(name):
     (payload := f"import {name}")
     exec(payload)
 
+def n(name, enabled):
+    exec(enabled and f"import {name}")
+    payload, ignored = f"import {name}", None
+    exec(payload)
+    exec(builtins.str.encode(f"import {name}"))
+
+class Outer:
+    inner_annotation: exec(f"import {NAME}") = 1
+
 def m(model_type):
     payload = "import "
     payload += model_type
@@ -759,8 +802,12 @@ def self_test() -> int:
             "f-string",
             "f-string",
             "f-string",
+            "f-string",
+            "f-string",
+            "f-string",
             "f-string via `annotated_at_module`",
             "f-string via `annotated`",
+            "f-string via `payload`",
             "f-string via `payload`",
             "f-string via `payload`",
             "f-string via `payload`",
@@ -772,7 +819,7 @@ def self_test() -> int:
         if kinds != expected:
             failures.append(f"expected {expected}, got {kinds}")
         if any(
-            f["qualname"] not in ("f", "g", "h", "i", "j", "k", "l", "m", "<module>")
+            f["qualname"] not in ("f", "g", "h", "i", "j", "k", "l", "m", "n", "Outer", "<module>")
             for f in findings
         ):
             failures.append(f"qualname wrong: {[f['qualname'] for f in findings]}")
