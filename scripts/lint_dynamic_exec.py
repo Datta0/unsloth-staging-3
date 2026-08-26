@@ -135,6 +135,14 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
     # `ast.NamedExpr` wrapper around it, not a different value.
     while isinstance(node, ast.NamedExpr):
         node = node.value
+    if isinstance(node, ast.Starred):
+        # `exec(*(f"import {name}",))` spreads a literal one-element container, so the
+        # source is right there. A starred NAME is left alone: nothing here knows what
+        # it holds, and flagging every `exec(*args)` would be noise.
+        inner = node.value
+        if isinstance(inner, (ast.Tuple, ast.List)) and len(inner.elts) == 1:
+            return _is_interpolated(inner.elts[0], resolve)
+        return None
     if isinstance(node, ast.Name):
         return resolve(node.id) if resolve is not None else None
     if isinstance(node, ast.BoolOp):
@@ -201,7 +209,7 @@ def _is_interpolated(node: ast.AST, resolve = None) -> str | None:
                 return inner
             # `str.replace(template, old, new)` is the unbound spelling; the template
             # is the first argument rather than the receiver.
-            if isinstance(receiver, ast.Name) and receiver.id in ("str", "bytes"):
+            if _constructor_name(receiver) in ("str", "bytes"):
                 if node.args:
                     template = node.args[0]
                     if isinstance(template, ast.Constant):
@@ -350,6 +358,26 @@ class _Visitor(ast.NodeVisitor):
             self._bind(node.target, f"{reason} appended")
         self.visit(node.target)
 
+    def visit_For(self, node: ast.For):
+        """`for payload in (f"import {name}",): exec(payload)` binds the same way.
+
+        A loop target is a binding form like the assignments already tracked, and this
+        one stays at the same level of indirection: only a literal tuple or list is
+        looked into, so `for payload in build(): ...` reports nothing because nothing
+        here knows what `build()` yields.
+        """
+        self.visit(node.iter)
+        if isinstance(node.iter, (ast.Tuple, ast.List)):
+            for element in node.iter.elts:
+                reason = _is_interpolated(element)
+                if reason is not None:
+                    self._bind(node.target, reason)
+        self.visit(node.target)
+        for statement in node.body + node.orelse:
+            self.visit(statement)
+
+    visit_AsyncFor = visit_For
+
     def visit_NamedExpr(self, node: ast.NamedExpr):
         """`(payload := f"import {name}")` as a statement, then `exec(payload)`.
 
@@ -464,6 +492,28 @@ def _notebook_code_cells(path: Path) -> list[tuple[int, str]]:
 _CODE_MAGICS = ("time", "timeit", "prun", "debug", "capture")
 
 
+def _magic_argument(rest: str) -> str:
+    """The Python part of a line magic's argument, with its options removed.
+
+    `%timeit -n 1 exec(payload)` carries options before the code, and keeping the whole
+    remainder left `-n 1 exec(...)`, which does not parse - so the cell was skipped and
+    the sink went unread. Leading option tokens are dropped one at a time until what is
+    left parses. Dropping only from the front, and only while the remainder still fails,
+    means a genuine argument is never truncated.
+    """
+    candidate = rest.strip()
+    while candidate:
+        try:
+            ast.parse(candidate)
+            return candidate
+        except SyntaxError:
+            head, separator, tail = candidate.partition(" ")
+            if not separator or not head.startswith("-") and not head.lstrip("-").isdigit():
+                break
+            candidate = tail.strip()
+    return rest
+
+
 def _neutralised(source: str) -> str:
     """The cell with IPython magics and shell escapes replaced by `pass`.
 
@@ -486,7 +536,7 @@ def _neutralised(source: str) -> str:
             if stripped.startswith("%") and not stripped.startswith("%%"):
                 magic, _, rest = stripped[1:].partition(" ")
                 if magic in _CODE_MAGICS and rest.strip():
-                    out.append(indent + rest)
+                    out.append(indent + _magic_argument(rest))
                     continuing = line.rstrip().endswith("\\")
                     continue
             out.append(indent + "pass")
