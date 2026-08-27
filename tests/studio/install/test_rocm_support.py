@@ -601,8 +601,40 @@ class TestDetectRocmVersion:
 # TEST: install_python_stack.py -- _ensure_rocm_torch
 
 
+def _named_arch_only():
+    """_infer_linux_amd_gfx_arch with the product-name half removed.
+
+    The function answers UNSLOTH_ROCM_GFX_ARCH first and infers from the board only after,
+    and it is that second half a real AMD host decides. Cases naming an arch still get it;
+    cases that named none get None instead of whatever board the runner happens to have."""
+    return (os.environ.get("UNSLOTH_ROCM_GFX_ARCH") or "").strip().lower() or None
+
+
 class TestEnsureRocmTorch:
     """Verify ROCm torch reinstall logic."""
+
+    @pytest.fixture(autouse = True)
+    def _isolate_host(self, monkeypatch):
+        """Describe the host by mocks alone: hide KFD topology and any ambient GPU mask.
+
+        Both are read by _runtime_gfx_target and neither is covered by the per-case mocks.
+        KFD sysfs is filtered by nothing, so on a real AMD test machine it supplies a GPU no
+        case asked for; and an inherited empty HIP/ROCR/CUDA mask means "no GPU", which
+        suppresses the very reroute a case is asserting. Both are environment leaks of the
+        same family the _detect_windows_gfx_arch mocks below already guard against, and a
+        masked CI job hits both at once. The product-name inference is the third: on a Strix
+        box /proc/cpuinfo names gfx1151 and the Strix per-arch route then answers before the
+        tag these cases assert, which is what the gfx1151 AMD runner sees. Individual cases
+        have long mocked it to None one at a time; doing it here covers the ones that forgot.
+        Cases that mean to exercise any of the three set it themselves and win, since that
+        happens inside this fixture."""
+        for _mask in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+            monkeypatch.delenv(_mask, raising = False)
+        with (
+            patch.object(stack_mod, "_kfd_gfx_targets", return_value = []),
+            patch.object(stack_mod, "_infer_linux_amd_gfx_arch", _named_arch_only),
+        ):
+            yield
 
     # _infer_linux_amd_gfx_arch mocked to None: on a real Strix host the live
     # /proc/cpuinfo would otherwise take the inferred-install path and break
@@ -934,8 +966,18 @@ class TestEnsureRocmTorch:
     @patch.object(stack_mod, "_has_rocm_gpu", return_value = True)
     @patch.object(stack_mod, "_infer_linux_amd_gfx_arch", return_value = None)
     @patch.object(stack_mod, "_detect_rocm_version", return_value = None)
+    @patch.object(stack_mod, "_installed_rocm_wheel_family", return_value = None)
+    @patch.object(stack_mod, "_torch_requires_rocm_sdk", return_value = False)
     def test_version_unreadable_prints_warning(
-        self, mock_ver, mock_infer, mock_gpu, mock_nvidia, mock_pip, capsys
+        self,
+        _mock_owns_sdk,
+        _mock_family,
+        mock_ver,
+        mock_infer,
+        mock_gpu,
+        mock_nvidia,
+        mock_pip,
+        capsys,
     ):
         """ROCm detected but version unreadable should print warning and skip."""
         with patch("os.path.isdir", return_value = True):
@@ -1455,6 +1497,25 @@ Agent 4
 class TestGfx906LegacyReroute:
     """gfx906 hosts on ROCm >= 6.4 must be rerouted to the rocm6.3 torch index;
     hosts already on gfx906-capable wheels are left alone."""
+
+    @pytest.fixture(autouse = True)
+    def _isolate_host(self, monkeypatch):
+        """Hide KFD topology and any ambient GPU mask, for the reason given on
+        TestEnsureRocmTorch: a real AMD test machine's sysfs would otherwise supply a GPU
+        these gfx906 cases did not ask for, its product name would infer an arch none of them
+        named, and an inherited empty mask would suppress the reroute they assert."""
+        for _mask in ("HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
+            monkeypatch.delenv(_mask, raising = False)
+        with (
+            patch.object(stack_mod, "_kfd_gfx_targets", return_value = []),
+            patch.object(stack_mod, "_infer_linux_amd_gfx_arch", _named_arch_only),
+            # No AMD per-arch wheel is installed in any of these cases. On the gfx1151
+            # runner both read a real one out of the venv, and the family gates then
+            # answer for a host none of them described.
+            patch.object(stack_mod, "_installed_rocm_wheel_family", return_value = None),
+            patch.object(stack_mod, "_torch_requires_rocm_sdk", return_value = False),
+        ):
+            yield
 
     @staticmethod
     def _gfx906_reroute_block(source: str) -> str:
