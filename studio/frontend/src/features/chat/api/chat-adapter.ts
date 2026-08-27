@@ -6140,10 +6140,27 @@ export function createOpenAIStreamAdapter(
                 );
               }
             };
+            // The window is passed so a length-stop can tell a Max Tokens the user chose
+            // from the backend's stand-in for "Max" (the whole context length). The two
+            // need opposite advice, and "Increase Max Tokens" cannot be acted on when it
+            // is already unlimited.
             const stream =
               generationDecision === "durable"
                 ? durableStream()
-                : streamChatCompletions(requestPayload, runSignal);
+                : streamChatCompletions(
+                    requestPayload,
+                    runSignal,
+                    // Only when the request targets the LOCAL model. ggufContextLength
+                    // stays populated for a resident GGUF even while an external model is
+                    // selected, so an external request with a 16K cap was being measured
+                    // against an unrelated 4096-token local window and reported as having
+                    // unlimited Max Tokens and no context left.
+                    isExternalRequest
+                      ? null
+                      : (runtime.customContextLength ??
+                        runtime.ggufContextLength ??
+                        null),
+                  );
             // Per run, not per module: two turns must not share a cycle.
             const canPublish = createStreamPublishGate();
 
