@@ -2,8 +2,7 @@ name: "staging-9922 windows-latest"
 on:
   push:
     branches: ["pr-9922-xplat-ci"]
-    paths-ignore:
-      - '**/*.md'
+    paths-ignore: ['**/*.md']
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -13,19 +12,33 @@ permissions:
 defaults:
   run:
     shell: bash
+    working-directory: studio/frontend
 jobs:
-  test:
+  frontend:
+    name: "Hub selection suite (windows-latest)"
     runs-on: windows-latest
     timeout-minutes: 30
-    env:
-      UNSLOTH_COMPILE_DISABLE: '1'
-      UNSLOTH_IS_PRESENT: '1'
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-node@v4
         with:
-          python-version: '3.12'
-      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
-      - run: PYTHONPATH=studio/backend python -m pytest studio/backend/tests -q || true
+          node-version: '22'
+      # --ignore-scripts matches the upstream Windows job; the runner's npm
+      # predates --strict-allow-scripts.
+      - run: npm ci --ignore-scripts --no-fund --no-audit
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Focused Hub selection tests
+        run: |
+          node --experimental-strip-types --test \
+            tests/hub-selection-resolution.test.ts \
+            tests/hub-selection-compat.test.ts \
+            tests/download-inventory-kind.test.ts \
+            tests/download-scoped-kind-upgrade.test.ts \
+            tests/download-scoped-delete-hint.test.ts
+      # The whole suite, so a Hub change that breaks something else is caught
+      # on this OS too. No '|| true': this is a gate.
+      - name: Full frontend suite
+        run: npm test
