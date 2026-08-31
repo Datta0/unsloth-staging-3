@@ -28,6 +28,8 @@ import {
   type DownloadManagerState,
   type JobListeners,
   type ManagedDownload,
+  downloadInventoryHintKind,
+  scopedDownloadInventoryKind,
 } from "./download-manager-types";
 import {
   clearRuntimeTimer,
@@ -53,6 +55,38 @@ function finiteNumber(value: unknown, fallback: number): number {
 
 function nonNegativeNumber(value: unknown, fallback = 0): number {
   return Math.max(0, finiteNumber(value, fallback));
+}
+
+/**
+ * The inventory kind of a persisted job, recovering it for records written
+ * before the field existed.
+ *
+ * Those records still carry `scopedFiles`, and that is the same evidence
+ * `startJob` classifies a fresh scoped request from. Without this, a scoped
+ * GGUF download persisted by an older Studio comes back as a model download on
+ * the next launch, so its row changes format under any selection pointing at
+ * it, and stays wrong until backend adoption happens to repair it.
+ */
+function inventoryKindOfPersisted(
+  value: Record<string, unknown>,
+  variant: string | null,
+): { inventoryKind?: Exclude<InventoryHint["kind"], "dataset"> } {
+  if (
+    value.inventoryKind === INVENTORY_HINT_KIND.MODEL ||
+    value.inventoryKind === INVENTORY_HINT_KIND.GGUF
+  ) {
+    return { inventoryKind: value.inventoryKind };
+  }
+  if (
+    variant?.startsWith("@") &&
+    Array.isArray(value.scopedFiles) &&
+    value.scopedFiles.every((file) => typeof file === "string")
+  ) {
+    return {
+      inventoryKind: scopedDownloadInventoryKind(value.scopedFiles as string[]),
+    };
+  }
+  return {};
 }
 
 function sanitizePersistedJob(
@@ -92,6 +126,7 @@ function sanitizePersistedJob(
     ...(typeof value.checkpoint === "boolean"
       ? { checkpoint: value.checkpoint }
       : {}),
+    ...inventoryKindOfPersisted(value, variant),
     // A held reading survives the reload that carried it: dropping the flag restores the stale
     // downloadedBytes with the guard reading undefined (so, measured), which is the "0 B left"
     // the guard exists to stop.
@@ -152,6 +187,9 @@ function toPersistedJob(
       : {}),
     ...(job.scopedFiles !== undefined ? { scopedFiles: job.scopedFiles } : {}),
     ...(job.checkpoint !== undefined ? { checkpoint: job.checkpoint } : {}),
+    ...(job.inventoryKind !== undefined
+      ? { inventoryKind: job.inventoryKind }
+      : {}),
     ...(job.measuredTransfer !== undefined
       ? { measuredTransfer: job.measuredTransfer }
       : {}),
@@ -190,24 +228,17 @@ export function jobKeyOf(
   return variantKey ? `${base}#${variantKey}` : base;
 }
 
-function completedInventoryHintKind(
-  kind: DownloadKind,
-  variant: string | null,
-): InventoryHint["kind"] {
-  return kind === DOWNLOAD_KIND.DATASET
-    ? INVENTORY_HINT_KIND.DATASET
-    : variant
-      ? INVENTORY_HINT_KIND.GGUF
-      : INVENTORY_HINT_KIND.MODEL;
-}
-
 function liveCompletedInventoryHintKeys(): Set<string> {
   const keys = new Set<string>();
   for (const job of Object.values(getState().jobs)) {
     if (job.state !== "complete") continue;
     keys.add(
       inventoryHintKey(
-        completedInventoryHintKind(job.kind, job.variant),
+        downloadInventoryHintKind(
+          job.kind,
+          job.variant,
+          job.inventoryKind,
+        ),
         job.repoId,
       ),
     );
@@ -224,7 +255,11 @@ function collectCompletedInventoryHints(
     // is only hidden once the backend has scanned its config, so an optimistic
     // hint would surface it in the chat inventory for the hint's whole TTL.
     if (job.external) return [];
-    const kind = completedInventoryHintKind(job.kind, job.variant);
+    const kind = downloadInventoryHintKind(
+      job.kind,
+      job.variant,
+      job.inventoryKind,
+    );
     if (
       runtimeRegistry.suppressedCompletedInventoryHints.has(
         inventoryHintKey(kind, job.repoId),
@@ -436,7 +471,11 @@ export function patchJob(key: string, patch: Partial<ManagedDownload>): void {
   ) {
     runtimeRegistry.suppressedCompletedInventoryHints.delete(
       inventoryHintKey(
-        completedInventoryHintKind(previousJob.kind, previousJob.variant),
+        downloadInventoryHintKind(
+          previousJob.kind,
+          previousJob.variant,
+          previousJob.inventoryKind,
+        ),
         previousJob.repoId,
       ),
     );
@@ -476,14 +515,18 @@ export function putJob(job: ManagedDownload): void {
   runtimeRegistry.clearRemovalTimer(job.key);
   if (!job.external) {
     forgetObservedInventoryHint(
-      completedInventoryHintKind(job.kind, job.variant),
+      downloadInventoryHintKind(job.kind, job.variant, job.inventoryKind),
       job.repoId,
     );
   }
   const suppressionChanged =
     runtimeRegistry.suppressedCompletedInventoryHints.delete(
       inventoryHintKey(
-        completedInventoryHintKind(job.kind, job.variant),
+        downloadInventoryHintKind(
+          job.kind,
+          job.variant,
+          job.inventoryKind,
+        ),
         job.repoId,
       ),
     );
@@ -580,7 +623,9 @@ export function discardDeletedInventoryHints(
     if (
       job.state === "complete" &&
       normalizeRepoIdentity(job.repoId) === repoIdentity &&
-      kinds.includes(completedInventoryHintKind(job.kind, job.variant))
+      kinds.includes(
+        downloadInventoryHintKind(job.kind, job.variant, job.inventoryKind),
+      )
     ) {
       removeJob(job.key);
     }
@@ -595,9 +640,18 @@ export function discardDeletedModelInventoryHints(
     discardDeletedInventoryHints(repoId, ["model", "gguf"]);
     return;
   }
-  discardPendingInventoryHint("gguf", repoId);
-  clearCompletedInventoryHint({ kind: "gguf", repoId });
   const job = getState().jobs[jobKeyOf(DOWNLOAD_KIND.MODEL, repoId, variant)];
+  // Every other hint site classifies a scoped `@variant` as a model download.
+  // Hardcoding "gguf" here was right while any variant meant GGUF; now it
+  // leaves a scoped model download's own hint behind, and the deleted row comes
+  // back optimistically until the hint expires.
+  const kind = downloadInventoryHintKind(
+    DOWNLOAD_KIND.MODEL,
+    variant,
+    job?.inventoryKind,
+  );
+  discardPendingInventoryHint(kind, repoId);
+  clearCompletedInventoryHint({ kind, repoId });
   if (job?.state === "complete") {
     removeJob(job.key);
   }
