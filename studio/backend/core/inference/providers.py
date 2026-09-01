@@ -20,7 +20,6 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
     "openai_codex": {
         "display_name": "ChatGPT / Codex subscription",
         "base_url": "https://chatgpt.com/backend-api",
-        # Only seeds the picker; /codex/models is the truth once connected.
         "default_models": [
             "gpt-5.4",
             "gpt-5.4-mini",
@@ -63,13 +62,13 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
         "supports_vision": True,
         "supports_tool_calling": True,
         "studio_tools": True,
-        # Server tools OpenAI runs itself on /v1/responses (cloud base URL only;
-        # `_stream_openai_responses` re-checks that). See `hosted_tools` below.
+        # Server tools OpenAI runs itself on /v1/responses (cloud base URL only; `_stream_openai_responses` re-checks
+        # that). See `hosted_tools` below.
         "hosted_tools": ("web_search", "code_execution", "image_generation"),
         "auth_header": "Authorization",
         "auth_prefix": "Bearer ",
-        # Scope the picker to the current generation. /v1/models returns many
-        # historical snapshots, fine-tunes, and non-chat models we don't want.
+        # Scope the picker to the current generation. /v1/models returns many historical snapshots, fine-tunes, and
+        # non-chat models we don't want.
         "model_id_allowlist": re.compile(r"^(gpt-5\.[3456]|gpt-4\.5|o3)(?:[-.]|$)"),
         # Hide dated snapshots and the retired plain gpt-5.3 id.
         "model_id_denylist": re.compile(r"^(gpt-5\.3)$|-\d{4}-\d{2}-\d{2}$"),
@@ -106,15 +105,12 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
     },
     "gemini": {
         "display_name": "Google Gemini",
-        # Native Gemini REST endpoint -- does NOT speak OpenAI Chat Completions;
-        # translated in `_stream_gemini` (external_provider.py).
-        # https://ai.google.dev/gemini-api/docs
+        # Native Gemini REST endpoint -- does NOT speak OpenAI Chat Completions; translated in `_stream_gemini`
+        # (external_provider.py). https://ai.google.dev/gemini-api/docs
         "base_url": "https://generativelanguage.googleapis.com/v1beta",
-        # Curated lineup (ListModels returns many historical/experimental ids).
-        # Excluded on purpose:
-        #   - `gemini-2.0-flash*` (retired 2026-06-01; 404 on use)
-        #   - `gemini-3-pro-preview` (shut down 2026-03-09; auto-redirects to
-        #     `gemini-3.1-pro-preview`, so we surface 3.1 directly).
+        # Curated lineup (ListModels returns many historical/experimental ids). Excluded on purpose: -
+        # `gemini-2.0-flash*` (retired 2026-06-01; 404 on use) - `gemini-3-pro-preview` (shut down 2026-03-09;
+        # auto-redirects to `gemini-3.1-pro-preview`, so we surface 3.1 directly).
         "default_models": [
             "gemini-3.1-pro-preview",
             "gemini-3.6-flash",
@@ -136,8 +132,7 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
         "supports_vision": True,
         "supports_tool_calling": True,
         "studio_tools": True,
-        # googleSearch / codeExecution grounding and the Nano Banana image path,
-        # all wired natively in `_stream_gemini`.
+        # googleSearch / codeExecution grounding and the Nano Banana image path, wired natively in `_stream_gemini`
         "hosted_tools": ("web_search", "code_execution", "image_generation"),
         # Native API takes the bare key on `x-goog-api-key`.
         "auth_header": "x-goog-api-key",
@@ -148,14 +143,13 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
             "API key from https://aistudio.google.com/apikey. "
             "See https://ai.google.dev/gemini-api/docs for endpoint shapes."
         ),
-        # gemini-3-pro-preview was shut down 2026-03-09 and auto-aliased to
-        # gemini-3.1-pro-preview; drop it so users see one canonical card.
+        # gemini-3-pro-preview was shut down and auto-aliased to 3.1
+        # gemini-3-pro-preview was shut down 2026-03-09 and auto-aliased to gemini-3.1-pro-preview; drop it so users see
+        # one canonical card.
         "model_id_deny_exact": ("gemini-3-pro-preview",),
-        # Chat-capable 3.6 / 3.5 / 3.1 / 3 / 2.5 families plus rolling *-latest
-        # aliases. Image-tier ids flow through the Nano Banana
-        # `responseModalities` path in `_stream_gemini`. Retired 2.0 ids
-        # excluded (they 404 on use). `-preview` is optional on the image ids
-        # so a GA rollover does not drop them from the picker.
+        # Chat-capable 3.6 / 3.5 / 3.1 / 3 / 2.5 families plus rolling *-latest aliases. Image-tier ids flow through the
+        # Nano Banana `responseModalities` path in `_stream_gemini`. Retired 2.0 ids excluded (they 404 on use).
+        # `-preview` is optional on the image ids so a GA rollover does not drop them from the picker.
         "model_id_allowlist": re.compile(
             r"^("
             r"gemini-3\.6-(?:flash|pro)(?:-preview)?|"
@@ -219,11 +213,8 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
     "kimi": {
         "display_name": "Kimi",
         "base_url": "https://api.moonshot.ai/v1",
-        # Surface only the two SoTA multimodal models (kimi-k2.6/k2.5);
-        # moonshot-v1-* and dated k2 previews are filtered by the allowlist.
-        # Docs: https://platform.kimi.ai/docs/models
-        # Listing/overview: https://platform.kimi.ai/docs/api/list-models
-        #                   https://platform.kimi.ai/docs/api/overview
+        # only the two SoTA multimodal models; moonshot-v1-* and dated k2 previews are filtered by the allowlist.
+        # https://platform.kimi.ai/docs/models
         "default_models": [
             "kimi-k2.6",
             "kimi-k2.5",
@@ -238,8 +229,8 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
         "auth_prefix": "Bearer ",
         "notes": "Moonshot API key. China: use base URL https://api.moonshot.cn/v1",
         "model_id_allowlist": re.compile(r"^kimi-k2\.[56]$"),
-        # Reasoning-class: the API rejects custom temperature/top_p ("only 1
-        # is allowed"). Strip both so the server uses its required defaults.
+        # Reasoning-class: the API rejects custom temperature/top_p ("only 1 is allowed"). Strip both so the server uses
+        # its required defaults.
         "body_omit": ("temperature", "top_p"),
     },
     "qwen": {
@@ -262,8 +253,8 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
     "huggingface": {
         "display_name": "Hugging Face",
         "base_url": "https://router.huggingface.co/v1",
-        # Seed the picker before the live /v1/models call resolves; the remote
-        # listing (see model_list_mode) is the source of truth.
+        # Seed the picker before the live /v1/models call resolves; the remote listing (see model_list_mode) is the
+        # source of truth.
         "default_models": [
             "openai/gpt-oss-120b",
             "deepseek-ai/DeepSeek-V3",
@@ -282,22 +273,22 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
             "returns the cross-provider chat catalog. See "
             "https://huggingface.co/docs/inference-providers/index."
         ),
-        # Remote so users see live availability; loadModels() merges defaults
-        # so they stay visible if the remote call fails.
+        # remote so users see live availability; loadModels() merges defaults so they stay visible if the remote call
+        # fails
         "model_list_mode": "remote",
-        # Scope to trusted first-party org repos (the response is otherwise
-        # hundreds of community fine-tunes, mirrors, fp8 variants).
+        # Scope to trusted first-party org repos (the response is otherwise hundreds of community fine-tunes, mirrors,
+        # fp8 variants).
         "model_id_allowlist": re.compile(
             r"^(openai|deepseek-ai|google|meta-llama|Qwen|moonshotai|mistralai|zai-org)/"
         ),
-        # Cap the post-filter list to first N matches (no server-side sort);
-        # default_models keeps flagship ids near the top.
+        # Cap the post-filter list to first N matches (no server-side sort); default_models keeps flagship ids near the
+        # top.
         "model_id_limit": 15,
     },
     "vllm": {
         "display_name": "vLLM",
-        # User-supplied via provider_base_url; the route falls back to the
-        # payload's base_url when the registry entry has none.
+        # User-supplied via provider_base_url; the route falls back to the payload's base_url when the registry entry
+        # has none.
         "base_url": "",
         "default_models": [],
         "supports_streaming": True,
@@ -306,9 +297,8 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
         "studio_tools": True,
         "auth_header": "Authorization",
         "auth_prefix": "Bearer ",
-        # Force /v1/chat/completions -- vLLM's /v1/responses rebuilds messages
-        # through the chat template, 400ing on strict-alternation templates
-        # (Gemma 3). The chat-completions path takes messages verbatim.
+        # Force /v1/chat/completions -- vLLM's /v1/responses rebuilds messages through the chat template, 400ing on
+        # strict-alternation templates (Gemma 3). The chat-completions path takes messages verbatim.
         "notes": "Self-hosted vLLM server. Always routed to /v1/chat/completions.",
         # Surfaced via the frontend's CUSTOM_PROVIDER_PRESETS, not the dropdown.
         "hidden": True,
@@ -328,7 +318,6 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
             "User-supplied OpenAI-compatible server. Routed to "
             "/v1/chat/completions; /models is optional."
         ),
-        # Surfaced by the frontend's generic Custom option, not the dropdown.
         "hidden": True,
     },
     "ollama": {
@@ -367,7 +356,6 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
     "openrouter": {
         "display_name": "OpenRouter",
         "base_url": "https://openrouter.ai/api/v1",
-        # Curated picker list (locked, not live /models).
         "default_models": [
             "openrouter/free",
             "openai/gpt-4o",
@@ -392,7 +380,6 @@ PROVIDER_REGISTRY: dict[str, dict[str, Any]] = {
         "supports_vision": True,
         "supports_tool_calling": True,
         "studio_tools": True,
-        # The router's universal web plugin (`plugins: [{id: "web"}]`).
         "hosted_tools": ("web_search",),
         "auth_header": "Authorization",
         "auth_prefix": "Bearer ",
@@ -433,9 +420,9 @@ def provider_runs_local_tools(provider_type: str | None) -> bool:
     tool_result message replay, which is separate work. Anthropic keeps its
     hosted web_search, web_fetch and code_execution meanwhile.
     """
-    # isinstance, not a truthiness check: the value reaches here straight from a
-    # request body, and a list or dict key raises TypeError inside dict.get, which
-    # would turn malformed input into a 500 instead of the caller's 400.
+    # isinstance, not truthiness: the value reaches here straight from a request body
+    # isinstance, not a truthiness check: the value reaches here straight from a request body, and a list or dict key
+    # raises TypeError inside dict.get, which would turn malformed input into a 500 instead of the caller's 400.
     if not isinstance(provider_type, str):
         return False
     info = PROVIDER_REGISTRY.get(provider_type)
@@ -480,26 +467,22 @@ def provider_hosted_tools(provider_type: str | None) -> frozenset[str]:
     return frozenset(info.get("hosted_tools") or ()) if info else frozenset()
 
 
-# The whole server-side builtin vocabulary, derived from the registry so a new
-# provider entry extends it by declaring its own tools. Mirrored on the frontend
-# as _SERVER_SIDE_BUILTIN_TOOL_NAMES (external_provider.py) for card labelling.
+# derived from the registry so a new provider entry extends it by declaring its own tools
+# The whole server-side builtin vocabulary, derived from the registry so a new provider entry extends it by declaring
+# its own tools. Mirrored on the frontend as _SERVER_SIDE_BUILTIN_TOOL_NAMES (external_provider.py) for card labelling.
 HOSTED_TOOL_NAMES: frozenset[str] = frozenset(
     name for info in PROVIDER_REGISTRY.values() for name in (info.get("hosted_tools") or ())
 )
 
 
-# Local tool names that stand in for a hosted one, per hosted name. A request
-# naming BOTH sides is asking for one tool twice, so the local side wins and the
-# hosted name is not forwarded: the alternative runs the provider's copy as well
-# and bills for it.
-#
-# Which side a request wants is the request's to say, not this server's to
-# assume. web_search is unambiguous -- the hosted name and Unsloth's own tool are
-# spelled the same, so naming it while the loop runs can only mean Unsloth's.
-# code_execution is a different name from python/terminal precisely because it
-# is a different thing: it runs in the provider's sandbox, and Unsloth has no
-# implementation of it at all (see ALL_TOOLS). Treating it as "already replaced"
-# therefore substitutes nothing, it just drops the tool while its pill stays lit.
+# local tool names standing in for a hosted one
+# Local tool names that stand in for a hosted one, per hosted name. A request naming BOTH sides is asking for one tool
+# twice, so the local side wins and the hosted name is not forwarded: the alternative runs the provider's copy as well
+# and bills for it.  Which side a request wants is the request's to say, not this server's to assume. web_search is
+# unambiguous -- the hosted name and Unsloth's own tool are spelled the same, so naming it while the loop runs can only
+# mean Unsloth's. code_execution is a different name from python/terminal precisely because it is a different thing: it
+# runs in the provider's sandbox, and Unsloth has no implementation of it at all (see ALL_TOOLS). Treating it as
+# "already replaced" therefore substitutes nothing, it just drops the tool while its pill stays lit.
 LOCAL_STANDINS_FOR_HOSTED_TOOLS: dict[str, frozenset[str]] = {
     "web_search": frozenset({"web_search"}),
     "code_execution": frozenset({"python", "terminal"}),
@@ -529,9 +512,8 @@ def hosted_only_tools(provider_type: str | None, enabled_tools: Any) -> list[str
     ]
 
 
-# Cloud-metadata hosts. The backend fetches the base URL on the caller's behalf,
-# so one of these would hand instance credentials to whoever asked, and no LLM
-# endpoint lives here. Refused on every deployment. Keep in sync with the
+# Cloud-metadata hosts. The backend fetches the base URL on the caller's behalf, so one of these would hand instance
+# credentials to whoever asked, and no LLM endpoint lives here. Refused on every deployment. Keep in sync with the
 # tool-approval gate's list in core/inference/tools.py (function-local there).
 _METADATA_HOST_NAMES = frozenset(
     {
@@ -542,8 +524,8 @@ _METADATA_HOST_NAMES = frozenset(
         "instance-data.ec2.internal",
     }
 )
-# Held parsed, so every spelling of the same address matches: fd00:ec2::254,
-# fd00:0ec2:0000:0000:0000:0000:0000:0254 and fd00:ec2::0.0.2.84 are one host.
+# Held parsed, so every spelling of the same address matches: fd00:ec2::254, fd00:0ec2:0000:0000:0000:0000:0000:0254 and
+# fd00:ec2::0.0.2.84 are one host.
 _METADATA_IPS = frozenset(
     ipaddress.ip_address(address)
     for address in (
@@ -555,32 +537,29 @@ _METADATA_IPS = frozenset(
         "fd20:ce::254",
         "100.100.100.200",
         "100.100.100.110",
-        # metadata.tencentyun.com, on VPC and on the classic network. Listed
-        # exactly because the resolved-address check reads this set rather than
-        # the link-local network below.
+        # metadata.tencentyun.com, on VPC and on the classic network. Listed exactly because the resolved-address check
+        # reads this set rather than the link-local network below.
         "169.254.0.23",
         "169.254.10.10",
     )
 )
-# Link-local, where the IPv4 metadata services live. Matched as a network so a
-# DNS name that merely starts with those digits (169.254.gateway.example.com) is
-# not mistaken for one.
+# Link-local, where the IPv4 metadata services live. Matched as a network so a DNS name that merely starts with those
+# digits (169.254.gateway.example.com) is not mistaken for one.
 _METADATA_NETWORK = ipaddress.ip_network("169.254.0.0/16")
 
-# Opt-in for operators who expose Unsloth on a shared host: also refuse provider
-# URLs that resolve to a non-public address. Off by default, because loopback and
-# LAN endpoints are the normal case (Ollama, llama.cpp, vLLM, custom gateways).
+# opt-in for operators exposing Unsloth on a shared host
+# Opt-in for operators who expose Unsloth on a shared host: also refuse provider URLs that resolve to a non-public
+# address. Off by default, because loopback and LAN endpoints are the normal case (Ollama, llama.cpp, vLLM, custom
+# gateways).
 _BLOCK_PRIVATE_ENV = "UNSLOTH_STUDIO_BLOCK_PRIVATE_PROVIDER_URLS"
 
 
-# An all-numeric host is an IPv4 literal to the resolver, in decimal, octal or
-# hex. `ipaddress` parses only the dotted quad, so 2852039166, 0xA9FEA9FE and
-# 0251.0376.0251.0376 would read as names while getaddrinfo returns
-# 169.254.169.254.
+# An all-numeric host is an IPv4 literal to the resolver, in decimal, octal or hex. `ipaddress` parses only the dotted
+# quad, so 2852039166, 0xA9FEA9FE and 0251.0376.0251.0376 would read as names while getaddrinfo returns 169.254.169.254.
 _NUMERIC_HOST_PART = re.compile(r"(?:0[xX][0-9a-fA-F]+|[0-9]+)")
 
-# IDNA label separators. httpx encodes a host through idna, which splits on all
-# of these, so http://169。254。169。254/ reaches 169.254.169.254.
+# IDNA label separators. httpx encodes a host through idna, which splits on all of these, so http://169。254。169。254/
+# reaches 169.254.169.254.
 _IDNA_DOTS = str.maketrans({"。": ".", "．": ".", "｡": "."})
 
 
@@ -600,8 +579,9 @@ def _canonical_host(hostname: str) -> str:
 
 def _metadata_host(hostname: str) -> bool:
     """True when ``hostname`` names a cloud metadata service."""
-    # An IPv6 scope id (fd00:ec2::254%250 once the transport decodes it) keeps
-    # the address unequal to the unscoped entry while dialling the same host.
+    # an IPv6 scope id keeps the address unequal to the unscoped entry while dialling the same host
+    # An IPv6 scope id (fd00:ec2::254%250 once the transport decodes it) keeps the address unequal to the unscoped entry
+    # while dialling the same host.
     hostname = hostname.translate(_IDNA_DOTS).rstrip(".").split("%")[0]
     hostname = _canonical_host(hostname)
     if hostname in _METADATA_HOST_NAMES:
@@ -617,49 +597,37 @@ def _metadata_host(hostname: str) -> bool:
     return ip in _METADATA_IPS or (ip.version == 4 and ip in _METADATA_NETWORK)
 
 
-# The block above only reads the hostname text, so a caller-controlled name
-# (metadata-alias.attacker.test IN A 169.254.169.254) dials the very service it
-# exists to refuse. Names are resolved on the default path too, but only far
-# enough to answer "is this metadata"; refusing other private addresses stays
-# opt-in. Three things keep that lookup off the endpoints people configure:
-#   * registry hosts and IP literals skip it, so a real provider or
-#     http://127.0.0.1:11434 touches no resolver;
-#   * a name that does not resolve is allowed -- http://my_ollama:11434 may only
-#     resolve in the client's network namespace, not in this one;
-#   * it is bounded and cached, so a dead resolver cannot stall each request.
-#     A client is built per request and the route validates the same URL again,
-#     so the cache is what keeps a request to one lookup.
-# Short on purpose. This validator is sync and called from async handlers, so
-# the wait is the event loop's wait, and every millisecond of it is shared by
-# every concurrent request. A provider hostname that a resolver can answer at
-# all is answered well inside this; past it the answer is treated as unknown,
-# which the default path allows and the opt-in path re-asks for without a bound.
-# So a longer deadline buys accuracy for nobody and costs latency for everyone.
+# The block above only reads the hostname text, so a caller-controlled name (metadata-alias.attacker.test IN A
+# 169.254.169.254) dials the very service it exists to refuse. Names are resolved on the default path too, but only far
+# enough to answer "is this metadata"; refusing other private addresses stays opt-in. Three things keep that lookup off
+# the endpoints people configure: * registry hosts and IP literals skip it, so a real provider or http://127.0.0.1:11434
+# touches no resolver; * a name that does not resolve is allowed -- http://my_ollama:11434 may only resolve in the
+# client's network namespace, not in this one; * it is bounded and cached, so a dead resolver cannot stall each request.
+# A client is built per request and the route validates the same URL again, so the cache is what keeps a request to one
+# lookup. Short on purpose. This validator is sync and called from async handlers, so the wait is the event loop's wait,
+# and every millisecond of it is shared by every concurrent request. A provider hostname that a resolver can answer at
+# all is answered well inside this; past it the answer is treated as unknown, which the default path allows and the
+# opt-in path re-asks for without a bound. So a longer deadline buys accuracy for nobody and costs latency for everyone.
 _DNS_TIMEOUT_SECONDS = 0.5
 _DNS_CACHE_TTL_SECONDS = 300.0
 _DNS_CACHE_MAX_ENTRIES = 512
-# hostname -> (expiry, addresses). Only answers land here; a failure and a
-# timeout are both cheap to repeat and wrong to remember.
+# hostname -> (expiry, addresses). Only answers land here; a failure and a timeout are both cheap to repeat and wrong to
+# remember.
 _dns_cache: dict[str, tuple[float, tuple[str, ...]]] = {}
 _dns_cache_lock = threading.Lock()
-# A lookup that times out is abandoned, not cancelled, so its thread lives until
-# the platform resolver gives up. Rotating hostnames defeat the cache and would
-# otherwise pile those up one per request, so the number in flight is capped and
-# a caller waits its turn up to the same deadline rather than being waved
-# through the moment the pool is busy.
-#
-# Saturating the pool still ends in "no answer", which the default path allows.
-# That is the same decision this file makes for a lookup that times out, and it
-# is deliberate: refusing instead would mean any resolver trouble, or any caller
-# willing to stall a few lookups, could stop the operator configuring a provider
-# at all. The check is a bound on what a caller-supplied URL may resolve to, not
-# a guarantee about what the socket will later connect to -- see the transport
-# note on _resolve_host.
+# A lookup that times out is abandoned, not cancelled, so its thread lives until the platform resolver gives up.
+# Rotating hostnames defeat the cache and would otherwise pile those up one per request, so the number in flight is
+# capped and a caller waits its turn up to the same deadline rather than being waved through the moment the pool is
+# busy. Saturating the pool still ends in "no answer", which the default path allows. That is the same decision this
+# file makes for a lookup that times out, and it is deliberate: refusing instead would mean any resolver trouble, or any
+# caller willing to stall a few lookups, could stop the operator configuring a provider at all. The check is a bound on
+# what a caller-supplied URL may resolve to, not a guarantee about what the socket will later connect to -- see the
+# transport note on _resolve_host.
 _DNS_MAX_IN_FLIGHT = 32
 _dns_in_flight = threading.BoundedSemaphore(_DNS_MAX_IN_FLIGHT)
 
-# Hostnames of the providers this build ships. They are hard-coded destinations,
-# not caller-controlled names, so learning their addresses buys nothing.
+# Hostnames of the providers this build ships. They are hard-coded destinations, not caller-controlled names, so
+# learning their addresses buys nothing.
 _REGISTRY_HOSTNAMES = frozenset(
     host
     for host in (
@@ -692,8 +660,8 @@ def _metadata_address(address: str) -> bool:
     return ip in _METADATA_IPS
 
 
-# What httpx leaves unescaped in a host: RFC 3986 sub-delims plus the WHATWG
-# set. Kept in step with its `_urlparse.encode_host`.
+# what httpx leaves unescaped in a host: RFC 3986 sub-delims plus the WHATWG set, kept in step with its
+# `_urlparse.encode_host`
 _HOST_SAFE_CHARS = "!$&'()*+,;=" + '"`{}%|\\'
 
 
@@ -713,16 +681,14 @@ def _transport_host(hostname: str) -> str:
     except ValueError:
         pass
     if hostname.isascii():
-        # httpx percent-encodes what RFC 3986 does not allow in a reg-name, so
-        # safe^alias.example is dialled as safe%5Ealias.example, a name whose
-        # parent zone can answer differently. Same quoting, same name.
+        # httpx percent-encodes what RFC 3986 disallows in a reg-name
+        # httpx percent-encodes what RFC 3986 does not allow in a reg-name, so safe^alias.example is dialled as
+        # safe%5Ealias.example, a name whose parent zone can answer differently. Same quoting, same name.
         return quote(hostname.lower(), safe = _HOST_SAFE_CHARS)
     try:
         import idna
         return idna.encode(hostname.lower()).decode("ascii")
     except Exception:
-        # httpx raises InvalidURL here, so the request cannot happen at all;
-        # resolving the name as written is then as good an answer as any.
         return hostname
 
 
@@ -749,8 +715,8 @@ def _resolve_host(hostname: str, port: int | None, scheme: str) -> tuple[str, ..
         return cached
     now = time.monotonic()
 
-    # Bound to a local: a worker abandoned at the deadline may outlive the
-    # global, and BoundedSemaphore raises if it releases one it never took.
+    # Bound to a local: a worker abandoned at the deadline may outlive the global, and BoundedSemaphore raises if it
+    # releases one it never took.
     in_flight = _dns_in_flight
     if not in_flight.acquire(timeout = _DNS_TIMEOUT_SECONDS):
         return None
@@ -769,27 +735,24 @@ def _resolve_host(hostname: str, port: int | None, scheme: str) -> tuple[str, ..
         except (OSError, UnicodeError, ValueError):
             return
         finally:
-            # Released by the worker, not the caller, so an abandoned lookup
-            # frees its slot only once the resolver actually lets it go.
+            # released by the worker, not the caller, so an abandoned lookup frees its slot only once the resolver lets
+            # it go
             in_flight.release()
         resolved.extend(str(info[4][0]) for info in infos)
         answered = True
 
-    # Daemon thread, so a resolver that never answers cannot hold up shutdown;
-    # the validator abandons it after the timeout and treats the name the same
-    # way it treats any other lookup failure.
+    # Daemon thread, so a resolver that never answers cannot hold up shutdown; the validator abandons it after the
+    # timeout and treats the name the same way it treats any other lookup failure.
     thread = threading.Thread(target = _resolve, daemon = True)
     thread.start()
     thread.join(_DNS_TIMEOUT_SECONDS)
     if thread.is_alive():
-        # A timeout is not an answer, so it is not remembered as one: the
-        # transport waits longer than this and would still get the address a
-        # deliberately slow authoritative server sends after the deadline.
+        # A timeout is not an answer, so it is not remembered as one: the transport waits longer than this and would
+        # still get the address a deliberately slow authoritative server sends after the deadline.
         return None
     if not answered:
-        # A failure is not cached either. It is cheap to repeat (the resolver
-        # says so immediately), and remembering it would turn one transient
-        # SERVFAIL into five minutes of refusal on the opt-in path.
+        # A failure is not cached either. It is cheap to repeat (the resolver says so immediately), and remembering it
+        # would turn one transient SERVFAIL into five minutes of refusal on the opt-in path.
         return None
 
     addresses = tuple(resolved)
@@ -821,17 +784,11 @@ def _reject_non_public(hostname: str, port: int | None, scheme: str) -> None:
     try:
         addresses = [ipaddress.ip_address(hostname)]
     except ValueError:
-        # The metadata check ran a moment ago and cached whatever it learned, so
-        # this reads that rather than starting a second bounded lookup: on a
-        # slow resolver the pair of them would each spend a deadline before the
-        # fallback below spent a third.
+        # The metadata check ran a moment ago and cached whatever it learned, so this reads that rather than starting a
+        # second bounded lookup: on a slow resolver the pair of them would each spend a deadline before the fallback
+        # below spent a third.
         resolved = _cached_addresses(hostname)
         if resolved is None:
-            # This path blocked on an unbounded getaddrinfo before the metadata
-            # check existed, and a resolver slower than that check's deadline is
-            # ordinary (the Linux default is 5s per server, twice). Falling back
-            # to the same unbounded call keeps a slow-but-working resolver from
-            # turning into a refusal here, where "no answer" fails closed.
             import socket
             try:
                 infos = socket.getaddrinfo(
@@ -882,8 +839,8 @@ def validate_provider_base_url(base_url: str) -> str:
     scheme = parts.scheme.lower()
     if scheme not in ("http", "https"):
         raise ValueError("Provider base URL must use http or https.")
-    # Userinfo stays allowed for gateways behind basic auth; the checks below read
-    # the parsed hostname, so http://api.openai.com@169.254.169.254/ is caught.
+    # Userinfo stays allowed for gateways behind basic auth; the checks below read the parsed hostname, so
+    # http://api.openai.com@169.254.169.254/ is caught.
     if not hostname:
         raise ValueError("Provider base URL must contain a hostname.")
 

@@ -75,8 +75,8 @@ class AudioCodecManager:
         else:
             raise ValueError(f"Unknown audio_type: {audio_type}")
 
-    # ── Lazy loaders ─────────────────────────────────────────────
 
+    # ── Lazy loaders ─────────────────────────────────────────────
     def _load_snac(self, device: str) -> None:
         if self._snac_model is not None:
             return
@@ -135,8 +135,8 @@ class AudioCodecManager:
         self._dac_audio_codec = processor.audio_codec
         logger.info("Loaded DAC audio codec")
 
-    # ── Decoders ─────────────────────────────────────────────────
 
+    # ── Decoders ─────────────────────────────────────────────────
     def decode_snac(self, generated_ids: torch.Tensor, device: str) -> Tuple[bytes, int]:
         """Decode SNAC tokens (Orpheus) into WAV bytes.
 
@@ -144,7 +144,6 @@ class AudioCodecManager:
         strips EOS (128258), redistributes 7-per-frame codes into 3 SNAC layers.
         Returns (wav_bytes, 24000).
         """
-        # Find START_OF_SPEECH token (128257)
         token_indices = (generated_ids == 128257).nonzero(as_tuple = True)
         if len(token_indices[1]) > 0:
             cropped = generated_ids[:, token_indices[1][-1] + 1 :]
@@ -154,10 +153,8 @@ class AudioCodecManager:
             cropped = generated_ids
         row = cropped[0]
 
-        # Remove EOS tokens (128258)
         row = row[row != 128258]
 
-        # Trim to multiple of 7
         row = row[: (len(row) // 7) * 7]
         if len(row) == 0:
             raise ValueError("No valid audio codes found after START_OF_SPEECH token")
@@ -210,8 +207,7 @@ class AudioCodecManager:
 
         semantic_ids = torch.tensor([int(t) for t in semantic_matches]).long().unsqueeze(0)
 
-        # Speaker encoder expects exactly 32 global tokens (token_num=32);
-        # pad with zeros or truncate.
+        # Speaker encoder expects exactly 32 global tokens (token_num=32); pad with zeros or truncate.
         GLOBAL_TOKEN_NUM = 32
         if global_matches:
             raw = [int(t) for t in global_matches]
@@ -220,7 +216,7 @@ class AudioCodecManager:
         if len(raw) < GLOBAL_TOKEN_NUM:
             raw = raw + [0] * (GLOBAL_TOKEN_NUM - len(raw))
         raw = raw[:GLOBAL_TOKEN_NUM]
-        global_ids = torch.tensor(raw).long().unsqueeze(0)  # (1, 32)
+        global_ids = torch.tensor(raw).long().unsqueeze(0)
 
         self._bicodec_tokenizer.device = device
         self._bicodec_tokenizer.model.to(device)
@@ -277,8 +273,8 @@ class AudioCodecManager:
             return self.decode_dac(text, device)
         raise ValueError(f"Cannot decode audio_type: {audio_type}")
 
-    # ── Cleanup ──────────────────────────────────────────────────
 
+    # ── Cleanup ──────────────────────────────────────────────────
     def unload(self) -> None:
         """Release all codec models from memory."""
         if self._snac_model is not None:
