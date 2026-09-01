@@ -3801,6 +3801,7 @@ def test_load_model_with_progress_uses_selected_gguf_size(monkeypatch, capsys):
 # must raise on it.
 # routes/inference.py, `_tunnel_safe_json`.
 
+# ── A load slower than the proxy timer (routes/inference.py _tunnel_safe_json) ──
 _DEFERRED_OOM = {
     "_deferred_error": {"status_code": 507, "detail": "CUDA out of memory"},
 }
@@ -4361,6 +4362,7 @@ def test_connect_explicit_api_key_skips_mint(fake_studio):
     assert not any(c[1].endswith("/api/auth/api-keys") for c in fake_studio)
 
 
+# ── OpenClaw (Anthropic /v1/messages) ────────────────────────────────
 def test_write_openclaw_config_fresh(tmp_path):
     path = tmp_path / "openclaw.json"
     start.write_openclaw_config(BASE, "sk-unsloth-abc", MODEL, path)
@@ -4538,6 +4540,7 @@ def test_connect_openclaw_no_launch_keeps_explicit_tui(fake_studio):
     assert _launch_command(result.output) == ["openclaw", "tui", "--message", "hi"]
 
 
+# ── OpenCode (OpenAI /v1/chat/completions) ───────────────────────────
 def test_write_opencode_config_fresh(tmp_path):
     path = tmp_path / "opencode.json"
     start.write_opencode_config(BASE, "sk-unsloth-abc", MODEL, path)
@@ -5059,6 +5062,7 @@ def test_connect_hermes_no_launch(fake_studio, tmp_path):
     assert not any(c[1].endswith("/api/inference/status") for c in fake_studio)
 
 
+# ── Pi (OpenAI-compatible /v1, key in config, ~/.pi relocated via HOME) ──
 def test_write_pi_config_fresh(tmp_path):
     path = tmp_path / ".pi" / "agent" / "models.json"
     start.write_pi_config(BASE, "sk-unsloth-abc", MODEL, path)
@@ -5149,6 +5153,7 @@ def test_connect_pi_no_launch_windows_relocates_userprofile(fake_studio, tmp_pat
     assert f'$env:USERPROFILE = "{home}"' in result.output
 
 
+# ── WSLENV path translation + PowerShell quoting (helper units) ──
 def test_wsl_bridge_names_flags_paths_not_scalars():
     # WSLENV only translates a var to a Windows path when its entry carries /p; scalar knobs and URLs must not get it.
     env = {
@@ -5198,6 +5203,7 @@ def test_powershell_quote_single_quotes_json():
     assert start._powershell_quote("a'b") == "'a''b'"
 
 
+# ── --yolo: one switch routed to each agent's own auto-approve form ──
 _NATIVE_YOLO = {
     "claude": "--dangerously-skip-permissions",
     "codex": "--dangerously-bypass-approvals-and-sandbox",
@@ -5899,6 +5905,7 @@ def test_session_config_no_launch_preserves_existing_state(fake_studio, tmp_path
         assert (home2 / "sessions" / "live.sqlite").read_text() == "state"
 
 
+# ── --persist: persist the agent session so it can be resumed ────────────────
 def test_session_config_persist_uses_stable_dir_and_survives(monkeypatch, tmp_path):
     monkeypatch.setattr(start, "_agents_config_root", lambda: tmp_path / "agents")
     with start._session_config("codex", launch = True, persist = True) as home:

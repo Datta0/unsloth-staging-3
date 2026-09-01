@@ -818,6 +818,7 @@ def _find_frontend_dist() -> Optional[Path]:
     return None
 
 
+# ── helpers for `unsloth studio run` ────────────────────────────────
 _direct_http_opener = None
 
 
@@ -1699,6 +1700,7 @@ def _format_context_length_line(load_result: dict) -> Optional[str]:
     return f"  Context length: {value_int} tokens"
 
 
+# ── unsloth studio (server) ──────────────────────────────────────────
 @studio_app.callback(invoke_without_command = True)
 def studio_default(
     ctx: typer.Context,
@@ -2075,6 +2077,7 @@ def studio_default(
         getattr(run_mod, "_wait_for_server_shutdown", lambda: None)()
 
 
+# ── unsloth studio run ───────────────────────────────────────────────
 def _split_repo_variant(model_arg: str) -> tuple[str, Optional[str]]:
     """Split ``org/name:variant`` into ``(repo, variant)``; mirrors
     llama.cpp's ``-hf <repo>:<quant>``. Local paths, Windows drives,
@@ -2889,6 +2892,7 @@ def run(
         getattr(run_mod, "_wait_for_server_shutdown", lambda: None)()
 
 
+# ── unsloth studio stop ───────────────────────────────────────────────
 _PID_FILE = STUDIO_HOME / "studio.pid"
 PID_FILE_GLOB = "studio-*.pid"
 
@@ -3125,6 +3129,7 @@ def stop():
         raise typer.Exit(1)
 
 
+# ── unsloth studio setup / update ─────────────────────────────────────
 def _wait_for_windows_setup_process(process) -> int:
     """Reap setup and its descendants before a runtime-gate owner can unwind."""
 
@@ -4521,6 +4526,7 @@ class _WindowsLauncherUpdateTransaction:
         return False
 
 
+# ── unsloth studio reset-password ────────────────────────────────────
 @studio_app.command("desktop-capabilities", hidden = True)
 def desktop_capabilities(
     json_output: bool = typer.Option(

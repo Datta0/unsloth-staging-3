@@ -27,6 +27,7 @@ def _studio():
 _BASE = ["--model", "unsloth/Qwen3-1.7B-GGUF"]
 
 
+# ── option registration ──────────────────────────────────────────────
 def test_run_exposes_secure_option_default_off():
     import inspect
 
@@ -56,6 +57,7 @@ def test_secure_exposes_hidden_not_secure_alias():
         assert getattr(opt, "default", None) is False
 
 
+# ── re-exec capture plumbing (mirrors test_studio_cloudflare_flag.py) ─
 class _ExecCaptured(SystemExit):
     def __init__(self, argv):
         super().__init__(0)
@@ -225,6 +227,7 @@ def test_run_not_secure_alias_respects_last_wins(monkeypatch, argv_order, expect
     assert expected in argv and unexpected not in argv, argv
 
 
+# ── in-venv path forwards secure + forced host into run_server ────────
 class _RunServerCaptured(SystemExit):
     def __init__(self, kwargs):
         super().__init__(0)
@@ -286,6 +289,7 @@ def test_run_in_venv_passes_secure_and_forces_host(monkeypatch, tmp_path, stub_t
     assert captured.get("host") == "127.0.0.1", captured
 
 
+# ── --secure + --no-cloudflare is rejected ───────────────────────────
 def test_run_secure_rejects_no_cloudflare(monkeypatch):
     studio_mod = _studio()
     import typer as _typer
@@ -310,6 +314,7 @@ def test_studio_default_rejects_secure_with_subcommand():
     assert "--secure" in combined, combined
 
 
+# ── secure resolves tools against the loopback bind (no flag -> no override) ──
 def test_run_secure_resolves_tools_against_loopback(monkeypatch):
     # --secure is a loopback bind behind an authenticated tunnel, so tools resolve against 127.0.0.1.
     # With no flag the resolver returns None and the child gets neither --enable-tools nor
@@ -374,6 +379,7 @@ def test_run_secure_enable_tools_no_auto_yes(monkeypatch):
     assert "--yes" not in argv, argv
 
 
+# ── plain `unsloth studio` exposes + forwards --enable-tools/--disable-tools ──
 def test_studio_default_exposes_enable_tools_option_default_none():
     import inspect
 

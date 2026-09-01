@@ -30,6 +30,7 @@ def _studio():
 _BASE = ["--model", "unsloth/Qwen3-1.7B-GGUF"]
 
 
+# ── option registration ──────────────────────────────────────────────
 def test_run_exposes_cloudflare_option_default_off():
     import inspect
 
@@ -50,6 +51,7 @@ def test_studio_default_exposes_cloudflare_option_default_off():
     assert getattr(opt, "default", "missing") is None
 
 
+# ── re-exec forwarding: `unsloth studio run` ─────────────────────────
 class _ExecCaptured(SystemExit):
     def __init__(self, argv):
         super().__init__(0)
@@ -133,6 +135,7 @@ def test_run_reexec_forwards_cloudflare_polarity(
     assert studio_mod.os.environ[studio_mod._CLOUDFLARE_INTENT_ENV] == expected_intent
 
 
+# ── re-exec forwarding: plain `unsloth studio` ───────────────────────
 def _invoke_studio_default(
     monkeypatch,
     args,
@@ -194,6 +197,7 @@ def test_studio_default_reexec_forwards_cloudflare(
     assert studio_mod.os.environ[studio_mod._CLOUDFLARE_INTENT_ENV] == expected_intent
 
 
+# ── in-venv path forwards cloudflare into run_server ─────────────────
 class _RunServerCaptured(SystemExit):
     def __init__(self, kwargs):
         super().__init__(0)
@@ -397,6 +401,7 @@ def test_run_silent_pins_internal_requests_to_the_bound_address(monkeypatch, tmp
     assert all(entry[0] not in {"verify", "print"} for entry in calls)
 
 
+# ── parent-level --cloudflare/--no-cloudflare with a subcommand is rejected ─
 @pytest.mark.parametrize("flag", ["--cloudflare", "--no-cloudflare"])
 def test_studio_default_rejects_cloudflare_flag_with_subcommand(monkeypatch, flag):
     # `unsloth studio --cloudflare run ...` would not reach the subcommand, so it must error (mirrors
@@ -412,6 +417,7 @@ def test_studio_default_rejects_cloudflare_flag_with_subcommand(monkeypatch, fla
     assert flag in combined, combined
 
 
+# ── run() tears the server + tunnel down if startup aborts ───────────
 def test_run_in_venv_shuts_down_on_startup_abort(monkeypatch, tmp_path):
     import types
 

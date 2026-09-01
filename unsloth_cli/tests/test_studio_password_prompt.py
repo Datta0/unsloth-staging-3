@@ -63,6 +63,7 @@ def test_should_prompt_password_change_matrix(cloudflare, host, secure, api_only
     )
 
 
+# ── shared harness ───────────────────────────────────────────────────
 class _ExecCaptured(SystemExit):
     def __init__(self, argv):
         super().__init__(0)
@@ -471,6 +472,7 @@ def test_an_ephemeral_multi_address_bind_is_rejected_before_password_or_launch(
     assert events == []
 
 
+# ── plain `unsloth studio` ───────────────────────────────────────────
 def test_studio_default_secure_prompts_and_updates_before_reexec(monkeypatch, tmp_path):
     studio_mod = _studio()
     events = _install_prompt_env(monkeypatch, tmp_path, interactive = True)
@@ -1049,6 +1051,7 @@ def test_studio_default_wildcard_cloudflare_prompts(monkeypatch, tmp_path):
     assert _auth_state(studio_mod)["must_change_password"] == 0
 
 
+# ── `unsloth studio run` ─────────────────────────────────────────────
 def test_run_secure_prompts_and_updates_before_reexec(monkeypatch, tmp_path):
     studio_mod = _studio()
     events = _install_prompt_env(monkeypatch, tmp_path, interactive = True)
@@ -1479,6 +1482,7 @@ def test_seeded_bootstrap_file_ends_with_a_newline(monkeypatch, tmp_path):
     assert studio_mod._pbkdf2_hex(raw.decode("utf-8").strip(), salt.encode("utf-8")) == pwd_hash
 
 
+# ── non-interactive --password / UNSLOTH_STUDIO_PASSWORD / stdin ──────
 def _exec_argv(events):
     return next(argv for kind, argv in events if kind == "exec")
 
