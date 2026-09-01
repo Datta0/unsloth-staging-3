@@ -15,6 +15,7 @@ import {
 import { toast } from "@/lib/toast";
 import { DRAFT_N_MAX_SPEC_TYPES } from "@/lib/speculative-modes";
 import { create } from "zustand";
+import { getChatSettings } from "../api/chat-settings-api";
 import {
   GPU_LAYERS_AUTO,
   recoverDroppedDiffusionSplit,
@@ -30,6 +31,7 @@ import {
   type Preset,
   getPresetSource,
 } from "../presets/preset-policy";
+import { normalizeModelIdentity } from "../../hub/lib/model-identity";
 import { normalizePresetLoadConfig } from "../presets/preset-load-config";
 import {
   CHAT_PROJECT_ATTACHMENT_TARGET_KEY,
@@ -56,7 +58,9 @@ import {
 } from "../types/runtime";
 import {
   loadChatSettingsWithLegacyImport,
+  sanitizeChatSettings,
   savePersistedChatSettingsPatch,
+  savePersistedChatSettingsPatchIfCurrent,
 } from "../utils/chat-settings-storage";
 import {
   loadShadowOwnsMirroredSetting,
@@ -66,6 +70,11 @@ import {
   normalizeStoredRagAutoInject,
 } from "../utils/mirrored-chat-settings";
 import { retryablePatchAfterFailure } from "../utils/settings-retry";
+import {
+  isPresenceBumpQwen,
+  migrateLegacyQwenDefaults,
+  type QwenDefaultsMigration,
+} from "../utils/qwen-defaults-migration";
 import {
   DEFAULT_AUTO_COMPACT_ENABLED,
   DEFAULT_COMPACTION_HEADROOM_RATIO,
@@ -333,6 +342,29 @@ function loadLastExternalCheckpoint(): string | null {
   }
 }
 
+/**
+ * Two checkpoints naming the same model.
+ *
+ * normalizeModelIdentity, not toLowerCase: it folds case for repository ids and
+ * the case-insensitive path forms while preserving it for POSIX paths, where
+ * /home/u/Models/qwen3.8 and /home/u/models/qwen3.8 are two different files.
+ */
+function sameCheckpointIdentity(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): boolean {
+  if (!(left && right)) {
+    return false;
+  }
+  return normalizeModelIdentity(left) === normalizeModelIdentity(right);
+}
+
+// A checkpoint that arrived without any adoption signal: restored from
+// localStorage at startup, or picked by the user while the settings GET was
+// still in flight. Chat settings are installation-wide, so neither may claim a
+// global snapshot another browser wrote for a different model.
+let unownedCheckpointBeforeHydration: string | null = null;
+
 function saveLastExternalCheckpoint(value: string | null): void {
   if (typeof window === "undefined") return;
   try {
@@ -482,6 +514,14 @@ async function flushSettingsPatch(keepalive = false): Promise<void> {
 // pendingTimer are both empty across that window, so they cannot answer "is a
 // settings write still outstanding" on their own.
 let unsettledFlushes = 0;
+
+function settingsWritesAreDrained(): boolean {
+  return (
+    pendingTimer === null &&
+    Object.keys(pendingPatch).length === 0 &&
+    unsettledFlushes === 0
+  );
+}
 
 function enqueueSettingsFlush(): Promise<void> {
   unsettledFlushes += 1;
@@ -2823,6 +2863,9 @@ type ChatRuntimeStore = {
       fromModelDefaults?: boolean;
       /** The context the model just loaded with. */
       maxTokensCap?: number;
+      /** Defaults came from the server-resident model at startup, so a legacy
+       * global snapshot can be attributed to it. */
+      migrateOwnedGlobalQwenDefaults?: boolean;
     },
   ) => void;
   setCustomPresets: (presets: Preset[]) => void;
@@ -3110,6 +3153,52 @@ const inferenceParamMutationVersions = Object.fromEntries(
 const scalarSettingMutationVersions = Object.fromEntries(
   SCALAR_SETTING_KEYS.map((key) => [key, 0]),
 ) as Record<ScalarSettingKey, number>;
+
+let loadedModelReasoningMode: {
+  checkpoint: string;
+  enabled: boolean;
+  reasoningMutationVersion: number;
+  fromLoad: boolean;
+} | null = null;
+
+/**
+ * Record the mode a load/status response put the active model in. Persisted
+ * settings can describe the previous model, so they cannot pick the migration
+ * table after a family default changed on load.
+ *
+ * `fromLoad` marks a model this browser actually loaded. A status refresh only
+ * echoes the reasoningEnabled already in the store, which before hydration is
+ * this browser's local default, so it must not outrank the persisted toggle.
+ */
+export function noteLoadedModelReasoningMode(
+  checkpoint: string,
+  enabled: boolean,
+  fromLoad = false,
+): void {
+  const state = useChatRuntimeStore.getState();
+  const previous = loadedModelReasoningMode;
+  loadedModelReasoningMode = {
+    checkpoint,
+    // A thread pin is not a shared model default. When one is active, retain
+    // the installation value captured before that thread was applied.
+    enabled:
+      threadScopedOverride("reasoningEnabled") !== undefined
+        ? installationReasoningEnabled(state)
+        : enabled,
+    reasoningMutationVersion:
+      scalarSettingMutationVersions.reasoningEnabled,
+    // Sticky per checkpoint: performLoad marks the load, then awaits refresh(),
+    // whose status merge calls this again with the default false. Downgrading
+    // there would drop the load's claim before hydration could read it.
+    fromLoad:
+      fromLoad ||
+      (previous !== null &&
+        sameCheckpointIdentity(previous.checkpoint, checkpoint) &&
+        previous.reasoningMutationVersion ===
+          scalarSettingMutationVersions.reasoningEnabled &&
+        previous.fromLoad),
+  };
+}
 
 function hasKeys(value: object): boolean {
   return Object.keys(value).length > 0;
@@ -3411,9 +3500,21 @@ function loadedContextFor(checkpoint: string): number | null {
   return loadedContext?.checkpoint === checkpoint ? loadedContext.cap : null;
 }
 
-/** A model that took over from another while the request was in flight. Its
- * defaults lose to its own entry but outrank the global set, which belongs to
- * whichever model was used last. Not narrowed to the keys that moved. */
+function capParamsToLoadedContext(
+  state: ChatRuntimeStore,
+  params: InferenceParams,
+): InferenceParams {
+  const residentGgufCap = isExternalModelId(params.checkpoint)
+    ? null
+    : state.ggufContextLength;
+  const cap = loadedContextFor(params.checkpoint) ?? residentGgufCap;
+  return cap !== null && params.maxTokens > cap
+    ? { ...params, maxTokens: cap }
+    : params;
+}
+
+/** A model selected while the request was in flight. Its defaults lose to its
+ * own entry but outrank the global set, which belongs to the last model used. */
 let modelLoadedBeforeHydration: string | null = null;
 
 /** A model stepped off before hydration. Nothing can be filed for it yet, but the
@@ -3423,9 +3524,12 @@ let modelLeftBeforeHydration: string | null = null;
 
 function noteModelDefaultsBeforeHydration(
   checkpoint: string,
-  replacedAnotherModel: boolean,
+  ownsPersistedGlobal: boolean,
 ): void {
-  if (replacedAnotherModel) {
+  // A model the user selected while settings were in flight does not own the
+  // previous session's global snapshot, even as this tab's first checkpoint.
+  // Server-resident startup adoption is the one exception.
+  if (!ownsPersistedGlobal) {
     modelLoadedBeforeHydration = checkpoint;
     return;
   }
@@ -3611,6 +3715,17 @@ function getHydratedSettingsState(
     ) {
       continue;
     }
+    // Same reason, the other direction: a load that landed while this response
+    // was in flight already chose the mode for the running model and advances
+    // no mutation version, so the stored toggle describes the previous one. Let
+    // the load win, as its sampling table does. Only an actual load, though: a
+    // status refresh echoes local state and must not outrank the installation.
+    if (
+      key === "reasoningEnabled" &&
+      loadEstablishedReasoningMode(state, true)
+    ) {
+      continue;
+    }
     // Only a local model or an openai_codex provider can run deep research, so a
     // stored true must not arm the pill for any other external checkpoint.
     if (
@@ -3672,14 +3787,9 @@ function getHydratedSettingsState(
   // Outside the replay: an install with only a global set has no entry, and the
   // budget restored from it does not fit the load either.
   const capped = nextState.params ?? params;
-  // ggufContextLength describes whatever is resident, which an external pick
-  // leaves loaded, so it is not this checkpoint's context to clamp against.
-  const residentGgufCap = isExternalModelId(checkpoint)
-    ? null
-    : state.ggufContextLength;
-  const cap = loadedContextFor(checkpoint) ?? residentGgufCap;
-  if (cap !== null && capped.maxTokens > cap) {
-    nextState.params = { ...capped, maxTokens: cap };
+  const withinLoadedContext = capParamsToLoadedContext(state, capped);
+  if (withinLoadedContext !== capped) {
+    nextState.params = withinLoadedContext;
   }
   return nextState;
 }
@@ -3700,6 +3810,352 @@ function setScalarSettingVersion<K extends ScalarSettingKey>(
   writeGlobal();
 }
 
+function localQwenMigrationSettings(
+  state: ChatRuntimeStore,
+): PersistedChatSettings {
+  return {
+    activePreset: state.activePreset,
+    activePresetSource: state.activePresetSource,
+    reasoningEnabled: installationReasoningEnabled(state),
+    inferenceParams: pickRememberedParams(
+      withoutActiveThreadParams(state, state.params),
+    ),
+    ...(Object.keys(state.paramsByModel).length > 0
+      ? { inferenceParamsByModel: state.paramsByModel }
+      : {}),
+  };
+}
+
+function installationReasoningEnabled(state: ChatRuntimeStore): boolean {
+  return threadScopedOverride("reasoningEnabled") !== undefined
+    ? (globalThreadScopedDefaults?.reasoningEnabled ?? state.reasoningEnabled)
+    : state.reasoningEnabled;
+}
+
+/**
+ * Whether a load or status response established the reasoning mode for the
+ * active model, with no user toggle since.
+ *
+ * A load writes reasoningEnabled without advancing its mutation version, so
+ * hydration would otherwise replay a toggle describing the previous model. The
+ * migration table and the hydrated pill both read this, so they cannot disagree
+ * and show a thinking pill above non-thinking sampling.
+ */
+function loadEstablishedReasoningMode(
+  state: ChatRuntimeStore,
+  requireLoad = false,
+): { enabled: boolean } | null {
+  const loaded = loadedModelReasoningMode;
+  if (
+    loaded !== null &&
+    sameCheckpointIdentity(loaded.checkpoint, state.params.checkpoint) &&
+    loaded.reasoningMutationVersion ===
+      scalarSettingMutationVersions.reasoningEnabled &&
+    (!requireLoad || loaded.fromLoad)
+  ) {
+    return { enabled: loaded.enabled };
+  }
+  return null;
+}
+
+function qwenMigrationThinkingOn(
+  settings: PersistedChatSettings,
+  state: ChatRuntimeStore,
+  reasoningMutationVersion = scalarSettingMutationVersions.reasoningEnabled,
+): boolean {
+  if (state.reasoningAlwaysOn) {
+    return true;
+  }
+  // Ahead of the established mode: a model that cannot reason never had the
+  // thinking table applied at load (apply-inference-status-to-store gates on
+  // supportsReasoning), and the mode recorded for it is just whatever toggle
+  // this browser happened to hold. Only once a load or status actually reported
+  // this checkpoint, though: supportsReasoning starts false, and "not asked
+  // yet" is not "cannot".
+  const statusSeen = sameCheckpointIdentity(
+    loadedModelReasoningMode?.checkpoint,
+    state.params.checkpoint,
+  );
+  if (statusSeen && !state.supportsReasoning) {
+    return false;
+  }
+  const established = loadEstablishedReasoningMode(state);
+  if (established) {
+    return established.enabled;
+  }
+  return settings.reasoningEnabled !== undefined &&
+    scalarSettingMutationVersions.reasoningEnabled === reasoningMutationVersion
+    ? settings.reasoningEnabled
+    : installationReasoningEnabled(state);
+}
+
+function qwenMigrationRemembersPerModel(
+  settings: PersistedChatSettings,
+  state: ChatRuntimeStore,
+  rememberParamsPerModelMutationVersion =
+    scalarSettingMutationVersions.rememberParamsPerModel,
+): boolean {
+  return settings.rememberParamsPerModel !== undefined &&
+    scalarSettingMutationVersions.rememberParamsPerModel ===
+      rememberParamsPerModelMutationVersion
+    ? settings.rememberParamsPerModel
+    : state.rememberParamsPerModel;
+}
+
+const QWEN_MIGRATION_DECISION_FIELDS = [
+  "activePreset",
+  "activePresetSource",
+  "reasoningEnabled",
+  "rememberParamsPerModel",
+  "inferenceParamsByModel",
+] as const satisfies ReadonlyArray<keyof PersistedChatSettings>;
+
+// Raw, not sanitized: the server tests `key in current` against what is stored,
+// and sanitizing drops keys that are still present, such as an empty
+// inferenceParamsByModel. Asserting absence from the sanitized copy would fence
+// a key the row really has and reject every migration on that install.
+function qwenMigrationExpectedAbsent(
+  rawSettings: unknown,
+): Array<keyof PersistedChatSettings> {
+  const raw =
+    typeof rawSettings === "object" && rawSettings !== null
+      ? (rawSettings as Record<string, unknown>)
+      : {};
+  return QWEN_MIGRATION_DECISION_FIELDS.filter(
+    (field) => !Object.hasOwn(raw, field),
+  );
+}
+
+function qwenMigrationExpectedAbsentPaths(
+  rawSettings: unknown,
+  patch: PersistedChatSettings,
+): Array<[keyof PersistedChatSettings, string]> {
+  // Raw for the same reason as qwenMigrationExpectedAbsent: the server tests the
+  // stored row, so a key sanitizing away must not be fenced as absent.
+  const nested = (field: keyof PersistedChatSettings): Record<string, unknown> =>
+    typeof rawSettings === "object" && rawSettings !== null
+      ? ((rawSettings as Record<string, unknown>)[field] as
+          | Record<string, unknown>
+          | undefined) ?? {}
+      : {};
+  const paths: Array<[keyof PersistedChatSettings, string]> = [];
+  if (patch.inferenceParams !== undefined) {
+    const global = nested("inferenceParams");
+    for (const field of ["topK", "repetitionPenalty"] as const) {
+      if (!Object.hasOwn(global, field)) {
+        paths.push(["inferenceParams", field]);
+      }
+    }
+  }
+  // Normalizing a differently-cased key writes a new exact-key row. Unfenced,
+  // the subset compare only checks the old spelling, so an exact-key row
+  // another tab added after the confirming read would be overwritten whole.
+  const stored = nested("inferenceParamsByModel");
+  for (const modelId of Object.keys(patch.inferenceParamsByModel ?? {})) {
+    if (!Object.hasOwn(stored, modelId)) {
+      paths.push(["inferenceParamsByModel", modelId]);
+    }
+  }
+  return paths;
+}
+
+function applyLegacyQwenDefaultsAfterPresetChange(
+  ownedGlobalCheckpoint: string | null,
+  migrateOwnedGlobalAlongsideModelMemory: boolean,
+): void {
+  useChatRuntimeStore.setState((state) => {
+    if (
+      !state.settingsHydrated ||
+      state.activePresetSource !== "builtin-default"
+    ) {
+      return state;
+    }
+    const checkpoint = state.params.checkpoint;
+    const includeOwnedGlobal = sameCheckpointIdentity(
+      ownedGlobalCheckpoint,
+      checkpoint,
+    );
+    const localSettings = localQwenMigrationSettings(state);
+    const migration = migrateLegacyQwenDefaults(
+      localSettings,
+      checkpoint,
+      qwenMigrationThinkingOn(localSettings, state),
+      includeOwnedGlobal,
+      migrateOwnedGlobalAlongsideModelMemory,
+    );
+    if (!migration.patch) return state;
+
+    const activeModelId = migration.migratedModelIds.find(
+      (modelId) => sameCheckpointIdentity(modelId, checkpoint),
+    );
+    const activePatch = activeModelId
+      ? migration.patch.inferenceParamsByModel?.[activeModelId]
+      : migration.patch.inferenceParams;
+    if (activePatch) {
+      // The open chat may pin one of these, but a later snapshot-less chat
+      // falls back to the installation copy captured when pairing began. Move
+      // it with the migrated defaults before restoring the thread's params.
+      noteThreadScopedDefaults(activePatch);
+    }
+    return {
+      ...(migration.settings.inferenceParamsByModel
+        ? { paramsByModel: migration.settings.inferenceParamsByModel }
+        : {}),
+      ...(activePatch
+        ? {
+            params: capParamsToLoadedContext(
+              state,
+              restoreThreadScopedParams({
+                ...state.params,
+                ...activePatch,
+              }),
+            ),
+          }
+        : {}),
+    };
+  });
+}
+
+async function retryLegacyQwenDefaultsAfterPresetChange(
+  ownedGlobalCheckpoint: string | null,
+  migrateOwnedGlobalAlongsideModelMemory: boolean,
+): Promise<void> {
+  try {
+    // Land the preset selection first so the confirming GET can recognize the
+    // legacy snapshot; a newer edit in another tab fails the fingerprint
+    // safely.
+    await flushPendingChatSettings();
+    // A write still outstanding past the flush timeout would reach the backend
+    // merge after this CAS and restore the legacy row, and nothing retries once
+    // the local copy is migrated. Skip instead: the local legacy row survives,
+    // so the next status refresh schedules this again.
+    if (!settingsWritesAreDrained()) {
+      return;
+    }
+    const state = useChatRuntimeStore.getState();
+    if (
+      !state.settingsHydrated ||
+      state.activePresetSource !== "builtin-default"
+    ) {
+      return;
+    }
+    const checkpoint = state.params.checkpoint;
+    const confirmedRaw = await getChatSettings();
+    const confirmed = sanitizeChatSettings(confirmedRaw);
+    const confirmedState = useChatRuntimeStore.getState();
+    // A model switch during the confirming GET invalidates both the row and the
+    // reasoning mode this retry would persist. The new model schedules its own.
+    if (
+      !confirmedState.settingsHydrated ||
+      confirmedState.activePresetSource !== "builtin-default" ||
+      confirmedState.params.checkpoint !== checkpoint
+    ) {
+      return;
+    }
+    const includeOwnedGlobal = sameCheckpointIdentity(
+      ownedGlobalCheckpoint,
+      checkpoint,
+    );
+    const migration = migrateLegacyQwenDefaults(
+      confirmed,
+      checkpoint,
+      qwenMigrationThinkingOn(confirmed, confirmedState),
+      includeOwnedGlobal,
+      migrateOwnedGlobalAlongsideModelMemory,
+    );
+    if (!migration.patch) return;
+    const persisted = await savePersistedChatSettingsPatchIfCurrent(
+      confirmed,
+      migration.patch,
+      qwenMigrationExpectedAbsent(confirmedRaw),
+      qwenMigrationExpectedAbsentPaths(confirmedRaw, migration.patch),
+    );
+    // Only now touch local state. Applying before persisting would leave this
+    // tab generating with values the server rejected, with no read to correct
+    // it; the write decides.
+    if (persisted.applied) {
+      applyLegacyQwenDefaultsAfterPresetChange(
+        ownedGlobalCheckpoint,
+        migrateOwnedGlobalAlongsideModelMemory,
+      );
+    }
+  } catch {
+    warnSettingsPersistenceFailure();
+  }
+}
+
+let qwenDefaultsRetryScheduled = false;
+let qwenDefaultsRetryOwnedGlobalCheckpoint: string | null = null;
+let qwenDefaultsRetryOwnedGlobalCheckpointConflicted = false;
+let qwenDefaultsRetryMigratesOwnedGlobalAlongsideModelMemory = false;
+
+function scheduleLegacyQwenDefaultsRetry(
+  ownedGlobalCheckpoint: string | null,
+  migrateOwnedGlobalAlongsideModelMemory = ownedGlobalCheckpoint !== null,
+): void {
+  if (ownedGlobalCheckpoint !== null) {
+    if (
+      qwenDefaultsRetryOwnedGlobalCheckpoint !== null &&
+      qwenDefaultsRetryOwnedGlobalCheckpoint.toLowerCase() !==
+        ownedGlobalCheckpoint.toLowerCase()
+    ) {
+      qwenDefaultsRetryOwnedGlobalCheckpointConflicted = true;
+    } else if (!qwenDefaultsRetryOwnedGlobalCheckpointConflicted) {
+      qwenDefaultsRetryOwnedGlobalCheckpoint = ownedGlobalCheckpoint;
+    }
+  }
+  qwenDefaultsRetryMigratesOwnedGlobalAlongsideModelMemory ||=
+    migrateOwnedGlobalAlongsideModelMemory;
+  if (qwenDefaultsRetryScheduled) {
+    return;
+  }
+  qwenDefaultsRetryScheduled = true;
+  queueMicrotask(() => {
+    const scheduledOwnedGlobalCheckpoint =
+      qwenDefaultsRetryOwnedGlobalCheckpointConflicted
+        ? null
+        : qwenDefaultsRetryOwnedGlobalCheckpoint;
+    const migrateScheduledOwnedGlobalAlongsideModelMemory =
+      qwenDefaultsRetryMigratesOwnedGlobalAlongsideModelMemory;
+    qwenDefaultsRetryScheduled = false;
+    qwenDefaultsRetryOwnedGlobalCheckpoint = null;
+    qwenDefaultsRetryOwnedGlobalCheckpointConflicted = false;
+    qwenDefaultsRetryMigratesOwnedGlobalAlongsideModelMemory = false;
+    const state = useChatRuntimeStore.getState();
+    if (
+      !state.settingsHydrated ||
+      state.activePresetSource !== "builtin-default"
+    ) {
+      return;
+    }
+    const localSettings = localQwenMigrationSettings(state);
+    const includeOwnedGlobal = sameCheckpointIdentity(
+      scheduledOwnedGlobalCheckpoint,
+      state.params.checkpoint,
+    );
+    const hasLocalCandidate =
+      migrateLegacyQwenDefaults(
+        localSettings,
+        state.params.checkpoint,
+        qwenMigrationThinkingOn(localSettings, state),
+        includeOwnedGlobal,
+        migrateScheduledOwnedGlobalAlongsideModelMemory,
+      ).patch !== null;
+    // A status refresh needs a confirming GET only when the local store still
+    // holds a legacy row. Adoption is the exception: it owns a server snapshot
+    // model defaults already replaced locally, so only the server still has it.
+    const hasOwnedGlobalCandidate =
+      includeOwnedGlobal && isPresenceBumpQwen(state.params.checkpoint);
+    if (!hasLocalCandidate && !hasOwnedGlobalCandidate) {
+      return;
+    }
+    void retryLegacyQwenDefaultsAfterPresetChange(
+      scheduledOwnedGlobalCheckpoint,
+      migrateScheduledOwnedGlobalAlongsideModelMemory,
+    );
+  });
+}
+
 export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   settingsHydrated: false,
   threadScopedSettingsPending: false,
@@ -3708,6 +4164,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   // useChatModelRuntime and intentionally NOT persisted here.
   params: (() => {
     const persistedExternal = loadLastExternalCheckpoint();
+    unownedCheckpointBeforeHydration = persistedExternal;
     return persistedExternal
       ? { ...DEFAULT_INFERENCE_PARAMS, checkpoint: persistedExternal }
       : DEFAULT_INFERENCE_PARAMS;
@@ -3895,7 +4352,119 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
     settingsHydrationPromise = (async () => {
       const hydrationVersions = getSettingsHydrationVersions();
       try {
-        const { settings, fromServer } = await loadChatSettingsWithLegacyImport();
+        const {
+          settings,
+          fromServer,
+          persisted: settingsArePersisted,
+        } = await loadChatSettingsWithLegacyImport();
+        // Assigned by the confirming read below, so the failure path can prefer
+        // it over the older hydration response.
+        let confirmed: PersistedChatSettings | undefined;
+        // What to hydrate when nothing was migrated. The confirming read is the
+        // newer server truth, but a legacy merge that failed to save exists
+        // only here, and re-reading the server would discard it.
+        const unmigrated = (
+          snapshot: PersistedChatSettings,
+        ): QwenDefaultsMigration => ({
+          settings: settingsArePersisted ? snapshot : settings,
+          patch: null,
+          migratedModelIds: [],
+        });
+        const checkpoint = get().params.checkpoint;
+        const thinkingOn = qwenMigrationThinkingOn(
+          settings,
+          get(),
+          hydrationVersions.scalarSettings.reasoningEnabled,
+        );
+        // A model loaded during the settings GET replaced the one whose global
+        // fallback was saved. Only the model resident at startup can own a
+        // global-only legacy snapshot.
+        const globalBelongsToActiveCheckpoint =
+          modelLoadedBeforeHydration !== checkpoint &&
+          modelLeftBeforeHydration === null &&
+          !sameCheckpointIdentity(unownedCheckpointBeforeHydration, checkpoint);
+        const remembersPerModel = qwenMigrationRemembersPerModel(
+          settings,
+          get(),
+          hydrationVersions.scalarSettings.rememberParamsPerModel,
+        );
+        let migration = migrateLegacyQwenDefaults(
+          settings,
+          checkpoint,
+          thinkingOn,
+          globalBelongsToActiveCheckpoint,
+          globalBelongsToActiveCheckpoint && !remembersPerModel,
+        );
+        if (fromServer && migration.patch) {
+          try {
+            // Re-read immediately before the write, so the patch derives from
+            // this confirmation rather than the earlier hydration response and
+            // a newer edit from another tab is left untouched.
+            const confirmedRaw = await getChatSettings();
+            confirmed = sanitizeChatSettings(confirmedRaw);
+            const confirmedState = get();
+            // A model switch during the confirming GET invalidates the
+            // checkpoint and mode this migration would persist; the new model
+            // schedules its own retry. The preset can move too: a slider
+            // touched now sets the local source to "modified" but queues its
+            // write behind the debounce, so the server still reads
+            // "builtin-default". Migrating on that stale read would rewrite a
+            // preset the user already modified, so trust the local version.
+            const presetSourceUnchanged =
+              activePresetSourceMutationVersion ===
+                hydrationVersions.presets.activePresetSource &&
+              confirmedState.activePresetSource === "builtin-default";
+            migration =
+              confirmedState.params.checkpoint === checkpoint &&
+              presetSourceUnchanged
+                ? migrateLegacyQwenDefaults(
+                    confirmed,
+                    checkpoint,
+                    qwenMigrationThinkingOn(
+                      confirmed,
+                      confirmedState,
+                      hydrationVersions.scalarSettings.reasoningEnabled,
+                    ),
+                    globalBelongsToActiveCheckpoint,
+                    globalBelongsToActiveCheckpoint &&
+                      !qwenMigrationRemembersPerModel(
+                        confirmed,
+                        confirmedState,
+                        hydrationVersions.scalarSettings
+                          .rememberParamsPerModel,
+                      ),
+                  )
+                : unmigrated(confirmed);
+            if (migration.patch) {
+              const persisted = await savePersistedChatSettingsPatchIfCurrent(
+                confirmed,
+                migration.patch,
+                qwenMigrationExpectedAbsent(confirmedRaw),
+                qwenMigrationExpectedAbsentPaths(
+                  confirmedRaw,
+                  migration.patch,
+                ),
+              );
+              migration = {
+                ...migration,
+                settings: persisted.settings,
+                patch: persisted.applied ? migration.patch : null,
+                migratedModelIds: persisted.applied
+                  ? migration.migratedModelIds
+                  : [],
+              };
+            }
+          } catch {
+            // Best effort, but that cannot mean hydrating values the server
+            // never accepted: the sheet and every request would show migrated
+            // sampling while storage still held the old row, on each start.
+            // Fall back to what was actually read, preferring the confirming
+            // snapshot when it landed, since the first read may already be
+            // stale and backfill would then push this browser's copy over it.
+            migration = unmigrated(confirmed ?? settings);
+          }
+        }
+        const hydratedSettings = migration.settings;
         let applied = false;
         set((state) => {
           if (state.settingsHydrated) {
@@ -3905,22 +4474,26 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
           const nextState: Partial<ChatRuntimeStore> = {
             settingsHydrated: true,
             ...getHydratedPresetState(
-              settings,
+              hydratedSettings,
               state,
               hydrationVersions.presets,
             ),
-            ...getHydratedSettingsState(settings, state, hydrationVersions),
+            ...getHydratedSettingsState(
+              hydratedSettings,
+              state,
+              hydrationVersions,
+            ),
           };
           return nextState;
         });
         if (applied) {
-          cacheHydratedSettings(settings, hydrationVersions);
+          cacheHydratedSettings(hydratedSettings, hydrationVersions);
           mirroredSettingsHydrated = true;
           // Only an authoritative read says a mirrored field is unset on the
           // server. A GET that fell back to legacy storage knows nothing about
           // it, and backfilling then pushes this browser's stale values over
           // whatever another browser wrote.
-          if (fromServer) backfillMirroredSettings(settings);
+          if (fromServer) backfillMirroredSettings(hydratedSettings);
           // After the backfill, so a startup edit wins over the stored value.
           flushPreHydrationSettings();
           // The previous session's tab-close writes, for the rows that did not exist
@@ -3973,7 +4546,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
     }),
   setModelRequiresTrustRemoteCode: (modelRequiresTrustRemoteCode) =>
     set({ modelRequiresTrustRemoteCode }),
-  setParams: (params, options) =>
+  setParams: (params, options) => {
     set((state) => {
       // Mirror setCheckpoint: the local load path can mutate params.checkpoint
       // via setParams() before setCheckpoint runs, leaving stale per-turn
@@ -4057,7 +4630,7 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       } else if (fromModelDefaults && !state.settingsHydrated) {
         noteModelDefaultsBeforeHydration(
           nextParams.checkpoint,
-          checkpointChanged && state.params.checkpoint !== "",
+          options?.migrateOwnedGlobalQwenDefaults === true,
         );
       }
       return {
@@ -4070,7 +4643,20 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
           ? { contextUsage: null, contextUsageByThreadId: {} }
           : {}),
       };
-    }),
+    });
+    // Startup can hydrate before the server's active model is adopted. Once
+    // status applies its defaults the checkpoint and reasoning mode are known,
+    // so the deferred active-row migration can run.
+    if (options?.fromModelDefaults === true) {
+      const retryState = get();
+      const ownsPersistedGlobal =
+        options.migrateOwnedGlobalQwenDefaults === true;
+      scheduleLegacyQwenDefaultsRetry(
+        ownsPersistedGlobal ? params.checkpoint : null,
+        ownsPersistedGlobal && !retryState.rememberParamsPerModel,
+      );
+    }
+  },
   setCustomPresets: (customPresets) =>
     set(() => {
       customPresetsMutationVersion += 1;
@@ -4083,12 +4669,25 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       saveSettingsPatch({ activePreset });
       return { activePreset };
     }),
-  setActivePresetSource: (activePresetSource) =>
-    set(() => {
+  setActivePresetSource: (activePresetSource) => {
+    let returnedToBuiltInDefault = false;
+    set((state) => {
+      returnedToBuiltInDefault =
+        activePresetSource === "builtin-default" &&
+        state.activePresetSource !== "builtin-default";
       activePresetSourceMutationVersion += 1;
       saveSettingsPatch({ activePresetSource });
       return { activePresetSource };
-    }),
+    });
+    if (returnedToBuiltInDefault) {
+      // The sheet updates provenance before applying the parameter edit. Defer
+      // a microtask so a final slider move restoring built-in Default has
+      // landed before the migration inspects and flushes it.
+      scheduleLegacyQwenDefaultsRetry(
+        useChatRuntimeStore.getState().params.checkpoint,
+      );
+    }
+  },
   setModels: (models) => set({ models }),
   setLoras: (loras) => set({ loras, loraInventorySettled: true }),
   setThreadRunning: (threadId, running, options) =>
@@ -4243,6 +4842,11 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
       // Clear stale per-turn usage on model change; the relaxed external-provider
       // render gate would otherwise show old counters until the next completion.
       const checkpointChanged = state.params.checkpoint !== modelId;
+      // An interactive pick during hydration has no adoption signal either, so
+      // the previous session's global does not become this model's.
+      if (checkpointChanged && !state.settingsHydrated) {
+        unownedCheckpointBeforeHydration = modelId;
+      }
       // Remember what the outgoing model was running with before replacing it.
       // Not for a restore: the model it steps off is the one a background load
       // put there, and its load defaults are not settings the user chose.

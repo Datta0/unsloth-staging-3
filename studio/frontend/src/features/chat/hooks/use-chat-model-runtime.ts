@@ -58,6 +58,7 @@ import {
   GPU_LAYERS_AUTO,
   isLocalModelPath,
   loadedGpuMemoryFields,
+  noteLoadedModelReasoningMode,
   persistGpuMemoryModeOnLoad,
   readPersistedGpuMemoryMode,
   readPersistedSpeculativeType,
@@ -93,7 +94,7 @@ import {
 } from "../presets/preset-policy";
 import { recordLastLocalModelLoad } from "../utils/last-local-model-load";
 import { loadFallbackNotice } from "../utils/mmproj-fallback";
-import { resolveQwenThinkingParams } from "../utils/qwen-params";
+import { resolveQwenThinkingParams } from "../utils/qwen-sampling-table";
 import { refreshContextUsage } from "../utils/refresh-context-usage";
 import { ensureGpuDeviceCache } from "@/hooks/use-gpu-info";
 import {
@@ -473,6 +474,10 @@ async function syncInferenceStatusToStore(options?: {
         applyActiveModelStatusToStore(statusRes, {
           previousCheckpoint: selectedCheckpoint,
           previousGgufVariant,
+          // With no prior selection this is Studio discovering the server's
+          // resident model, so its global-only snapshot belongs to this
+          // checkpoint and is safe to migrate.
+          adoptingExistingServerModel: selectedCheckpoint === "",
         });
         // setModels(listRes...) above used catalog data, which omits audio
         // capability. Re-apply live status so attach gates survive a refresh.
@@ -1919,6 +1924,9 @@ export function useChatModelRuntime() {
                 ? nativePathExpiresAtMs
                 : null,
             });
+            // fromLoad: this browser performed the load, so the mode it chose
+            // outranks a persisted toggle describing the previous model.
+            noteLoadedModelReasoningMode(modelId, nextReasoningEnabled, true);
             // Unlock attach menus for capabilities the catalog entry lacked.
             syncModelCapabilities(modelId, loadResponse);
             // Qwen3-family: apply thinking-mode-specific params after load.
