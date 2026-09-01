@@ -1,0 +1,68 @@
+name: "staging-7704 windows AMD spoof"
+on:
+  push:
+    branches: ["pr-7704-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  gate:
+    # windows-latest is the only runner that can present this PR's shape: a win_amd64
+    # interpreter that can actually import the triton-windows wheel. The AMD side is spoofed
+    # (no AMD GPU, no ROCm runtime, no HIP compile) -- see win_amd_gate_probe.py.
+    runs-on: windows-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The default a bare `pip install triton-windows` gives you today; this is the
+          # release that renamed get_cc to _find_compiler.
+          - triton: "triton-windows"
+            label: default
+          # The release the PR's own message recommends, and the one whose get_cc is known
+          # to prefer the ROCm wheel's clang-cl.
+          - triton: "triton-windows<3.7"
+            label: pinned-lt-3.7
+    name: "gate (${{ matrix.label }})"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install triton-windows (real wheel, real import)
+        run: python -m pip install "${{ matrix.triton }}"
+      # Diagnostics only, and it must never decide the job: the `pip show | head` pipe SIGPIPEs
+      # under `set -e` often enough to have failed one matrix leg and not the other, and the
+      # vswhere path differs by Visual Studio edition on the image.
+      - name: Record what is real on this runner
+        continue-on-error: true
+        run: |
+          set +e
+          python -c "import sys, sysconfig, platform; print('platform', sys.platform); print('machine', platform.machine()); print('platlib', sysconfig.get_paths()['platlib'])"
+          python -m pip show triton-windows
+          ls "C:/Program Files (x86)/Microsoft Visual Studio/Installer/vswhere.exe" "C:/Program Files/Microsoft Visual Studio/Installer/vswhere.exe" 2>/dev/null
+          exit 0
+      - name: Run the toolchain gate probe
+        run: python .github/scripts/win_amd_gate_probe.py --repo-root . --out win_gate_report.json
+      # The suite asserts on basename() and os.pathsep, which differ between posix and Windows,
+      # so running it here is a real cross-platform gate and not a repeat of the Linux run.
+      - name: Run the PR's own test suite on Windows
+        run: |
+          python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+          PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_msvc_env_7595.py studio/backend/tests/test_diffusion_speed.py -q --tb=short
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: win-gate-report-${{ matrix.label }}
+          path: win_gate_report.json
