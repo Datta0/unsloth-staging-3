@@ -55,12 +55,12 @@ def spawn_download(
     env["HF_HUB_DISABLE_TELEMETRY"] = "1"
     # Xet's out-of-order chunks do not provide steady partial-file progress.
     env["HF_HUB_DISABLE_XET"] = "1"
-    # Parallel Range chunks leave sparse partials a resumed sequential writer
-    # cannot reuse, which defeats the point of cancelling.
+    # Parallel Range chunks leave sparse partials a resumed sequential writer cannot reuse, which defeats the point of
+    # cancelling.
     env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
-    # Replace the inherited credentials only when the caller supplied one. With
-    # no token, leave the ambient login alone: the parent plans the download
-    # with it, so scrubbing here would fail gated repos that used to work.
+    # with no token, leave the ambient login alone: the parent planned the download with it
+    # Replace the inherited credentials only when the caller supplied one. With no token, leave the ambient login alone:
+    # the parent plans the download with it, so scrubbing here would fail gated repos that used to work.
     if hf_token:
         env["HF_HUB_DISABLE_IMPLICIT_TOKEN"] = "0"
         for token_key in (
@@ -82,8 +82,8 @@ def spawn_download(
         cwd = str(cwd),
         stdout = subprocess.DEVNULL,
         stderr = subprocess.PIPE,
-        # Die with Unsloth: a detached worker would keep pulling gigabytes after
-        # the app closed, with nothing left able to stop it.
+        # Die with Unsloth: a detached worker would keep pulling gigabytes after the app closed, with nothing left able
+        # to stop it.
         **child_popen_kwargs(),
     )
     adopt_pid(process.pid)  # terminate_all backstop for graceful exits
