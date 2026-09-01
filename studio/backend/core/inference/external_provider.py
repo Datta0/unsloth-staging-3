@@ -1111,7 +1111,7 @@ class ExternalProviderClient:
                 yield line
             return
 
-        # OpenAI moved flagship models (gpt-5.x) off /v1/chat/completions — those endpoints return 404 "This is not a
+        # OpenAI moved flagship models (gpt-5.x) off /v1/chat/completions - those endpoints return 404 "This is not a
         # chat model" for the new families. Route all OpenAI traffic through /v1/responses instead; we translate the
         # Responses SSE back into Chat Completions chunks so the frontend stays endpoint-agnostic.
         if self.provider_type == "openai":
@@ -1325,7 +1325,7 @@ class ExternalProviderClient:
                 # server-side.
                 event_counts: dict[str, int] = {}
                 chosen_model: Optional[str] = None
-                # OpenRouter has no web_search_call events — citations arrive as url_citation annotations. Synthesise a
+                # OpenRouter has no web_search_call events - citations arrive as url_citation annotations. Synthesise a
                 # tool_start/tool_end pair to match the OpenAI/Anthropic UX.
                 web_search_active = (
                     self.provider_type == "openrouter"
@@ -1702,7 +1702,7 @@ class ExternalProviderClient:
                             response.headers.get("Retry-After"),
                         )
                         return
-                    # Manual __anext__ loop instead of `async for` — see the stream_chat_completion comment for the
+                    # Manual __anext__ loop instead of `async for` - see the stream_chat_completion comment for the
                     # Python 3.13 + httpcore 1.0.x GeneratorExit interaction this avoids.
                     lines_gen = response.aiter_lines().__aiter__()
                     try:
@@ -1738,7 +1738,7 @@ class ExternalProviderClient:
             first_args = _json.loads(first_args_raw)
         except Exception:
             first_args = {}
-        # Args are an opaque receipt (`{"search_result":..., "usage":{"total_tokens":N}}`), not a query — Kimi runs the
+        # Args are an opaque receipt (`{"search_result":..., "usage":{"total_tokens":N}}`), not a query - Kimi runs the
         # search server-side and bakes results into context.
         logger.info(
             "Kimi $web_search: %d tool_call(s), args[0]=%s",
@@ -1760,7 +1760,7 @@ class ExternalProviderClient:
                 "arguments": first_args if isinstance(first_args, dict) else {},
             }
         )
-        # The search already ran server-side, so emit tool_end now — otherwise the UI card sits in "running" through the
+        # The search already ran server-side, so emit tool_end now - otherwise the UI card sits in "running" through the
         # whole second-call answer.
         yield _build_kimi_tool_end(_synthetic_chunk, tool_call_id, [])
 
@@ -2422,7 +2422,7 @@ class ExternalProviderClient:
 
                 lines_gen = response.aiter_lines().__aiter__()
                 thinking_open = False
-                # Diagnostic counters for "no thinking content" reports — distinguish "Anthropic never sent
+                # Diagnostic counters for "no thinking content" reports - distinguish "Anthropic never sent
                 # thinking_delta" from "frontend didn't render the chunks".
                 event_counts: dict[str, int] = {}
                 # web_search state. Query streams via input_json_delta on a server_tool_use block; results land in a
@@ -2459,7 +2459,7 @@ class ExternalProviderClient:
                 code_execution_generated_files = 0
                 # Container id captured from `message_start.message.container.id` when code_execution is enabled. Emit a
                 # `container_ready` _toolEvent on first sight so the chat adapter persists it on the thread record. Only
-                # emitted when the value differs from the inbound id — no churn on reuse.
+                # emitted when the value differs from the inbound id - no churn on reuse.
                 latched_container_id: Optional[str] = None
                 container_id_emitted = False
                 # Cache usage from message_start (cache_creation/read_input_tokens) and message_delta (output_tokens),
@@ -2580,7 +2580,7 @@ class ExternalProviderClient:
                         return "\n".join(parts) if parts else "(no output)"
                     if inner_type == "text_editor_code_execution_result":
                         # view: file content; create: is_file_update flag; str_replace: diff `lines` list. The matching
-                        # server_tool_use carries the command + path, already encoded into tool_start arguments — here
+                        # server_tool_use carries the command + path, already encoded into tool_start arguments - here
                         # we only format the result body.
                         if "lines" in inner and isinstance(inner.get("lines"), list):
                             return "\n".join(str(line) for line in inner["lines"])
@@ -2759,12 +2759,12 @@ class ExternalProviderClient:
                                     current_code_exec_use["buffer"] += partial
                                 elif current_web_fetch_use is not None:
                                     current_web_fetch_use["buffer"] += partial
-                            # signature_delta and other delta types are skipped — they carry trust / verification
+                            # signature_delta and other delta types are skipped - they carry trust / verification
                             # metadata, not user-visible content.
 
                         elif event_type == "content_block_stop":
                             if current_server_tool_use is not None:
-                                # End of the server_tool_use block — parse the accumulated input_json into a query and
+                                # End of the server_tool_use block - parse the accumulated input_json into a query and
                                 # emit tool_start. The matching tool_end fires later when the web_search_tool_result
                                 # block closes with the actual results.
                                 buffer = current_server_tool_use["buffer"]
@@ -2791,7 +2791,7 @@ class ExternalProviderClient:
                                 )
                                 current_server_tool_use = None
                             elif current_result_block is not None:
-                                # End of a web_search_tool_result — emit tool_end carrying the search results as
+                                # End of a web_search_tool_result - emit tool_end carrying the search results as
                                 # Title:/URL: blocks. The frontend's parseSourcesFromResult lifts these into source
                                 # pills at message tail.
                                 tool_use_id = current_result_block["tool_use_id"]
@@ -2808,7 +2808,7 @@ class ExternalProviderClient:
                                 )
                                 current_result_block = None
                             elif current_code_exec_use is not None:
-                                # End of a code-execution server_tool_use — parse the buffered input_json into a
+                                # End of a code-execution server_tool_use - parse the buffered input_json into a
                                 # {command, path, ...} dict and emit tool_start. The matching tool_end fires on the
                                 # result block's content_block_stop.
                                 buffer = current_code_exec_use["buffer"]
@@ -2871,7 +2871,7 @@ class ExternalProviderClient:
                                 )
                                 current_code_exec_result = None
                             elif current_web_fetch_use is not None:
-                                # End of the web_fetch server_tool_use — parse the buffered input_json into the URL the
+                                # End of the web_fetch server_tool_use - parse the buffered input_json into the URL the
                                 # model asked Anthropic to fetch and emit tool_start. The matching tool_end fires on the
                                 # result block's content_block_stop just below.
                                 buffer = current_web_fetch_use["buffer"]
@@ -2902,7 +2902,7 @@ class ExternalProviderClient:
                                 )
                                 current_web_fetch_use = None
                             elif current_web_fetch_result is not None:
-                                # End of the web_fetch_tool_result — format the source pill and emit tool_end.
+                                # End of the web_fetch_tool_result - format the source pill and emit tool_end.
                                 tool_use_id = current_web_fetch_result["tool_use_id"]
                                 result_text = _format_web_fetch_result(
                                     current_web_fetch_result["inner"]
@@ -3348,7 +3348,7 @@ class ExternalProviderClient:
                                     )
                                     if _fetched is not None:
                                         _final_mime, _b64 = _fetched
-                                        # base64 expands ~4/3 — recover bytes from len(_b64).
+                                        # base64 expands ~4/3 - recover bytes from len(_b64).
                                         _approx_bytes = (len(_b64) * 3) // 4
                                         if (
                                             _remote_image_total_bytes + _approx_bytes

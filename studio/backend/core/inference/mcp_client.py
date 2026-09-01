@@ -238,7 +238,7 @@ def _oauth_store():
         from utils.paths.storage_roots import ensure_dir, studio_root
 
         # hash keys: fastmcp uses raw URLs as keys, and FileTreeStore would treat the "://" as nested directories
-        # Hash keys/collections — fastmcp uses raw URLs as keys, and FileTreeStore would treat the "://" as nested
+        # Hash keys/collections - fastmcp uses raw URLs as keys, and FileTreeStore would treat the "://" as nested
         # directories.
         _oauth_token_store = FileTreeStore(
             data_directory = ensure_dir(studio_root() / "mcp-oauth-tokens"),

@@ -126,7 +126,7 @@ def _local_gguf_path(repo_id: str, gguf_filename: str) -> Optional[str]:
             hit = try_to_load_from_cache(repo_id, gguf_filename, cache_dir = root)
             if isinstance(hit, str) and Path(hit).is_file():
                 return hit
-    except Exception:  # noqa: BLE001 — a cache we cannot read is not a verdict
+    except Exception:  # noqa: BLE001 - a cache we cannot read is not a verdict
         pass
     return None
 
@@ -158,7 +158,7 @@ def _hub_revision(repo_id: str, gguf_filename: str, hf_token: Optional[str]) -> 
             token = hf_token,
             timeout = _HEADER_TIMEOUT_SECONDS,
         )
-    except Exception:  # noqa: BLE001 — a revision we cannot read is not a verdict
+    except Exception:  # noqa: BLE001 - a revision we cannot read is not a verdict
         return None
     return getattr(meta, "commit_hash", None) or None
 
@@ -225,7 +225,7 @@ def _interrupt_read(response: Any) -> None:
         return
     try:
         response.raw.shutdown()
-    except Exception:  # noqa: BLE001 — a deadline that cannot fire must not become a new failure
+    except Exception:  # noqa: BLE001 - a deadline that cannot fire must not become a new failure
         try:
             response.close()
         except Exception:  # noqa: BLE001
@@ -247,7 +247,7 @@ def _read_gguf_header(repo_id: str, gguf_filename: str, hf_token: Optional[str])
     try:
         from huggingface_hub import hf_hub_url
         from huggingface_hub.utils import build_hf_headers, get_session
-    except Exception:  # noqa: BLE001 — an unexpected hub layout leaves today's behaviour
+    except Exception:  # noqa: BLE001 - an unexpected hub layout leaves today's behaviour
         return b""
     buffer = bytearray()
     # Published by the worker as soon as it has something interruptible; read by this thread on timeout. A one-element
@@ -280,7 +280,7 @@ def _read_gguf_header(repo_id: str, gguf_filename: str, hf_token: Optional[str])
         # header layouts, no cut ever produces a wrong dim, so a short prefix is answered or ignored. TRUNCATION only: a
         # header with flipped bytes can still parse to a wrong dim (~0.6% under a 1-4 byte flip), which the loader's own
         # full-file backstop shares. TLS makes that unlikely on this path.
-        except Exception:  # noqa: BLE001 — offline, deadline fired, or the peer went away
+        except Exception:  # noqa: BLE001 - offline, deadline fired, or the peer went away
             pass
 
     # The watchdog exists as well as the join because iter_content blocks inside urllib3 until a whole 64 KiB chunk has

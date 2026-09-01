@@ -230,7 +230,7 @@ class InferenceOrchestrator:
         self._cmd_queue: Any = None
         self._resp_queue: Any = None
         self._subprocess_shutdown_lock = threading.Lock()
-        self._cancel_event: Any = None  # mp.Event — set to cancel generation
+        self._cancel_event: Any = None  # mp.Event - set to cancel generation
         # Set for the whole unload; the worker never clears it (unlike _cancel_event), so a generate queued behind the
         # cancelled one is skipped, not run.
         self._drain_event: Any = None
@@ -1065,7 +1065,7 @@ class InferenceOrchestrator:
                 return
 
 
-    # ------------------------------------------------------------------ Dispatcher — per-request mailbox routing for
+    # ------------------------------------------------------------------ Dispatcher - per-request mailbox routing for
     # compare mode ------------------------------------------------------------------
     def _start_dispatcher(self) -> bool:
         """Start the dispatcher thread if not already running.
@@ -2338,7 +2338,7 @@ class InferenceOrchestrator:
             pass
 
 
-    # ------------------------------------------------------------------ Audio generation — TTS, ASR, audio input
+    # ------------------------------------------------------------------ Audio generation - TTS, ASR, audio input
     # ------------------------------------------------------------------
     def generate_audio_response(
         self,

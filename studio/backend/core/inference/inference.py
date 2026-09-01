@@ -101,13 +101,13 @@ class HarmonyTextStreamer:
         self._final_emitted: int = 0
 
 
-    # put / end — called from the generation thread
+    # put / end - called from the generation thread
     def put(self, value):
         """Receive new token IDs from model.generate()."""
         import torch
 
         if isinstance(value, torch.Tensor):
-            # shape (batch, seq) — take first batch element
+            # shape (batch, seq) - take first batch element
             ids = value[0].tolist() if value.dim() > 1 else value.tolist()
         elif isinstance(value, (list, tuple)):
             ids = list(value)
@@ -558,7 +558,7 @@ class InferenceBackend:
                     self.models[model_name]["model"] = model
                     self.models[model_name]["tokenizer"] = tokenizer
 
-                # Load external codec for TTS audio types (Whisper is ASR, audio_vlm is audio input — neither needs one)
+                # Load external codec for TTS audio types (Whisper is ASR, audio_vlm is audio input - neither needs one)
                 if audio_type not in ("whisper", "audio_vlm"):
                     model_repo_path = self.models[model_name].get("model_repo_path")
                     self._audio_codec_manager.load_codec(
@@ -1536,7 +1536,7 @@ class InferenceBackend:
         if not system_prompt:
             system_prompt = "You are an assistant that transcribes speech accurately."
 
-        # Gemma 3n format — audio goes INTO apply_chat_template
+        # Gemma 3n format - audio goes INTO apply_chat_template
         audio_messages = [
             {"role": "system", "content": [{"type": "text", "text": system_prompt}]},
             {
