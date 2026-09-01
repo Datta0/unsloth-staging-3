@@ -57,8 +57,6 @@ def _side(
 
 
 # ── the null control ────────────────────────────────────────────────────────────────────────
-
-
 def test_two_self_installed_copies_of_one_ref_are_a_null_control():
     """`--branch main --ab main`: same build, two ports, and it is the calibration run."""
 
@@ -95,20 +93,17 @@ def test_one_attached_studio_driven_twice_is_a_null_control():
     assert is_null_control(sides) is True
 
 
-# ── the stream-cost injection needs two origins ─────────────────────────────────────────────
-#
-# The injection is a CONTEXT init script gated on `window.location.origin`, and both arms are
-# driven by one browser context and one page, so the origin is the only thing that can tell them
-# apart. Two arms on one origin therefore BOTH burn the injected cost, the difference between them
-# is zero, and `evaluate_stream_cost_recovery_gate` -- which reads back
-# `(injected_rate - base_rate) * chars` -- reports a recovery of nothing and blames the
-# accumulator. The one flag whose job is to separate "the change did nothing" from "the metric is
-# not watching" would answer the second when the truth is neither.
-#
+# The stream-cost injection needs two origins. The injection is a CONTEXT init script gated on
+# `window.location.origin`, and both arms are driven by one browser context and one page, so the
+# origin is the only thing that can tell them apart. Two arms on one origin BOTH burn the injected
+# cost, the difference is zero, and `evaluate_stream_cost_recovery_gate` reports a recovery of
+# nothing and blames the accumulator, so the one flag whose job is to separate 'the change did
+# nothing' from 'the metric is not watching' answers the second when the truth is neither.
 # One attached Unsloth driven twice is not a mistake in general: it is a null control this tool
-# detects on purpose, pinned by the test directly above. It is only fatal with the injection on.
+# detects on purpose, pinned by the test above. It is only fatal with the injection on.
 
 
+# ── the stream-cost injection needs two origins ─────────────────────────────────────────────
 def _inject_args(attach, attach_b, *extra):
     return parse_args(["--attach", attach, "--ab", "main", "--attach-b", attach_b, *extra])
 
@@ -226,8 +221,6 @@ def test_an_attached_side_and_a_self_installed_one_on_the_same_port_are_refused(
 
 
 # ── the controls: the refusal may not swallow a run that is fine ────────────────────────────
-
-
 def test_two_origins_may_inject():
     args = _inject_args(
         "http://127.0.0.1:5401", "http://127.0.0.1:5402", "--inject-stream-cost-ms", "3"
@@ -359,8 +352,6 @@ def test_a_null_control_states_the_commit_it_compared_with_itself():
 
 
 # ── one password per side ───────────────────────────────────────────────────────────────────
-
-
 def test_each_attached_side_authenticates_with_its_own_password():
     args = parse_args(
         [
@@ -395,8 +386,6 @@ def test_without_ab_there_is_one_side():
 
 
 # ── one home per side ───────────────────────────────────────────────────────────────────────
-
-
 def test_ab_sides_never_share_an_explicit_home():
     base = side_home("/tmp/home", "/out", "base", ab = True)
     treatment = side_home("/tmp/home", "/out", "treatment", ab = True)
@@ -413,8 +402,6 @@ def test_without_home_each_side_lands_under_the_output_directory():
 
 
 # ── the doctor ──────────────────────────────────────────────────────────────────────────────
-
-
 def test_an_engine_with_a_note_is_not_installed():
     assert engines_installed("chromium, webkit (not installed), firefox (unavailable)") == [
         "chromium"
@@ -429,8 +416,6 @@ def test_an_engine_with_a_note_is_not_installed():
 
 
 # ── the exit status ─────────────────────────────────────────────────────────────────────────
-
-
 def test_a_fully_resumed_run_is_a_success():
     """Every cell was already complete, so the requested output exists. Exit 0."""
 
@@ -447,8 +432,6 @@ def test_one_failed_cell_fails_the_run():
 
 
 # ── the report ladder ───────────────────────────────────────────────────────────────────────
-
-
 def _rows(
     rungs,
     cells,
@@ -562,8 +545,6 @@ def test_an_explicit_tier_still_wins(tmp_path):
 
 
 # ── --rungs is normalised and checked before anything is acquired ────────────────────────────
-
-
 def _rungs(value):
     return planned_rungs(parse_args(["--tier", "standard", "--rungs", value]))
 

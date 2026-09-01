@@ -54,9 +54,9 @@ class _Verdict:
 
 
 class _Bundle:
-    # WHAT `browser.launch` WOULD HAVE RESOLVED on the machine running this test. `run_meta`
-    # records the engine and `requested_identity` resolves the same way, so a stub that names a
-    # fixed one would make a legitimate resume look like an engine change off Linux and macOS.
+    # WHAT `browser.launch` WOULD HAVE RESOLVED on the machine running this test. `run_meta` records the
+    # engine and `requested_identity` resolves the same way, so a stub naming a fixed one would make a
+    # legitimate resume look like an engine change off Linux and macOS.
     engine = browser_mod.default_engine()[0]
     engine_note = "stubbed for this test"
     browser = context = page = cdp = None
@@ -100,8 +100,8 @@ def studio(monkeypatch, tmp_path):
     def fake_install(ref, home, *args, **kwargs):
         install = StudioInstall(home = Path(home), repo = Path(home).parent / "repo", branch = ref)
         # `setattr` rather than a constructor argument, so this fixture also builds against a
-        # `StudioInstall` that has no commit field and the tests below fail on the subject rather
-        # than on the way in.
+        # `StudioInstall` that has no commit field and the tests fail on the subject rather than the way
+        # in.
         install.commit = state["commits"].get(ref, f"c-{ref}-1")
         return install
 
@@ -151,8 +151,6 @@ def _rows(state):
 
 
 # ── what a run records ───────────────────────────────────────────────────────────────────────
-
-
 def test_a_run_records_the_commit_its_ref_resolved_to(studio):
     assert sb.run(_args(studio, "--branch", "main")) == 0
 
@@ -171,8 +169,6 @@ def test_an_attached_studio_records_no_commit(studio):
 
 
 # ── the refusal ──────────────────────────────────────────────────────────────────────────────
-
-
 def test_a_resume_after_the_branch_moved_is_refused(studio):
     assert sb.run(_args(studio, "--branch", "main")) == 0
 
@@ -213,8 +209,6 @@ def test_a_resume_after_the_treatment_moved_is_refused(studio):
 
 
 # ── the controls ─────────────────────────────────────────────────────────────────────────────
-
-
 def test_the_same_commit_still_resumes(studio):
     """The control that matters: a resume of the build the payload was recorded on is the whole
     point of `--resume` and must still skip its cells and exit 0."""

@@ -48,8 +48,8 @@ METRIC = "message_menu.open_close_ms"
 
 
 #: Wall clock per session. A resume starts after the run it continues has stopped; the real
-#: two-launcher payload of defect 9 overlaps by sixteen minutes, which is what `_at` reproduces
-#: for the concurrent fixtures.
+#: two-launcher payload of defect 9 overlaps by sixteen minutes, which is what `_at` reproduces for
+#: the concurrent fixtures.
 _STARTED = {
     "s1": "2026-08-23T00:00:00",
     "t2": "2026-08-23T02:00:00",
@@ -164,8 +164,6 @@ def _interleaved(tmp_path, name = "concurrent"):
 
 
 # ── the resume must be scored, and scored from the attempt that superseded ──
-
-
 def test_a_resumed_ab_is_scored_rather_than_refused(tmp_path):
     pooled = floor_table.paired(floor_table.read_rows(_resumed(tmp_path)))
     assert pooled, (
@@ -219,8 +217,6 @@ def test_the_floor_side_is_reduced_the_same_way(tmp_path):
 
 
 # ── the concurrent case must still be refused ────────────────────────
-
-
 def test_two_concurrent_launchers_are_still_refused(tmp_path):
     with pytest.raises(SystemExit) as exc:
         floor_table.paired(floor_table.read_rows(_interleaved(tmp_path)))
@@ -269,8 +265,6 @@ def test_an_unrelated_interleaved_session_does_not_condemn_a_resume(tmp_path):
 
 
 # ── the censoring guard has to read the rows the numbers came from ───
-
-
 def test_a_superseded_dead_attempt_does_not_mark_a_metric_censored(tmp_path):
     """`censored_metrics` counts an `expect_ok is False` action as a censored cell.
 
@@ -291,8 +285,6 @@ def test_a_superseded_dead_attempt_does_not_mark_a_metric_censored(tmp_path):
 
 
 # ── controls: nothing else changes ───────────────────────────────────
-
-
 def test_an_ordinary_single_session_payload_is_untouched(tmp_path):
     rows = [_meta("s1")] + _arm(BASE, "s1", 1000.0) + _arm(TREAT, "s1", 500.0)
     pooled = floor_table.paired(floor_table.read_rows(_write(tmp_path, "plain", rows)))
@@ -309,8 +301,6 @@ def test_sequential_sessions_with_no_repeated_id_still_pair_within_themselves(tm
 
 
 # ── the clock is a second witness, independent of file order ─────────
-
-
 def test_sessions_that_overlap_in_time_are_refused_even_when_the_file_looks_sequential(tmp_path):
     """Two runs at once whose rows did not happen to interlock in this file.
 
@@ -358,8 +348,6 @@ def test_naming_a_session_still_reads_that_session(tmp_path):
 
 
 # ── the teeth these guards need, found by mutating the fix ───────────
-
-
 def test_a_whole_payload_read_does_not_fall_back_to_the_superseded_cell_row(tmp_path):
     """`cell_metrics` with no session named is last-writer-wins over `cell_id`.
 

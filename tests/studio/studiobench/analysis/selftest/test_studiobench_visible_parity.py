@@ -48,8 +48,6 @@ def _cap(visible: dict[int, str], ever: list[int] | None = None) -> dict:
 
 
 # ── the exemption, which is the entire point ────────────────────────
-
-
 def test_a_difference_that_is_only_off_screen_passes():
     """THE POLICY, IN ONE ASSERTION. The treatment renders ordinals 1-3 differently -- they are
     genuinely not the same DOM -- but the viewport never showed them during this action, so the
@@ -81,8 +79,6 @@ def test_showing_different_messages_is_itself_a_visible_difference():
 
 
 # ── the windowed arm is comparable at all ───────────────────────────
-
-
 def test_a_windowed_arm_and_a_full_arm_are_compared_by_thread_position():
     """The reason this mode works where the digest does not. The base has the whole thread mounted
     and the treatment has a window of it, so mounted INDEX 0 is a different message on the two
@@ -93,8 +89,6 @@ def test_a_windowed_arm_and_a_full_arm_are_compared_by_thread_position():
 
 
 # ── the positive control ────────────────────────────────────────────
-
-
 def test_a_visibility_scan_that_saw_nothing_is_not_a_pass():
     """Two empty scans have equal ordinal sets and no differing digests, so without this the
     strongest verdict available is returned on the strength of never having observed a single
@@ -121,8 +115,6 @@ def test_a_missing_capture_is_refused_rather_than_assumed_empty():
 
 
 # ── the honest residue ──────────────────────────────────────────────
-
-
 def test_a_message_seen_mid_action_but_unmounted_by_capture_is_not_counted_as_agreement():
     """THIS TEST USED TO ASSERT MATCH, and it contradicted its own name.
 
@@ -181,8 +173,7 @@ def test_a_pair_where_nothing_visible_could_be_digested_is_not_a_pass():
     """Every ordinal the viewport showed had been unmounted by capture time, so the comparison
     observed the visibility but none of the content. That is not agreement."""
     got = P.compare_visible(_cap({}, ever = [3, 4]), _cap({}, ever = [3, 4]))
-    # The zero-length scan control fires first, and either refusal is correct; what must not
-    # happen is a MATCH.
+    # The zero-length scan control fires first, and either refusal is correct; what must not happen is a MATCH.
     assert got["verdict"] == P.NOT_COMPARABLE, got
 
 
@@ -270,16 +261,15 @@ def test_every_mode_names_the_policy_it_is_judging_against():
     # The behavioural mode grants neither of the first two and is the only one that speaks to the
     # third, so "either" would be the wrong word for it now.
     assert "cannot grant the performance or off-screen exemptions" in P.POLICY_BY_MODE["behaviour"]
-    # AND IT SAYS HOW IT MEASURES THE CONDITION. "Complete" on its own reads as a comparison of
-    # the copied content; what the gate does is divide each arm's clipboard length by the thread's
-    # visible text and require the ratio to land in a band. Saying which of those it is decides
-    # whether a reader is entitled to conclude the copy was intact, so the weaker wording is not
-    # allowed back: the line has to name the measure AND disclaim the one it does not perform.
+    # AND IT SAYS HOW IT MEASURES THE CONDITION. "Complete" alone reads as a comparison of the copied
+    # content; what the gate does is divide each arm's clipboard length by the thread's visible text
+    # and require the ratio to land in a band. Which of those it is decides whether a reader may
+    # conclude the copy was intact, so the line has to name the measure AND disclaim the other.
     assert "BY LENGTH" in P.POLICY_BY_MODE["behaviour"]
     assert "does not compare the copied characters" in P.POLICY_BY_MODE["behaviour"]
     assert "records the exemption rather than granting it" in P.POLICY_BY_MODE["behaviour"]
-    # The floor survives the exemption. An exemption changes what counts as a pass; a measurement
-    # with no floor under it is not a pass in the first place.
+    # The floor survives the exemption. An exemption changes what counts as a pass; a measurement with
+    # no floor under it is not a pass in the first place.
     assert "does not remove the floor" in P.POLICY_BY_MODE["visible"]
 
 
@@ -302,8 +292,8 @@ def test_the_policy_line_is_printed_next_to_every_claim_line():
     for name in claims:
         assert f"P.{name}" in source, f"{name} is never printed"
     for mode in P.POLICY_BY_MODE:
-        # Either printed straight from the table, or through the per-mode helper that fills in
-        # the numbers that mode is actually enforcing.
+        # Either printed straight from the table, or through the per-mode helper that fills in the numbers
+        # that mode is enforcing.
         assert (
             f"POLICY_BY_MODE['{mode}']" in source or f"{mode}_policy(" in source
         ), f"the {mode} policy line is never printed"
