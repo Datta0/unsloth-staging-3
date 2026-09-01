@@ -17,6 +17,7 @@ import {
   loadOptionalBool,
   loadedGpuMemoryFields,
   normalizeSpeculativeType,
+  noteLoadedModelReasoningMode,
   resolvePreserveThinkingOnLoad,
   resolveToolsEnabledOnLoad,
   useChatRuntimeStore,
@@ -26,7 +27,7 @@ import {
   isMultimodalResponse,
 } from "../types/api";
 import type { ChatModelRow } from "../types/runtime";
-import { resolveQwenThinkingParams } from "../utils/qwen-params";
+import { resolveQwenThinkingParams } from "../utils/qwen-sampling-table";
 import { sameGpuSelection } from "@/hooks/gpu-selection";
 import { resolveBatchSizeSeed } from "./resolve-batch-size-seed";
 import { resolveChatTemplateSeed } from "./resolve-chat-template-seed";
@@ -135,6 +136,9 @@ export type ApplyInferenceStatusOptions = {
    * status -- without it a variant-only switch underneath the tab reads as
    * steady state and the hydration reseed keeps the old quant's baselines. */
   previousGgufVariant?: string | null;
+  /** This status belongs to the model already resident when Studio started,
+   * so the persisted global sampling snapshot belongs to this checkpoint. */
+  adoptingExistingServerModel?: boolean;
 };
 
 /** Mirror refresh() hydration so adopted CLI models get reasoning/tools flags. */
@@ -169,6 +173,8 @@ export function applyActiveModelStatusToStore(
       {
         fromModelDefaults: true,
         maxTokensCap: status.context_length ?? undefined,
+        migrateOwnedGlobalQwenDefaults:
+          options.adoptingExistingServerModel === true,
       },
     );
   }
@@ -677,6 +683,11 @@ export function applyActiveModelStatusToStore(
     useChatRuntimeStore.setState({ reasoningEnabled: reasoningDefault });
   }
 
+  noteLoadedModelReasoningMode(
+    checkpointId,
+    reasoningAlwaysOn || useChatRuntimeStore.getState().reasoningEnabled,
+  );
+
   // Every status merge carries the base family recommendation, including the
   // refresh immediately after performLoad. Layer the active Qwen mode over it
   // so that refresh cannot undo performLoad's thinking table. This also covers
@@ -694,6 +705,8 @@ export function applyActiveModelStatusToStore(
         {
           fromModelDefaults: true,
           maxTokensCap: status.context_length ?? undefined,
+          migrateOwnedGlobalQwenDefaults:
+            options.adoptingExistingServerModel === true,
         },
       );
     }
@@ -739,6 +752,7 @@ export async function tryAdoptServerActiveModel(): Promise<boolean> {
   applyActiveModelStatusToStore(status, {
     previousCheckpoint,
     previousGgufVariant,
+    adoptingExistingServerModel: true,
   });
   return true;
 }
