@@ -1583,6 +1583,7 @@ class ExternalProviderClient:
             url,
         )
 
+        # ---- First call: collect the model's $web_search tool_call ----
         tool_calls_acc: dict[int, dict[str, Any]] = {}
         try:
             async with _http_client.stream(
@@ -1764,6 +1765,7 @@ class ExternalProviderClient:
         # whole second-call answer.
         yield _build_kimi_tool_end(_synthetic_chunk, tool_call_id, [])
 
+        # ---- Second call: echo the tool_calls back and stream answer ----
         assistant_msg = {
             "role": "assistant",
             "content": "",

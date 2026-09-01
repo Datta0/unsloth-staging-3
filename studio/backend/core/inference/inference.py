@@ -376,6 +376,7 @@ class InferenceBackend:
                 "active_adapter": None,
             }
 
+            # ── Audio model loading path ──────────────────────────
             if config.is_audio:
                 audio_type = config.audio_type
                 adapter_info = " (LoRA adapter)" if config.is_lora else ""
@@ -1983,6 +1984,7 @@ class InferenceBackend:
             raise
 
 
+    # ── Audio (TTS) Generation ────────────────────────────────────
     def generate_audio_response(
         self,
         text: str,
