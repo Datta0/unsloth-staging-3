@@ -42,6 +42,17 @@ import {
 } from "../src/features/find-in-page/lib/find-text-index.ts";
 import { useFindInPageStore } from "../src/features/find-in-page/stores/find-in-page-store.ts";
 
+/** The feature's component module as one string. */
+async function readComponentSource(): Promise<string> {
+  return await readFile(
+    new URL(
+      "../src/features/find-in-page/components/find-in-page.tsx",
+      import.meta.url,
+    ),
+    "utf8",
+  );
+}
+
 // --- the hand-rolled tree ----------------------------------------------------------------------
 
 function text(data: string): FindTextNodeLike {
@@ -1262,13 +1273,7 @@ test("the stylesheet paints the two highlights the code registers", async () => 
 });
 
 test("the bar keeps itself out of the region it searches", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   assert.match(bar, new RegExp(`${FIND_SKIP_ATTRIBUTE}=`));
   // And the mutation filter reads the same attribute, so the counter re-rendering does not order a
   // re-index of the conversation.
@@ -1367,13 +1372,7 @@ test("dark mode sits above the cards it floats over", async () => {
 });
 
 test("the bar stays out of a backgrounded scope, and off the document origin", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   // Every modal, not just Settings: Radix marks the shell aria-hidden for as long as one is up,
   // and `enabled` is read at render, which a dialog opening need not cause.
   assert.match(
@@ -1489,6 +1488,67 @@ test("a query too large to compile falls back instead of throwing on the first s
   assert.deepEqual(findMatches(index, query, 10), []);
 });
 
+test("a Hangul query finds the syllables it is looking at", () => {
+  // NFD takes a syllable apart into leading, vowel and trailing Jamo, and none of those are
+  // combining marks. Clustered by the general rule, one syllable became three clusters, each
+  // composed back to itself, so the pattern held only the decomposed spelling and the composed
+  // text in the index matched none of it. Every Korean query returned nothing.
+  const index = buildTextIndex(
+    el("DIV", [el("P", [text("\uac00\ub098\ub2e4 hello \ud55c\uad6d\uc5b4")])]),
+  );
+  assert.deepEqual(findMatches(index, "\uac00", 10), [{ start: 0, end: 1 }]);
+  assert.deepEqual(findMatches(index, "\uac00\ub098\ub2e4", 10), [
+    { start: 0, end: 3 },
+  ]);
+  assert.deepEqual(findMatches(index, "\ud55c\uad6d\uc5b4", 10), [
+    { start: 10, end: 13 },
+  ]);
+  // Both spellings reach the other, as for any other script.
+  assert.deepEqual(
+    findMatches(index, "\uac00\ub098\ub2e4".normalize("NFD"), 10),
+    [{ start: 0, end: 3 }],
+  );
+  const decomposed = buildTextIndex(
+    el("DIV", [el("P", [text("\uac00\ub098\ub2e4".normalize("NFD"))])]),
+  );
+  assert.equal(findMatches(decomposed, "\uac00\ub098\ub2e4", 10).length, 1);
+});
+
+test("a Hangul syllable is matched whole, in every spelling it can be stored in", () => {
+  // Three canonical spellings, not two. Besides fully composed and fully decomposed there is the
+  // half-composed one, an LV syllable followed by a loose trailing Jamo, which is exactly what
+  // joining two text nodes produces when the syllable straddles them.
+  const GA = "\uac00"; // 가
+  const GAG = "\uac01"; // 각, the same syllable closed by a trailing consonant
+  const GAG_NFD = "\u1100\u1161\u11a8";
+  const GAG_HALF = "\uac00\u11a8";
+  const index = (body: string) =>
+    buildTextIndex(el("DIV", [el("P", [text(body)])]));
+
+  // Every spelling of the text is reachable from every spelling of the query.
+  for (const body of [GAG, GAG_NFD, GAG_HALF]) {
+    for (const query of [GAG, GAG_NFD, GAG_HALF]) {
+      const hits = findMatches(index(body), query, 10);
+      assert.equal(
+        hits.length,
+        1,
+        `${escape(body)} searched for ${escape(query)}`,
+      );
+      // And the highlight covers the whole syllable as that text spells it, never part of it.
+      assert.deepEqual(hits[0], { start: 0, end: body.length });
+    }
+  }
+
+  // An open syllable must not stop short of the trailing Jamo that closes the one on screen.
+  // Decomposed, 가 would otherwise match the first two thirds of 각 and highlight part of a letter,
+  // while composed text never could, since there the whole syllable is one code point.
+  for (const body of [GAG, GAG_NFD, GAG_HALF]) {
+    assert.deepEqual(findMatches(index(body), GA, 10), [], escape(body));
+  }
+  // The open syllable is still found where it really is open.
+  assert.deepEqual(findMatches(index(GA), GA, 10), [{ start: 0, end: 1 }]);
+});
+
 test("a match with no geometry is aimed at through its nearest laid-out ancestor", async () => {
   const dom = await readFile(
     new URL("../src/features/find-in-page/lib/find-dom.ts", import.meta.url),
@@ -1543,13 +1603,7 @@ test("re-indexing while the document changes is a throttle, and says so", async 
 });
 
 test("the bar has no border, and its buttons have a hover that shows", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   const surface = /className="(find-bar-surface[^"]*)"/.exec(bar);
   assert.ok(surface, "the bar no longer wears the shared surface class");
   assert.equal(
@@ -1566,13 +1620,7 @@ test("the bar has no border, and its buttons have a hover that shows", async () 
 test("a long query rewinds to its first character when focus leaves", async () => {
   // Typing past the width of the field scrolls it, and a bar left showing the tail of a word says
   // nothing about what was searched for.
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   assert.match(bar, /onBlur=\{rewindToStart\}/);
   assert.match(bar, /input\.setSelectionRange\(0, 0\);/);
   assert.match(bar, /input\.scrollLeft = 0;/);
@@ -1700,13 +1748,7 @@ test("the rows progressive completion adds are re-anchored, not renumbered", asy
 });
 
 test("Escape closes the bar from the walk buttons, not just the field", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   // On the WINDOW, in the capture phase, for the lifetime of the open bar. A handler on the bar
   // only reaches presses that started inside it, so clicking a message to read it left a bar
   // Escape would not close -- and with a tool request waiting, that same unprevented Escape went
@@ -1769,13 +1811,7 @@ test("only threads this search can read are forced to finish mounting", async ()
 test("the chord is left to the browser when the scope is behind a modal", async () => {
   // `useShortcut` prevents the event BEFORE calling the handler, so declining from inside the
   // handler kills the chord for everyone: no bar, and no native find either.
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   assert.match(bar, /claims: \(\) => !isSurfaceBackgrounded\(/);
   const shortcut = await readFile(
     new URL("../src/features/settings/hooks/use-shortcut.ts", import.meta.url),
@@ -1787,13 +1823,7 @@ test("the chord is left to the browser when the scope is behind a modal", async 
 });
 
 test("the Enter that commits an IME candidate is left alone", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   // Ahead of preventDefault, or the composition is discarded before the guard is reached.
   const enter = bar.slice(bar.indexOf('event.key === "Enter"'));
   const guard = enter.indexOf("isImeComposing(event.nativeEvent)");
@@ -1802,13 +1832,7 @@ test("the Enter that commits an IME candidate is left alone", async () => {
 });
 
 test("closing the bar hands focus back to where it came from", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   // Captured above the effect that focuses the field, or it reads the field it is about to fill.
   const capture = bar.indexOf("const active = document.activeElement");
   const takeFocus = bar.indexOf("input.select();");
@@ -1931,13 +1955,7 @@ test("leaving the shell forgets the search", () => {
 });
 
 test("the shell unmounting is what calls it, not the bar closing", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   // As an unmount cleanup. Not `enabled`: a dialog turns that off, and the search should still be
   // there when it closes.
   assert.match(bar, /useEffect\(\(\) => reset, \[reset\]\);/);
@@ -2124,13 +2142,7 @@ test("the cap flag is what the bar renders, not the count", async () => {
   // still costs nothing under the cap, where the thunk is never called.
   assert.match(engine, /let anchoredAt: number \| null = null;/);
   assert.match(engine, /anchoredAt = viewportOffset\(index\);/);
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   assert.match(bar, /\$\{capped \? "\+" : ""\}/);
   assert.equal(bar.includes("count >= MAX_MATCHES"), false);
 });
@@ -2138,13 +2150,7 @@ test("the cap flag is what the bar renders, not the count", async () => {
 test("Escape is left to the IME while it is composing", async () => {
   // Escape dismisses a candidate. Consumed here, it closes the bar out from under a word still
   // being typed, and the candidate window never sees the key it was aimed at.
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   const escape = bar.slice(bar.indexOf("const onEscape ="));
   const guard = escape.indexOf("isImeComposing(event)");
   const consume = escape.indexOf("event.preventDefault()");
@@ -2283,13 +2289,7 @@ test("a container query resizing the scope invalidates the index", async () => {
 });
 
 test("nothing of the engine is mounted while the bar is closed", async () => {
-  const bar = await readFile(
-    new URL(
-      "../src/features/find-in-page/components/find-in-page.tsx",
-      import.meta.url,
-    ),
-    "utf8",
-  );
+  const bar = await readComponentSource();
   // The index, the observer and the highlights all live in `useFindInPage`, and the only component
   // that calls it is behind this return. A hook moved above it would run them on every route.
   assert.match(bar, /if \(!enabled \|\| !open\) return null;/);
