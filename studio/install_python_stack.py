@@ -5638,6 +5638,30 @@ def _shared_base_requirements() -> Path | None:
     return None
 
 
+_UNSLOTH_ZOO_GIT_URL = "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
+
+
+def _unsloth_zoo_ref() -> str:
+    """The unsloth-zoo git ref the --local overlay installs.
+
+    UNSLOTH_ZOO_REF lets the Studio venv track the requested zoo instead of
+    always main, which is what the Docker build pins against and what
+    install.sh reads into _ZOO_REF. Unset means main.
+    """
+    return os.environ.get("UNSLOTH_ZOO_REF", "").strip() or "main"
+
+
+def _unsloth_zoo_git_spec() -> str:
+    """The pip requirement string for the unsloth-zoo overlay.
+
+    An unset UNSLOTH_ZOO_REF leaves the URL bare rather than appending @main: a
+    bare git URL already clones the default branch, so the default install is
+    byte for byte the one every caller and the staging path already expect.
+    """
+    ref = os.environ.get("UNSLOTH_ZOO_REF", "").strip()
+    return _UNSLOTH_ZOO_GIT_URL + ("@" + ref if ref else "")
+
+
 def _overlay_local_core_package(
     name: str,
     local_repo: str,
@@ -5656,9 +5680,10 @@ def _overlay_local_core_package(
         install_label = "Overlaying local repo (editable)"
         args = ("-e", local_repo)
     elif canonical == "unsloth-zoo":
-        step_label = "overlaying unsloth-zoo from git main"
-        install_label = "Overlaying unsloth-zoo from git main"
-        args = ("--force-reinstall", "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo")
+        zoo_ref = _unsloth_zoo_ref()
+        step_label = f"overlaying unsloth-zoo from git {zoo_ref}"
+        install_label = f"Overlaying unsloth-zoo from git {zoo_ref}"
+        args = ("--force-reinstall", _unsloth_zoo_git_spec())
     else:
         return False
     _step(_LABEL, step_label)
@@ -5704,7 +5729,7 @@ def _overlay_source_spec(name: str, local_repo: str) -> str:
     if canonical == "unsloth":
         return local_repo
     if canonical == "unsloth-zoo":
-        return "unsloth-zoo @ git+https://github.com/unslothai/unsloth-zoo"
+        return _unsloth_zoo_git_spec()
     return ""
 
 
@@ -7005,6 +7030,9 @@ def install_python_stack() -> int:
     package_name = os.environ.get("STUDIO_PACKAGE_NAME", "unsloth")
     # --local overlays a local repo checkout after updating deps.
     local_repo = os.environ.get("STUDIO_LOCAL_REPO", "")
+    # The unsloth-zoo git ref for the --local overlay is read where the overlay
+    # runs (_unsloth_zoo_ref / _unsloth_zoo_git_spec) so UNSLOTH_ZOO_REF reaches
+    # the metadata-repair reinstall path too, not just the two calls below.
     # Clean-machine CI overlays only unsloth, not the full local source pair.
     ci_source_overlay = os.environ.get("UNSLOTH_CI_SOURCE_OVERLAY", "")
     # +1 for the anyio repair check (step 8b), +1 for the diffusers pin (step 11b, every platform)

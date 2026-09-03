@@ -125,6 +125,24 @@ del maybe_set_windows_rocm_bnb_version
 # Fixes https://github.com/unslothai/unsloth/issues/1266
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 
+# `docker --gpus '"device=N"'` sets NVIDIA_VISIBLE_DEVICES but not
+# CUDA_VISIBLE_DEVICES, so Inductor's compile-worker pool can't enumerate the
+# cgroup-pinned GPU ("Could not find an active GPU backend"). Force a single
+# in-process compile thread. Trigger only on pinned ids, not "all"/"none"/"void"/""
+# (the `--gpus all` default). Opt out with UNSLOTH_FORCE_SINGLE_COMPILE_WORKER=0.
+_nvd = os.environ.get("NVIDIA_VISIBLE_DEVICES", "").strip().lower()
+_cgroup_pinned = _nvd not in ("", "all", "none", "void")
+if (
+    os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "auto") != "0"
+    and _cgroup_pinned
+    and "CUDA_VISIBLE_DEVICES" not in os.environ
+):
+    # Honour an existing thread count; always plant the sentinel for the zoo patch.
+    if os.environ.get("TORCHINDUCTOR_COMPILE_THREADS") in (None, "", "1"):
+        os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+        os.environ["UNSLOTH_FORCE_SINGLE_COMPILE_WORKER"] = "1"
+del _nvd, _cgroup_pinned
+
 
 from importlib.metadata import version as importlib_version
 from importlib.metadata import PackageNotFoundError
@@ -155,6 +173,25 @@ except ModuleNotFoundError:
     )
 except:
     raise
+
+# Re-assert single-compile-worker after unsloth_zoo's patch_torch_compile (which
+# historically popped TORCHINDUCTOR_COMPILE_THREADS). Set the Inductor config
+# directly and patch the zoo's determine_compile_threads so every options dict
+# sees 1. No-op when the user opted out.
+if os.environ.get("UNSLOTH_FORCE_SINGLE_COMPILE_WORKER", "0") == "1":
+    try:
+        torch._inductor.config.compile_threads = 1
+    except Exception:
+        pass
+    os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    try:
+        setattr(
+            importlib.import_module("unsloth_zoo.temporary_patches.common"),
+            "determine_compile_threads",
+            lambda: 1,
+        )
+    except Exception:
+        pass
 
 from unsloth_zoo.device_type import (
     is_hip,
