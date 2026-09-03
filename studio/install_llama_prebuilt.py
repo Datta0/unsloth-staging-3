@@ -541,6 +541,17 @@ _os_error_messages = _core._os_error_messages
 is_busy_lock_error = _core.is_busy_lock_error
 
 
+def is_cross_device_error(exc: BaseException) -> bool:
+    """True for an EXDEV "cross-device link" rename failure.
+
+    os.replace / os.rename cannot move across filesystems -- e.g. inside a Docker
+    build where the staging tree and the install dir land on different overlayfs
+    layers (Errno 18). Unlike a busy/in-use error, a cross-device move is safely
+    completed by a copy + remove of the (idle) source.
+    """
+    return isinstance(exc, OSError) and exc.errno == errno.EXDEV
+
+
 # Status logs default to stderr so resolver modes keep stdout machine-readable
 # (setup.sh json.load()s the whole stdout). main() flips this for the install
 # path, where PowerShell otherwise renders stderr as NativeCommandError noise.
@@ -4465,20 +4476,81 @@ def activate_staged_dir(staging_dir: Path, dst: Path) -> None:
     ``os.replace`` failure means the directory is genuinely in use, and a
     silent copy + ``rmtree`` could partially delete a live install.
 
-    Only busy/lock errors (``is_busy_lock_error``) trigger the copy; anything
-    else (disk full, cross-device, missing path) re-raises so it cannot leave
-    a partially copied install behind. A copy is preferred over retrying the
-    rename because antivirus scans of large DLLs can outlast any reasonable
-    retry window.
+    Only busy/lock errors (``is_busy_lock_error``) and cross-device links
+    (``is_cross_device_error``, hit when a Docker build lands the staging tree
+    and the install dir on different overlay layers) trigger the copy; anything
+    else (disk full, missing path) re-raises so it cannot leave a partially
+    copied install behind. A copy is preferred over retrying the rename because
+    antivirus scans of large DLLs can outlast any reasonable retry window.
     """
     try:
         os.replace(staging_dir, dst)
     except OSError as exc:
-        if not is_busy_lock_error(exc):
+        # Busy/in-use (Windows AV) or cross-device (Docker overlayfs): both safe to
+        # complete by copy + remove. Anything else (disk full, missing path) re-raises.
+        if not (is_busy_lock_error(exc) or is_cross_device_error(exc)):
             raise
         log(f"os.replace failed ({exc!r}); falling back to file-by-file copy of staging tree")
         shutil.copytree(staging_dir, dst, dirs_exist_ok = True)
         remove_tree(staging_dir)
+
+
+def move_install_dir_aside(
+    src: Path,
+    dst: Path,
+    *,
+    busy_retry: bool = False,
+) -> None:
+    """Move an existing install dir to ``dst`` (a unique, non-existent sibling).
+
+    os.replace is the fast path. On a cross-device link (EXDEV -- e.g. moving the
+    base-image llama.cpp aside during a Docker studio build, where the rollback
+    path is on a different overlay) fall back to copy + remove. A busy/in-use
+    failure is deliberately NOT copy-faked here: the source is a live install and
+    a partial copy + rmtree would be worse than failing, so it re-raises.
+
+    ``busy_retry`` routes the rename through ``replace_with_busy_retry`` so a
+    transient Windows sharing violation is waited out rather than treated as a
+    move failure. It is opt-in per call site: the aside-move of the *live*
+    install is the one this installer most needs to survive, while the recovery
+    path's move of an already-failed tree gives up at once because it has a
+    cheaper answer (drop the tree) than blocking for seconds on a scanner.
+
+    The copy never writes into ``dst`` directly: callers treat ``dst.exists()``
+    as proof of a complete tree (activation recovery restores a rollback dir
+    whenever it exists), so a copy that dies halfway (ENOSPC, I/O error) must
+    not leave a partial tree at ``dst``. Copy to a temp sibling and publish it
+    with one atomic rename; on failure remove the temp copy and leave ``src``
+    untouched.
+    """
+    try:
+        if busy_retry:
+            replace_with_busy_retry(src, dst)
+        else:
+            os.replace(src, dst)
+    except OSError as exc:
+        if not is_cross_device_error(exc):
+            raise
+        if _is_link_or_junction(src):
+            # copytree honours symlinks inside what it copies but always follows
+            # the root, so copying a linked install would duplicate a checkout
+            # this installer does not own into the staging root. Same refusal the
+            # rollback-restore copy makes.
+            log("install path is a link; not copying it aside")
+            raise
+        copy_tmp = dst.with_name(dst.name + ".copying")
+        counter = 0
+        while copy_tmp.exists():
+            counter += 1
+            copy_tmp = dst.with_name(f"{dst.name}.copying-{counter}")
+        log(f"os.replace cross-device ({exc!r}); copy+publish {src} -> {dst}")
+        try:
+            shutil.copytree(src, copy_tmp)
+            os.replace(copy_tmp, dst)
+        except BaseException:
+            remove_tree(copy_tmp)
+            raise
+        remove_tree(src)
 
 
 def activate_install_tree(staging_dir: Path, install_dir: Path, host: HostInfo) -> None:
@@ -4491,7 +4563,7 @@ def activate_install_tree(staging_dir: Path, install_dir: Path, host: HostInfo) 
             had_existing = True
             rollback_dir = unique_install_side_path(install_dir, "rollback")
             log(f"moving existing install to rollback path {rollback_dir}")
-            replace_with_busy_retry(install_dir, rollback_dir)
+            move_install_dir_aside(install_dir, rollback_dir, busy_retry = True)
             moved_aside = True
             log(f"moved existing install to rollback path {rollback_dir.name}")
 
@@ -4526,7 +4598,11 @@ def activate_install_tree(staging_dir: Path, install_dir: Path, host: HostInfo) 
                 failed_dir = unique_install_side_path(install_dir, "failed")
                 log(f"moving failed active install to {failed_dir}")
                 try:
-                    os.replace(install_dir, failed_dir)
+                    # move_install_dir_aside, not a bare os.replace: in a Docker
+                    # build the failed tree and the staging root can sit on
+                    # different overlay layers, and EXDEV there must not cost the
+                    # retained copy of the tree that failed confirmation.
+                    move_install_dir_aside(install_dir, failed_dir)
                 except Exception as failed_move_exc:
                     failed_dir = None
                     log(f"failed active install could not be moved aside: {failed_move_exc}")
