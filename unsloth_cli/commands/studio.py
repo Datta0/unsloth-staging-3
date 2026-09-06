@@ -3650,6 +3650,26 @@ _PS_PROXY_DEFAULTS_PRELUDE = (
 )
 
 
+def _with_studio_uv_cache(env: Optional[dict]) -> Optional[dict]:
+    """Point the setup script's uv at the Studio cache, as the backend already is.
+
+    Three things pick a uv cache and only two of them agreed. install.sh and
+    install.ps1 choose one for the install itself, and storage_roots._setup_cache_env
+    seeds cache_root()/uv for the backend server, which is also where install.sh
+    repoints UV_CACHE_DIR before it autostarts Studio. An update reaches neither: it
+    runs setup.sh/setup.ps1 from this process, nothing here set the variable, and uv
+    fell back to its own user-wide default. So an update re-downloaded whatever a
+    Studio-cache install had just fetched, and left those bytes outside the Studio
+    root where the uninstaller cannot reclaim them.
+
+    Blank counts as unset, matching storage_roots.py; an explicit UV_CACHE_DIR from
+    the caller still wins, which is the same precedence the installers use.
+    """
+    if (os.environ.get("UV_CACHE_DIR") or "").strip():
+        return env
+    return {**(env or os.environ), "UV_CACHE_DIR": str(STUDIO_HOME / "cache" / "uv")}
+
+
 def _run_setup_script(*, verbose: bool = False, repo_root: Optional[Path] = None) -> None:
     """Find and run the studio setup/update script."""
     script = _find_setup_script(repo_root)
@@ -3664,6 +3684,7 @@ def _run_setup_script(*, verbose: bool = False, repo_root: Optional[Path] = None
         raise typer.Exit(1)
 
     env = {**os.environ, "UNSLOTH_VERBOSE": "1"} if verbose else None
+    env = _with_studio_uv_cache(env)
 
     if platform.system() == "Windows":
         # Resolved, not bare: the gate that runs immediately before this in setup() and update()
