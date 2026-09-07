@@ -601,6 +601,174 @@ def test_local_gguf_entry_filters_non_gguf_and_recurses(tmp_path):
     assert e2 is not None and e2.variants
 
 
+def test_local_gguf_entry_labels_a_quantless_filename_as_the_picker_does(tmp_path):
+    # No quant token in the name, so the picker and every saved setting key this variant by
+    # the stem. Labelling it "v2" here left an API load reading a key nothing wrote (#10227).
+    from types import SimpleNamespace
+
+    from utils.openai_auto_switch_settings import override_lookup_candidates
+
+    repo = tmp_path / "models--org--KAT-GGUF"
+    snapshot = repo / "snapshots" / "abc"
+    snapshot.mkdir(parents = True)
+    (snapshot / "KAT-Coder-V2.5-Dev-APEX-dynamic-v2.gguf").write_text("x")
+
+    entry = resolver._local_gguf_entry("org/KAT-GGUF", SimpleNamespace(path = str(repo)))
+    assert entry is not None
+    assert entry.variants == ("KAT-Coder-V2.5-Dev-APEX-dynamic-v2",)
+    assert "org/KAT-GGUF:KAT-Coder-V2.5-Dev-APEX-dynamic-v2" in override_lookup_candidates(
+        entry.load_path, entry.loader_id, entry.variants[0]
+    )
+
+
+def test_local_gguf_entry_skips_a_quant_whose_blob_is_gone(tmp_path):
+    # An evicted blob leaves a dangling link, and advertising it offers a quant no load can
+    # open. The twins repo is the other direction: one quant, two checkpoints, dead one first.
+    from types import SimpleNamespace
+
+    evicted = tmp_path / "models--org--evicted" / "snapshots" / "abc"
+    evicted.mkdir(parents = True)
+    (evicted / "m-Q8_0.gguf").write_text("x")
+    twins = tmp_path / "models--org--twins" / "snapshots" / "abc"
+    twins.mkdir(parents = True)
+    (twins / "z-BF16.gguf").write_text("x")
+    try:
+        (evicted / "m-Q4_K_M.gguf").symlink_to(tmp_path / "evicted-blob")
+        (twins / "a-BF16.gguf").symlink_to(tmp_path / "evicted-blob")
+    except (NotImplementedError, OSError):
+        pytest.skip("symlinks unavailable (Windows without developer mode)")
+
+    entry = resolver._local_gguf_entry(
+        "org/evicted", SimpleNamespace(path = str(evicted.parent.parent))
+    )
+    assert entry is not None and entry.variants == ("Q8_0",)
+    assert resolver._resolve_from_index("org/evicted", {"org/evicted": entry})[1] == "Q8_0"
+
+    twin_entry = resolver._local_gguf_entry(
+        "org/twins", SimpleNamespace(path = str(twins.parent.parent))
+    )
+    assert twin_entry is not None and twin_entry.variants == ("BF16",)
+
+
+def _one_gguf_repo(tmp_path, name, filenames):
+    """An HF-cache repo dir holding *filenames*, and the entry the index builds for it."""
+    from types import SimpleNamespace
+
+    snapshot = tmp_path / f"models--org--{name}" / "snapshots" / "abc"
+    snapshot.mkdir(parents = True)
+    for index, filename in enumerate(filenames):
+        (snapshot / filename).write_bytes(b"\0" * (4096 + index * 100))
+    return resolver._local_gguf_entry(
+        f"org/{name}", SimpleNamespace(path = str(snapshot.parent.parent))
+    )
+
+
+def test_a_quant_id_v1_models_used_to_publish_still_resolves(tmp_path):
+    # /v1/models published the loader's spelling (first token, BF16) where the shared lister
+    # takes the K-quant, and a quant-looking label is refused rather than read as a repo tag,
+    # so the swap alone would 404 a client pinned to "<repo>:BF16".
+    entry = _one_gguf_repo(tmp_path, "float-then-k", ["DeepSeek-R1-BF16-Q4_K_M.gguf"])
+    assert entry is not None
+    assert entry.variants == ("Q4_K_M",)
+    assert entry.aliases == (("bf16", "Q4_K_M"),)
+
+    index = {"org/float-then-k": entry}
+    for requested in ("org/float-then-k:BF16", "org/float-then-k:bf16"):
+        resolved = resolver._resolve_from_index(requested, index)
+        assert resolved is not None, requested
+        # the CURRENT label, so the override lookup reads the key the UI wrote
+        assert resolved[1] == "Q4_K_M"
+    # a quant genuinely not on disk still misses
+    assert resolver._resolve_from_index("org/float-then-k:Q8_0", index) is None
+
+
+def test_a_legacy_quant_id_never_shadows_a_quant_that_is_really_there(tmp_path):
+    # b-BF16.gguf IS the BF16 file; a-BF16-Q4_K_M.gguf merely used to be called that, so the
+    # real one keeps the name and no alias is offered.
+    entry = _one_gguf_repo(tmp_path, "collide", ["a-BF16-Q4_K_M.gguf", "b-BF16.gguf"])
+    assert entry is not None
+    assert set(entry.variants) == {"Q4_K_M", "BF16"}
+    assert entry.aliases == ()
+
+    index = {"org/collide": entry}
+    assert resolver._resolve_from_index("org/collide:BF16", index)[1] == "BF16"
+    assert resolver._resolve_from_index("org/collide:Q4_K_M", index)[1] == "Q4_K_M"
+
+
+def test_an_ambiguous_legacy_quant_id_resolves_to_nothing(tmp_path):
+    # two files, one old label: it names neither, as the override key folding already does.
+    entry = _one_gguf_repo(tmp_path, "ambiguous", ["x-BF16-Q4_K_M.gguf", "y-BF16-Q6_K.gguf"])
+    assert entry is not None
+    assert set(entry.variants) == {"Q4_K_M", "Q6_K"}
+    assert entry.aliases == ()
+    assert resolver._resolve_from_index("org/ambiguous:BF16", {"org/ambiguous": entry}) is None
+
+
+def test_a_quantless_pin_keeps_its_own_weights_instead_of_quietly_getting_the_quant(tmp_path):
+    # This repo published "8B" for the unquantized file and ":8b" loaded it. "8B" does not look
+    # like a quant, so the swap does not 404 that pin: it falls through to the Ollama-tag branch
+    # and quietly serves the Q4_K_M instead. The quiet failure is why quantless labels alias too.
+    entry = _one_gguf_repo(
+        tmp_path, "quantless-pin", ["Meta-Llama-3-8B.gguf", "Meta-Llama-3-8B-Q4_K_M.gguf"]
+    )
+    assert entry is not None
+    assert entry.aliases == (("8b", "Meta-Llama-3-8B"),)
+    resolved = resolver._resolve_from_index("org/quantless-pin:8b", {"org/quantless-pin": entry})
+    assert resolved is not None and resolved[1] == "Meta-Llama-3-8B"
+    # the bare id never reaches an alias, so preferred_quant still decides it
+    bare = resolver._resolve_from_index("org/quantless-pin", {"org/quantless-pin": entry})
+    assert bare[1] == entry.variants[0] == "Q4_K_M"
+
+
+def test_a_bundle_repos_mirror_is_not_emptied_by_the_h3_filter(tmp_path):
+    # A cache dir name only ever extends a repo id by more of that id, so these contain the
+    # bundle marker while being ordinary chat repos. Matched as a substring, the denoiser filter
+    # left them with no quants, which withholds the entry and 404s a downloaded model.
+    from types import SimpleNamespace
+    for name in ("MiniMax-H3-GGUF-mirror", "minimax-h3-gguf-i1", "MiniMax-H3-GGUF-BF16"):
+        snapshot = tmp_path / f"models--unsloth--{name}" / "snapshots" / "abc"
+        snapshot.mkdir(parents = True)
+        (snapshot / "m-Q4_K_M.gguf").write_bytes(b"\0" * 4096)
+        (snapshot / "m-Q8_0.gguf").write_bytes(b"\0" * 8192)
+        entry = resolver._local_gguf_entry(
+            f"unsloth/{name}", SimpleNamespace(path = str(snapshot.parent.parent))
+        )
+        assert entry is not None, f"{name} disappeared from the index"
+        assert set(entry.variants) == {"Q4_K_M", "Q8_0"}, name
+
+
+def test_a_broken_alias_helper_costs_the_aliases_and_not_the_model(tmp_path, monkeypatch):
+    # _local_gguf_entry answers None on any raise, so an escaping shim would drop the repo.
+    monkeypatch.setattr(
+        resolver,
+        "_legacy_variant_aliases",
+        lambda variants: (_ for _ in ()).throw(RuntimeError("renamed private helper")),
+    )
+    entry = _one_gguf_repo(tmp_path, "shim-broke", ["DeepSeek-R1-BF16-Q4_K_M.gguf"])
+    assert entry is None, "a raising helper must not be what deletes the entry"
+
+    # And it swallows its own failure: it reaches into two private names in another module.
+    monkeypatch.undo()
+    from utils.models import model_config
+
+    def renamed_away(*_args, **_kwargs):
+        raise AttributeError("_qualified_variant_name")
+
+    monkeypatch.setattr(model_config, "_qualified_variant_name", renamed_away)
+    entry = _one_gguf_repo(tmp_path, "shim-renamed", ["DeepSeek-R1-BF16-Q4_K_M.gguf"])
+    assert entry is not None and entry.variants == ("Q4_K_M",)
+    assert entry.aliases == ()
+
+
+def test_a_repo_the_two_listers_agree_on_carries_no_aliases(tmp_path):
+    # The overwhelmingly common case: every alias is a cost, so a repo that needs none
+    # carries none, and an id naming no local quant keeps missing.
+    entry = _one_gguf_repo(tmp_path, "ordinary", ["m-Q4_K_M.gguf", "m-Q8_0.gguf"])
+    assert entry is not None
+    assert entry.aliases == ()
+    assert resolver._resolve_from_index("org/ordinary:BF16", {"org/ordinary": entry}) is None
+
+
 def test_local_gguf_entry_rejects_standalone_companions(tmp_path, monkeypatch):
     # Codex P2: _scan_models_dir's standalone-.gguf pass emits an entry for a
     # bare mmproj projector (it only filters mmproj inside directory scans). A
