@@ -2374,16 +2374,99 @@ def test_retirement_leaves_a_folder_linked_after_the_ownership_check(rag_home):
     source = rag_home / "before-check"
     source.mkdir()
     existing = folder_sync.create_folder(scope_type = "project", scope_id = "p1", path = str(source))
-    checked_at = folder_sync.now_iso()
+    owned = folder_sync.linked_folder_ids(scope)
     # a second backend process links this one after the check and before the write
     later = rag_home / "after-check"
     later.mkdir()
     fresh = folder_sync.create_folder(scope_type = "project", scope_id = "p1", path = str(later))
 
-    folder_sync.retire_scope(scope, checked_at)
+    folder_sync.retire_scope(scope, owned)
 
     assert folder_sync.get_folder(existing["id"])["status"] == "retired"
     survivor = folder_sync.get_folder(fresh["id"])
     assert survivor["status"] == fresh["status"]
     assert survivor["auto_sync"] == fresh["auto_sync"]
     assert survivor["last_error"] is None
+
+
+@requires_sqlite_vec
+def test_the_ownership_bound_survives_a_clock_that_cannot_separate_the_two(rag_home, monkeypatch):
+    """Windows reads its clock in ~15.6ms steps, so both links can share one timestamp.
+
+    Freezing `_now` is that quantisation at its limit: any clock-derived bound has to guess,
+    and guessing wrong retires the folders of a project recreated with the same id, for good.
+    """
+    scope = store.project_scope("p1")
+    monkeypatch.setattr(folder_sync, "_now", lambda: "2026-01-01T00:00:00+00:00")
+    for name in ("before-check", "after-check"):
+        (rag_home / name).mkdir()
+    existing = folder_sync.create_folder(
+        scope_type = "project", scope_id = "p1", path = str(rag_home / "before-check")
+    )
+    owned = folder_sync.linked_folder_ids(scope)
+    fresh = folder_sync.create_folder(
+        scope_type = "project", scope_id = "p1", path = str(rag_home / "after-check")
+    )
+    assert existing["created_at"] == fresh["created_at"]
+
+    folder_sync.retire_scope(scope, owned)
+
+    assert folder_sync.get_folder(existing["id"])["status"] == "retired"
+    assert folder_sync.get_folder(fresh["id"])["status"] == fresh["status"]
+
+
+@requires_sqlite_vec
+def test_an_empty_ownership_snapshot_retires_nothing_but_still_tombstones(rag_home):
+    """`None` means no bound; `[]` means the check saw no folders, and is not the same thing."""
+    scope = store.project_scope("p1")
+    (rag_home / "linked-late").mkdir()
+    fresh = folder_sync.create_folder(
+        scope_type = "project", scope_id = "p1", path = str(rag_home / "linked-late")
+    )
+
+    folder_sync.retire_scope(scope, [])
+
+    assert folder_sync.scope_retired(scope) is True
+    assert folder_sync.get_folder(fresh["id"])["status"] == fresh["status"]
+
+
+@requires_sqlite_vec
+def test_the_ownership_bound_is_applied_past_the_sqlite_parameter_cap(rag_home, monkeypatch):
+    """A scope with more folders than SQLite takes host parameters still retires all of them."""
+    scope = store.project_scope("p1")
+    monkeypatch.setattr(folder_sync, "_ID_CHUNK", 3)
+    folders = []
+    for index in range(7):
+        source = rag_home / f"folder-{index}"
+        source.mkdir()
+        folders.append(
+            folder_sync.create_folder(scope_type = "project", scope_id = "p1", path = str(source))
+        )
+    owned = folder_sync.linked_folder_ids(scope)
+    assert len(owned) == len(folders)
+
+    folder_sync.retire_scope(scope, owned)
+
+    assert [folder_sync.get_folder(f["id"])["status"] for f in folders] == ["retired"] * 7
+
+
+@requires_sqlite_vec
+def test_the_ownership_snapshot_survives_an_unloadable_vector_extension(rag_home, monkeypatch):
+    """Retirement already runs without sqlite-vec loaded, so the snapshot must too."""
+    scope = store.project_scope("p1")
+    source = rag_home / "linked"
+    source.mkdir()
+    folder = folder_sync.create_folder(scope_type = "project", scope_id = "p1", path = str(source))
+
+    def unavailable():
+        raise sqlite3.OperationalError("cannot load sqlite-vec")
+
+    # scoped, not monkeypatch.undo(): rag_home patches through the same fixture, so undoing
+    # here would restore the database path before the assertions read it
+    with monkeypatch.context() as no_vec:
+        no_vec.setattr(folder_sync.rag_db, "get_connection", unavailable)
+        owned = folder_sync.linked_folder_ids(scope)
+        folder_sync.retire_scope(scope, owned)
+
+    assert owned == [folder["id"]]
+    assert folder_sync.get_folder(folder["id"])["status"] == "retired"
