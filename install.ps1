@@ -346,9 +346,9 @@ function Install-UnslothStudio {
     # Windows picks the temp directory from TMP, then TEMP, then the profile, and
     # never checks it exists or is writable. The desktop app passes on whatever it
     # inherited (studio/src-tauri/src/install.rs sets neither); one report had it at
-    # C:\Windows\TEMP, where the source Add-Type had just written was gone by the
-    # time csc.exe opened it (issue #9140). The Python, uv and VC++ downloads stage
-    # through it too. Probe it once and, if it cannot hold a file, point BOTH
+    # C:\Windows\TEMP, unwritable, which used to break the install outright because
+    # the native helper was compiled through it (issue #9140). Nothing compiles now,
+    # but the Python, uv and VC++ downloads still stage through it. Probe it once and, if it cannot hold a file, point BOTH
     # variables at a directory we own: every child process and every
     # [System.IO.Path]::GetTempPath() call reads the process environment block.
     function Test-StudioDirectoryUsable {
@@ -830,14 +830,101 @@ function Install-UnslothStudio {
     try { $defaultProfile = [Environment]::GetFolderPath("UserProfile") } catch {}
     $tauriProfile = if ($defaultProfile) { $defaultProfile } else { $env:USERPROFILE }
 
-    # GetFinalPathNameByHandleW is the only exact answer: it follows junctions,
-    # symlinks and SUBST drives, expands 8.3 aliases and reports the on-disk
-    # spelling, none of which GetFullPath does. It costs a C# compile, and 5.1 (the
-    # interpreter the desktop app spawns) compiles by writing the source to %TEMP%
-    # and running csc.exe. When that directory is unusable, or a scanner eats the
-    # source, Add-Type throws CS2001, which used to abort a first launch as "Could
-    # not create the Unsloth install lock" (issue #9140). Try once, retry with a
-    # %TEMP% we own, cache the answer (callers resolve dozens of paths), then let
+    # Every native declaration in this script goes through here, and none of them
+    # goes through Add-Type.
+    #
+    # Add-Type on Windows PowerShell 5.1 (the interpreter the desktop app spawns)
+    # has no in-process compiler: it writes C# to %TEMP% and runs csc.exe to get a
+    # DLL back. That is true of -TypeDefinition and of -MemberDefinition alike.
+    # Bitdefender blocks the DLL that produces, and the verdict lands on the
+    # generated file rather than on anything shipped: a windowless PowerShell,
+    # spawned by a GUI binary, launching a compiler and writing executable content
+    # to %TEMP% is a dropper's shape, whatever the code says. It also used to fail
+    # outright with CS2001 when %TEMP% was unusable (issue #9140).
+    #
+    # Reflection emit builds the same interop stubs in memory. No compiler
+    # process, no source on disk, no DLL, nothing in %TEMP%, and the resulting
+    # assembly reports an empty Location. Available on .NET Framework 4 and on
+    # .NET 5+, so 5.1 and 7 take the same path.
+    #
+    # Throws on failure rather than reporting it: each caller wants a different
+    # answer to "the native side is unavailable", and the two that are cosmetic
+    # must not print the resolver's warning.
+    #
+    # Test-StudioCanDefineNativeTypes is the gate every caller checks first, and it
+    # is a gate rather than a try/catch because one of the two conditions is not
+    # catchable. App Control's Dynamic Code Security (policy option 19) always
+    # blocks loading unsigned assemblies built with System.Reflection.Emit, and
+    # Microsoft documents the parent process as usually stopped or crashing rather
+    # than raising, so nothing below could recover from it:
+    # learn.microsoft.com/en-us/windows/security/application-security/application-control/app-control-for-business/design/appcontrol-and-dotnet
+    # A machine enforcing user-mode code integrity puts PowerShell in Constrained
+    # Language, which is the first check and the one that fires in practice; the
+    # Device Guard probe is the belt to that pair of braces, for a policy that
+    # somehow left the language mode alone.
+    $script:StudioCanDefineNativeTypes = $null
+    function Test-StudioCanDefineNativeTypes {
+        if ($null -ne $script:StudioCanDefineNativeTypes) { return $script:StudioCanDefineNativeTypes }
+        $languageMode = "FullLanguage"
+        try { $languageMode = [string]$ExecutionContext.SessionState.LanguageMode } catch {}
+        if ($languageMode -ne "FullLanguage") {
+            $script:StudioCanDefineNativeTypes = $false
+            return $false
+        }
+        # Absent on a host with no Device Guard at all, which is the common case and
+        # is not a reason to refuse: unreadable means unrestricted here.
+        $enforced = $false
+        try {
+            $guard = Get-CimInstance -Namespace "root\Microsoft\Windows\DeviceGuard" `
+                -ClassName "Win32_DeviceGuard" -ErrorAction Stop
+            # 0 off, 1 audit, 2 enforced.
+            if ($guard -and [int]$guard.UsermodeCodeIntegrityPolicyEnforcementStatus -eq 2) {
+                $enforced = $true
+            }
+        } catch {}
+        $script:StudioCanDefineNativeTypes = -not $enforced
+        return $script:StudioCanDefineNativeTypes
+    }
+
+    function New-StudioEmittedNativeType {
+        param(
+            [Parameter(Mandatory = $true)][string]$TypeName,
+            # @{ Name = "CloseHandle"; Library = "kernel32.dll"; Return = [bool]
+            #    Args = @([IntPtr]) }
+            [Parameter(Mandatory = $true)][object[]]$Imports
+        )
+        $assemblyName = New-Object System.Reflection.AssemblyName $TypeName
+        $assembly = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly(
+            $assemblyName, [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $module = $assembly.DefineDynamicModule($TypeName)
+        $builder = $module.DefineType(
+            $TypeName, "Public, Class, AutoClass, AnsiClass, BeforeFieldInit")
+
+        $winapi = [System.Runtime.InteropServices.CallingConvention]::Winapi
+        # Matches the CharSet the C# these replace declared. It selects name
+        # mangling as well as marshalling: the runtime probes <Name>W first and
+        # falls back to <Name>, which is how an unsuffixed export like CloseHandle
+        # or SHChangeNotify resolved before and still does.
+        $unicode = [System.Runtime.InteropServices.CharSet]::Unicode
+        $standard = [System.Reflection.CallingConventions]::Standard
+        $attributes = "Public, Static, HideBySig, PinvokeImpl"
+        $preserveSig = [System.Reflection.MethodImplAttributes]::PreserveSig
+
+        foreach ($import in $Imports) {
+            $method = $builder.DefinePInvokeMethod(
+                $import.Name, $import.Library, $import.Name, $attributes,
+                $standard, $import.Return, $import.Args, $winapi, $unicode)
+            $method.SetImplementationFlags(
+                $method.GetMethodImplementationFlags() -bor $preserveSig)
+        }
+        $null = $builder.CreateType()
+        return $null -ne ($TypeName -as [type])
+    }
+
+    # GetFinalPathNameByHandleW is the only exact answer for a path: it follows
+    # junctions, symlinks and SUBST drives, expands 8.3 aliases and reports the
+    # on-disk spelling, none of which GetFullPath does. Cache the answer, since
+    # callers resolve dozens of paths, and where it is unavailable let
     # Get-StudioLexicalPath carry the run.
     $script:StudioFinalPathNativeState = $null
     # Reset with the rest: under `irm | iex` these are the caller's own.
@@ -852,165 +939,104 @@ function Install-UnslothStudio {
     }
 
     function Initialize-StudioFinalPathNativeType {
-        if ("UnslothStudioFinalPathV2" -as [type]) {
+        if ("UnslothStudioFinalPathV3" -as [type]) {
             $script:StudioFinalPathNativeState = $true
             return $true
         }
         if ($null -ne $script:StudioFinalPathNativeState) { return $script:StudioFinalPathNativeState }
-        # Constrained Language Mode forbids Add-Type, so compiling would only produce
-        # a second, less honest error.
-        $languageMode = "FullLanguage"
-        try { $languageMode = [string]$ExecutionContext.SessionState.LanguageMode } catch {}
-        if ($languageMode -ne "FullLanguage") {
+        # Constrained Language Mode forbids defining types at all, by emit as by
+        # Add-Type, so compiling would only produce a second, less honest error.
+        if (-not (Test-StudioCanDefineNativeTypes)) {
             $script:StudioFinalPathNativeState = $false
-            Write-StudioFinalPathDegraded -Reason "PowerShell is in $languageMode"
+            $languageMode = "FullLanguage"
+            try { $languageMode = [string]$ExecutionContext.SessionState.LanguageMode } catch {}
+            $reason = if ($languageMode -ne "FullLanguage") { "PowerShell is in $languageMode" }
+                      else { "this host enforces user-mode code integrity" }
+            Write-StudioFinalPathDegraded -Reason $reason
             return $false
         }
-        Initialize-StudioTempEnvironment
-        $source = @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-using Microsoft.Win32.SafeHandles;
-
-public static class UnslothStudioFinalPathV2
-{
-    private const uint FileShareRead = 0x00000001;
-    private const uint FileShareWrite = 0x00000002;
-    private const uint FileShareDelete = 0x00000004;
-    private const uint OpenExisting = 3;
-    private const uint FileFlagBackupSemantics = 0x02000000;
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern SafeFileHandle CreateFileW(
-        string fileName,
-        uint desiredAccess,
-        uint shareMode,
-        IntPtr securityAttributes,
-        uint creationDisposition,
-        uint flagsAndAttributes,
-        IntPtr templateFile);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern uint GetFinalPathNameByHandleW(
-        SafeFileHandle file,
-        StringBuilder path,
-        uint pathLength,
-        uint flags);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr OpenProcess(
-        uint desiredAccess,
-        bool inheritHandle,
-        int processId);
-
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool QueryFullProcessImageNameW(
-        IntPtr process,
-        uint flags,
-        StringBuilder path,
-        ref uint pathLength);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    public static string Resolve(string path)
-    {
-        using (SafeFileHandle handle = CreateFileW(
-            path,
-            0,
-            FileShareRead | FileShareWrite | FileShareDelete,
-            IntPtr.Zero,
-            OpenExisting,
-            FileFlagBackupSemantics,
-            IntPtr.Zero))
-        {
-            if (handle.IsInvalid)
-                throw new Win32Exception(Marshal.GetLastWin32Error());
-
-            StringBuilder buffer = new StringBuilder(512);
-            uint length = GetFinalPathNameByHandleW(
-                handle, buffer, (uint)buffer.Capacity, 0);
-            if (length == 0)
-                throw new Win32Exception(Marshal.GetLastWin32Error());
-            if (length >= buffer.Capacity)
-            {
-                buffer = new StringBuilder((int)length + 1);
-                length = GetFinalPathNameByHandleW(
-                    handle, buffer, (uint)buffer.Capacity, 0);
-                if (length == 0)
-                    throw new Win32Exception(Marshal.GetLastWin32Error());
-            }
-            if (length >= buffer.Capacity)
-                throw new InvalidOperationException("Final path exceeded the allocated buffer");
-            return buffer.ToString();
-        }
-  }
-
-    public static string GetProcessImagePath(int processId)
-    {
-        const uint ProcessQueryLimitedInformation = 0x1000;
-        IntPtr process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
-        if (process == IntPtr.Zero)
-        {
-            return null;
-        }
-        try
-        {
-            StringBuilder path = new StringBuilder(32768);
-            uint pathLength = (uint)path.Capacity;
-            return QueryFullProcessImageNameW(process, 0, path, ref pathLength)
-                ? path.ToString()
-                : null;
-        }
-        finally
-        {
-            CloseHandle(process);
-        }
-  }
-}
-'@
-        $firstError = $null
+        # Everything below the capability check is unchanged, so a host where the
+        # emit fails degrades exactly as a host that could not compile already
+        # did, which is a path the installer has always taken and still completes
+        # on.
+        #
+        # DefinePInvokeMethod cannot ask for SetLastError, so nothing below reads
+        # GetLastWin32Error. The C# it replaces threw a Win32Exception the callers
+        # only ever turned back into "use the lexical answer", so returning null
+        # loses a code nothing acted on.
         try {
-            Add-Type -TypeDefinition $source -ErrorAction Stop
+            $null = New-StudioEmittedNativeType -TypeName "UnslothStudioFinalPathV3" -Imports @(
+                @{ Name = "CreateFileW"; Library = "kernel32.dll"; Return = [IntPtr]
+                   Args = @([string], [uint32], [uint32], [IntPtr], [uint32], [uint32], [IntPtr]) },
+                @{ Name = "GetFinalPathNameByHandleW"; Library = "kernel32.dll"; Return = [uint32]
+                   Args = @([IntPtr], [System.Text.StringBuilder], [uint32], [uint32]) },
+                @{ Name = "CloseHandle"; Library = "kernel32.dll"; Return = [bool]
+                   Args = @([IntPtr]) }
+            )
         } catch {
-            $firstError = $_.Exception.Message
+            $script:StudioFinalPathNativeState = $false
+            Write-StudioFinalPathDegraded -Reason (($_.Exception.Message -split "`r?`n")[0].Trim())
+            return $false
         }
-        # A compile that reports failure can still have loaded the type, and the same
-        # name cannot be defined twice in one session.
-        if ("UnslothStudioFinalPathV2" -as [type]) {
-            $script:StudioFinalPathNativeState = $true
-            return $true
-        }
-        $private = New-StudioPrivateTempDirectory
-        if ($private) {
-            $hadTmp = ($null -ne $env:TMP)
-            $previousTmp = $env:TMP
-            $hadTemp = ($null -ne $env:TEMP)
-            $previousTemp = $env:TEMP
-            try {
-                # Both, because GetTempPath reads TMP first.
-                $env:TMP = $private
-                $env:TEMP = $private
-                try { Add-Type -TypeDefinition $source -ErrorAction Stop } catch {}
-            } finally {
-                if ($hadTmp) { $env:TMP = $previousTmp } else { Remove-Item Env:\TMP -ErrorAction SilentlyContinue }
-                if ($hadTemp) { $env:TEMP = $previousTemp } else { Remove-Item Env:\TEMP -ErrorAction SilentlyContinue }
-                # Only now: deleting while csc.exe still holds it is the race being
-                # worked around.
-                Remove-Item -LiteralPath $private -Recurse -Force -ErrorAction SilentlyContinue
-            }
-        }
-        if ("UnslothStudioFinalPathV2" -as [type]) {
+        if ("UnslothStudioFinalPathV3" -as [type]) {
             $script:StudioFinalPathNativeState = $true
             return $true
         }
         $script:StudioFinalPathNativeState = $false
-        # First line of the compiler output, not the whole C# dump it echoes after.
-        $reason = if ($firstError) { ($firstError -split "`r?`n")[0].Trim() } else { "compilation failed" }
-        Write-StudioFinalPathDegraded -Reason $reason
+        Write-StudioFinalPathDegraded -Reason "the native path resolver could not be defined"
         return $false
+    }
+
+    # GetFinalPathNameByHandleW is the only exact answer: it follows junctions,
+    # symlinks and SUBST drives, expands 8.3 aliases and reports the on-disk
+    # spelling, none of which GetFullPath does.
+    #
+    # This is what the compiled Resolve() did, moved out of C# so the imports
+    # above are all the native code there is. Same flags, same two-pass buffer
+    # growth. Null rather than an exception when the handle or the call fails:
+    # every caller already treats "no exact answer" as "use the lexical one".
+    function Get-StudioNativeFinalPath {
+        param([Parameter(Mandatory = $true)][string]$Path)
+
+        $invalidHandle = [IntPtr](-1)
+        $fileShareAll = [uint32]7          # READ | WRITE | DELETE
+        $openExisting = [uint32]3
+        $backupSemantics = [uint32]0x02000000   # required to open a DIRECTORY
+
+        # Every native call is guarded, not just the ones that can fail usefully.
+        # An emitted stub binds its import on first CALL, not when the type is
+        # defined, so a host missing the export raises here rather than above, and
+        # the caller must see the same "no exact answer" it sees from a handle it
+        # could not open. The callers already treat null that way; throwing past
+        # them would be a new failure mode this change has no business inventing.
+        $handle = $invalidHandle
+        try {
+            $handle = [UnslothStudioFinalPathV3]::CreateFileW(
+                $Path, [uint32]0, $fileShareAll, [IntPtr]::Zero,
+                $openExisting, $backupSemantics, [IntPtr]::Zero)
+        } catch {
+            return $null
+        }
+        if ($handle -eq $invalidHandle -or $handle -eq [IntPtr]::Zero) { return $null }
+        try {
+            $buffer = New-Object System.Text.StringBuilder 512
+            $length = [UnslothStudioFinalPathV3]::GetFinalPathNameByHandleW(
+                $handle, $buffer, [uint32]$buffer.Capacity, [uint32]0)
+            if ($length -eq 0) { return $null }
+            if ($length -ge $buffer.Capacity) {
+                $buffer = New-Object System.Text.StringBuilder ([int]$length + 1)
+                $length = [UnslothStudioFinalPathV3]::GetFinalPathNameByHandleW(
+                    $handle, $buffer, [uint32]$buffer.Capacity, [uint32]0)
+                if ($length -eq 0) { return $null }
+            }
+            # Still short is the only answer worth trusting.
+            if ($length -ge $buffer.Capacity) { return $null }
+            return $buffer.ToString()
+        } catch {
+            return $null
+        } finally {
+            try { [void][UnslothStudioFinalPathV3]::CloseHandle($handle) } catch {}
+        }
     }
 
     function Resolve-StudioLinkTarget {
@@ -1189,15 +1215,16 @@ public static class UnslothStudioFinalPathV2
         $resolved = $null
         if (Initialize-StudioFinalPathNativeType) {
             try {
-                $resolved = [UnslothStudioFinalPathV2]::Resolve($existingPath)
+                $resolved = Get-StudioNativeFinalPath -Path $existingPath
+                if ([string]::IsNullOrWhiteSpace($resolved)) { throw "no exact answer" }
                 $exact = $true
             } catch {
-                # The helper COMPILED and still could not answer: a path renamed
+                # The helper was DEFINED and still could not answer: a path renamed
                 # between the Test-Path walk and CreateFileW, an access denial on a
                 # component, a volume with no drive letter. Falling back keeps the
                 # install alive, and Exact = $false already makes the runtime lock
                 # fail closed, but nothing said so out loud: the degraded warning
-                # below only fires when the compile itself failed. An operator was
+                # below only fires when the type itself could not be built. An operator was
                 # left with a silently inexact identity on a host that looks fine.
                 $resolved = $null
                 if (-not $script:StudioNativeResolveWarned) {
@@ -1264,9 +1291,12 @@ public static class UnslothStudioFinalPathV2
             Write-StudioLine "       The desktop app uses the Windows profile .unsloth\studio root." -ForegroundColor Red
             Write-StudioLine "       Run install.ps1 without --tauri for custom-root shell installs," -ForegroundColor Yellow
             Write-StudioLine "       or unset the env var for default desktop installs." -ForegroundColor Yellow
-            # Resolving the roots above can redirect TMP/TEMP, and this throw is well
-            # before the lock try/finally. Under `irm | iex` those variables are the
-            # caller's own and would stay pointed at an installer-owned directory.
+            # Belt and braces: TMP/TEMP are only redirected from
+            # Initialize-StudioTempEnvironment, which now runs after this throw, so
+            # there is nothing to restore here today. The call returns immediately
+            # when nothing was overridden, and under `irm | iex` those variables are
+            # the caller's own, so the day anything above starts redirecting them
+            # again this stays correct instead of silently leaking.
             Restore-StudioTempEnvironment
             throw "$envOverrideVar is not supported with --tauri."
         }
@@ -1528,23 +1558,33 @@ public static class UnslothStudioFinalPathV2
     function Enable-StudioVirtualTerminal {
         if ($env:NO_COLOR) { return $false }
         # A redirected stdout is not a console and GetConsoleMode fails on a non-console handle,
-        # so the block below could only return $false anyway. Answer without Add-Type, which runs
-        # csc.exe and drops source in %TEMP%. install.rs spawns us with a pipe, so this is the path
-        # the compile was on.
+        # so the block below could only return $false anyway. install.rs spawns us with a pipe,
+        # so that is the path the desktop app is on.
         if ($script:StudioStdoutRedirected) { return $false }
+        # Emitted rather than compiled, for the reason New-StudioEmittedNativeType
+        # gives. -MemberDefinition runs csc.exe just as -TypeDefinition does, and
+        # the guard above only keeps the desktop app off it; the console path,
+        # including `irm | iex`, reached the compiler here every run. Colour is
+        # cosmetic, so failure is still just a plain banner.
+        # The same gate the resolver uses: colour is not worth a risk that cannot be
+        # caught, and a plain banner is the answer either way.
+        if (-not (Test-StudioCanDefineNativeTypes)) { return $false }
         try {
-            if (-not ("StudioVT.Native" -as [type])) {
-                Add-Type -Namespace StudioVT -Name Native -MemberDefinition @'
-[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
-[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m);
-[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m);
-'@ -ErrorAction Stop
+            if (-not ("StudioVTNative" -as [type])) {
+                $null = New-StudioEmittedNativeType -TypeName "StudioVTNative" -Imports @(
+                    @{ Name = "GetStdHandle"; Library = "kernel32.dll"; Return = [IntPtr]
+                       Args = @([int]) },
+                    @{ Name = "GetConsoleMode"; Library = "kernel32.dll"; Return = [bool]
+                       Args = @([IntPtr], [uint32].MakeByRefType()) },
+                    @{ Name = "SetConsoleMode"; Library = "kernel32.dll"; Return = [bool]
+                       Args = @([IntPtr], [uint32]) }
+                )
             }
-            $h = [StudioVT.Native]::GetStdHandle(-11)
+            $h = [StudioVTNative]::GetStdHandle(-11)
             [uint32]$mode = 0
-            if (-not [StudioVT.Native]::GetConsoleMode($h, [ref]$mode)) { return $false }
+            if (-not [StudioVTNative]::GetConsoleMode($h, [ref]$mode)) { return $false }
             $mode = $mode -bor 0x0004
-            return [StudioVT.Native]::SetConsoleMode($h, $mode)
+            return [StudioVTNative]::SetConsoleMode($h, $mode)
         } catch {
             return $false
         }
@@ -1578,8 +1618,11 @@ public static class UnslothStudioFinalPathV2
     }
     Write-StudioLine ""
 
-    # Here so its warning lands under the banner. A no-op the second time: a --tauri
-    # run with a custom root reaches it first via Initialize-StudioFinalPathNativeType.
+    # Here so its warning lands under the banner. The only caller now: the native
+    # path resolver used to reach it first, because compiling wrote to %TEMP%, and
+    # it no longer writes anything anywhere. Nothing between the banner and here
+    # touches the temporary directory, so the fix-up still lands before the first
+    # user of it.
     Initialize-StudioTempEnvironment
 
     # ── Helper: refresh PATH from registry (deduplicating entries) ──
@@ -2873,13 +2916,24 @@ exit 0
                     substep "Created Unsloth Studio shortcut"
                     # Per-item SHChangeNotify: the global broadcast misses a rewritten same-name .lnk.
                     try {
-                        Add-Type -Namespace UnslothShell -Name IconRefresh -MemberDefinition '[System.Runtime.InteropServices.DllImport("shell32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)] public static extern void SHChangeNotify(int eventId, uint flags, string item1, System.IntPtr item2);' -ErrorAction SilentlyContinue
+                        # Emitted, not compiled: -MemberDefinition runs csc.exe too.
+                        # Tauri returns before it gets here, so this one was only
+                        # ever on the console path, but that path deserves the same
+                        # treatment. A failure here leaves stale icons, nothing more,
+                        # and the enclosing catch already absorbed that.
+                        if (-not (Test-StudioCanDefineNativeTypes)) { throw "native types are unavailable on this host" }
+                        if (-not ("UnslothShellIconRefresh" -as [type])) {
+                            $null = New-StudioEmittedNativeType -TypeName "UnslothShellIconRefresh" -Imports @(
+                                @{ Name = "SHChangeNotify"; Library = "shell32.dll"; Return = [System.Void]
+                                   Args = @([int], [uint32], [string], [IntPtr]) }
+                            )
+                        }
                         # SHCNE_UPDATEITEM (0x00002000) + SHCNF_PATHW (0x0005) per shortcut
                         foreach ($scPath in $createdShortcutPaths) {
-                            try { [UnslothShell.IconRefresh]::SHChangeNotify(0x00002000, 0x0005, $scPath, [System.IntPtr]::Zero) } catch {}
+                            try { [UnslothShellIconRefresh]::SHChangeNotify(0x00002000, 0x0005, $scPath, [System.IntPtr]::Zero) } catch {}
                         }
                         # SHCNE_ASSOCCHANGED (0x08000000) global refresh (belt-and-suspenders)
-                        [UnslothShell.IconRefresh]::SHChangeNotify(0x08000000, 0, $null, [System.IntPtr]::Zero)
+                        [UnslothShellIconRefresh]::SHChangeNotify(0x08000000, 0, $null, [System.IntPtr]::Zero)
                     } catch {}
                     if ($firstInstall -or $iconChanged) {
                         try { & "$env:SystemRoot\System32\ie4uinit.exe" -ClearIconCache 2>$null } catch {}
@@ -3262,19 +3316,80 @@ exit 0
     }
 
     # QueryFullProcessImageNameW answers for processes whose MainModule is not
-    # readable here, but needs the compiled helper. Without a fallback a host that
-    # cannot compile would find NO running processes and overwrite a venv Unsloth has
-    # open, so the ladder ends at Win32_Process. Every rung reports a real executable
-    # image; a command line or working directory mentioning the path is never proof.
+    # readable here: PROCESS_QUERY_LIMITED_INFORMATION is granted where the
+    # PROCESS_VM_READ that MainModule needs is refused, and it asks nothing of WMI.
+    # Without it a host can find NO running processes and overwrite a venv Unsloth
+    # has open, so the ladder still ends at Get-Process and Win32_Process. Every
+    # rung reports a real executable image; a command line or working directory
+    # mentioning the path is never proof.
+    #
+    # Emitted rather than compiled, like every other native declaration here. The
+    # ladder itself is unchanged from before that switch.
+    $script:StudioProcessImageNativeState = $null
+    function Initialize-StudioProcessImageNativeType {
+        if ("UnslothStudioProcessImageV1" -as [type]) {
+            $script:StudioProcessImageNativeState = $true
+            return $true
+        }
+        if ($null -ne $script:StudioProcessImageNativeState) { return $script:StudioProcessImageNativeState }
+        if (-not (Test-StudioCanDefineNativeTypes)) {
+            $script:StudioProcessImageNativeState = $false
+            return $false
+        }
+        try {
+            $null = New-StudioEmittedNativeType -TypeName "UnslothStudioProcessImageV1" -Imports @(
+                @{ Name = "OpenProcess"; Library = "kernel32.dll"; Return = [IntPtr]
+                   Args = @([uint32], [bool], [int]) },
+                @{ Name = "QueryFullProcessImageNameW"; Library = "kernel32.dll"; Return = [bool]
+                   Args = @([IntPtr], [uint32], [System.Text.StringBuilder], [uint32].MakeByRefType()) },
+                @{ Name = "CloseHandle"; Library = "kernel32.dll"; Return = [bool]
+                   Args = @([IntPtr]) }
+            )
+        } catch {
+            $script:StudioProcessImageNativeState = $false
+            return $false
+        }
+        $script:StudioProcessImageNativeState = $null -ne ("UnslothStudioProcessImageV1" -as [type])
+        return $script:StudioProcessImageNativeState
+    }
+
+    # The body of the compiled GetProcessImagePath, moved out of C# so the imports
+    # above are all the native code there is. Same flags, same buffer. Null rather
+    # than an exception on any failure, which is what the compiled one returned and
+    # what the caller below skips on.
+    function Get-StudioNativeProcessImagePath {
+        param([Parameter(Mandatory = $true)][int]$ProcessId)
+        $queryLimitedInformation = [uint32]0x1000
+        $handle = [IntPtr]::Zero
+        try {
+            $handle = [UnslothStudioProcessImageV1]::OpenProcess(
+                $queryLimitedInformation, $false, $ProcessId)
+        } catch {
+            return $null
+        }
+        if ($handle -eq [IntPtr]::Zero) { return $null }
+        try {
+            $buffer = New-Object System.Text.StringBuilder 32768
+            [uint32]$length = $buffer.Capacity
+            if (-not [UnslothStudioProcessImageV1]::QueryFullProcessImageNameW(
+                    $handle, [uint32]0, $buffer, [ref]$length)) {
+                return $null
+            }
+            return $buffer.ToString()
+        } catch {
+            return $null
+        } finally {
+            try { [void][UnslothStudioProcessImageV1]::CloseHandle($handle) } catch {}
+        }
+    }
+
     $script:StudioProcessImageTable = $null
     $script:StudioProcessImageWarned = $false
     function Get-StudioProcessImagePath {
         param([Parameter(Mandatory = $true)][int]$ProcessId)
-        if (Initialize-StudioFinalPathNativeType) {
-            try {
-                $native = [UnslothStudioFinalPathV2]::GetProcessImagePath($ProcessId)
-                if (-not [string]::IsNullOrWhiteSpace($native)) { return $native }
-            } catch {}
+        if (Initialize-StudioProcessImageNativeType) {
+            $native = Get-StudioNativeProcessImagePath -ProcessId $ProcessId
+            if (-not [string]::IsNullOrWhiteSpace($native)) { return $native }
             return $null
         }
         if (-not $script:StudioProcessImageWarned) {
@@ -3322,7 +3437,7 @@ exit 0
         # D:\env\python.exe matched a protected C:\env, aborting a legitimate install
         # as "still in use". The alias it was written for, SUBST, is folded in
         # Get-StudioLexicalPath instead. A volume reached by GUID still cannot be
-        # matched to the same volume by drive letter without the compiler.
+        # matched to the same volume by drive letter without the native resolver.
 
         # Block only confirmed executable identities: a command line or working
         # directory that merely mentions the path is not proof of an open file.
