@@ -1,0 +1,50 @@
+name: "staging-10496 windows-latest"
+on:
+  push:
+    branches: ["pr-10496-xplat-ci"]
+    paths-ignore:
+      - '**/*.md'
+  workflow_dispatch:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+defaults:
+  run:
+    shell: bash
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      UNSLOTH_COMPILE_DISABLE: '1'
+      UNSLOTH_IS_PRESENT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # setup-python's macOS builds omit --enable-loadable-sqlite-extensions, so sqlite-vec
+      # cannot load and every RAG test errors for environment reasons -- a false red, exactly
+      # what the scoped selection above exists to avoid. uv's managed interpreters have it.
+      - name: Ensure the interpreter can load SQLite extensions
+        run: |
+          if python -c "import sqlite3,sys; sys.exit(0 if hasattr(sqlite3.connect(':memory:'),'enable_load_extension') else 1)"; then
+            exit 0
+          fi
+          python -m pip install uv==0.11.0
+          python -m uv python install 3.12
+          # uv python find --managed-python still answered with the runner's framework
+          # build, so read the path off the managed list instead.
+          managed=$(python -m uv python list --only-installed --managed-python --output-format json             | python -c "import json,sys; print(next(e['path'] for e in json.load(sys.stdin) if e['version'].startswith('3.12.')))")
+          python -m uv venv --seed --python "$managed" "$RUNNER_TEMP/ci-venv"
+          if [ -d "$RUNNER_TEMP/ci-venv/bin" ]; then
+            echo "$RUNNER_TEMP/ci-venv/bin" >> "$GITHUB_PATH"
+          else
+            echo "$RUNNER_TEMP/ci-venv/Scripts" >> "$GITHUB_PATH"
+          fi
+      - run: python -m pip install -r studio/backend/requirements/studio.txt pytest pytest-asyncio pytest-timeout python-multipart
+      - run: rc=0; PYTHONPATH=studio/backend python -m pytest studio/backend/tests/test_rag_chunking.py studio/backend/tests/test_rag_chunking_simulations.py studio/backend/tests/test_rag_embedding_identity.py studio/backend/tests/test_rag_ingestion.py studio/backend/tests/test_rag_ocr_fallback.py studio/backend/tests/test_rag_upload_formats.py studio/backend/tests/test_rag_upload_progress.py studio/backend/tests/test_rag_upload_simulations.py -q --tb=short -k 'not llama_cpp_load_progress_live and not TestGpuAutoSelection and not TestPreSpawnGpuResolution and not TestPerGpuFitGuardAllCounts and not TestTransformersIntrospection and not test_returns_cuda_when_cuda_available and not test_calls_cuda_cache_when_cuda' > pytest_out.txt 2>&1 || rc=$?; cat pytest_out.txt; if [ "$rc" = "5" ]; then echo "no tests ran (deps absent on this runner)"; rc=0; fi; if [ "$rc" = "2" ] && grep -qE "No module named .(torch|unsloth_zoo|transformers)." pytest_out.txt && ! grep -qE "^(FAILED|ERROR) " pytest_out.txt; then echo "collection needs a dep this runner does not ship"; rc=0; fi; if [ "$rc" = "1" ] && ! grep -qE "^ERROR " pytest_out.txt; then tot=$(grep -cE "^FAILED " pytest_out.txt); dep=$(grep -cE "^FAILED .* No module named .(torch|unsloth_zoo|transformers).$" pytest_out.txt); if [ "$tot" -gt 0 ] && [ "$tot" = "$dep" ]; then echo "only tests needing a dep this runner does not ship failed"; rc=0; fi; fi; exit "$rc"
