@@ -1813,6 +1813,10 @@ def test_the_probe_body_carries_no_double_quote(script: str):
 # Every case here is a way a real child can answer badly: it printed the marker and then died,
 # it ran in a language mode its parent did not, it printed something that merely CONTAINS the
 # marker, or it never returned at all.
+# A #!/bin/sh host, so POSIX only: Windows CreateProcess rejects a file with no
+# executable format, every case would come back false through the catch, and the
+# accept case would fail while the deadline case passed without waiting.
+@pytest.mark.skipif(os.name == "nt", reason = "the fake host is a shell script")
 @requires_pwsh
 @pytest.mark.parametrize("script", ["install", "setup"])
 @pytest.mark.parametrize(
@@ -1820,9 +1824,21 @@ def test_the_probe_body_carries_no_double_quote(script: str):
     [
         ("STUDIO_EMIT_OK FullLanguage", 0, "True", "ok", "the good case"),
         ("STUDIO_EMIT_OK FullLanguage", 23, "False", "blocked", "marker then a bad exit"),
-        ("STUDIO_EMIT_OK ConstrainedLanguage", 0, "False", "blocked", "a child restricted differently"),
+        (
+            "STUDIO_EMIT_OK ConstrainedLanguage",
+            0,
+            "False",
+            "blocked",
+            "a child restricted differently",
+        ),
         ("", 1, "False", "blocked", "a child that ran and refused"),
-        ("NOT_STUDIO_EMIT_OK_FAILURE", 0, "False", "indeterminate", "a line that merely contains the marker"),
+        (
+            "NOT_STUDIO_EMIT_OK_FAILURE",
+            0,
+            "False",
+            "indeterminate",
+            "a line that merely contains the marker",
+        ),
         ("", 0, "False", "indeterminate", "silence"),
     ],
 )
@@ -1843,7 +1859,7 @@ def test_the_probe_only_accepts_a_clean_exact_answer(
             [
                 '$ErrorActionPreference = "Stop"',
                 _one_function(source, "Test-StudioEmitInChildProcess"),
-                f'Write-Output "ANSWER:$(Test-StudioEmitInChildProcess -HostPath \'{fake}\')"',
+                f"Write-Output \"ANSWER:$(Test-StudioEmitInChildProcess -HostPath '{fake}')\"",
                 'Write-Output "OUTCOME:$script:StudioEmitProbeOutcome"',
             ]
         )
@@ -1878,6 +1894,13 @@ def test_only_a_probe_that_never_answered_is_retried(script: str, outcome: str, 
                 "$script:StudioCanDefineNativeTypes = $null",
                 "$script:StudioEmitProbeOutcome = $null",
                 "$script:ProbeCalls = 0",
+                # An active policy, so the gate reaches the probe on any host. Without
+                # this the real query answers 0 on a Windows runner and the gate returns
+                # before the stub below is ever called.
+                "function Get-CimInstance {",
+                "    param([string]$Namespace, [string]$ClassName, [string]$ErrorAction)",
+                "    [pscustomobject]@{ UsermodeCodeIntegrityPolicyEnforcementStatus = 1 }",
+                "}",
                 # A stub, because the gate calls the real probe through $PSHOME, which is
                 # read-only and cannot be pointed at a fake host. What is under test here is
                 # the gate's retry rule, not the child.
@@ -1887,7 +1910,7 @@ def test_only_a_probe_that_never_answered_is_retried(script: str, outcome: str, 
                 "    return $false",
                 "}",
                 _one_function(source, "Test-StudioCanDefineNativeTypes"),
-                '$answer = Test-StudioCanDefineNativeTypes',
+                "$answer = Test-StudioCanDefineNativeTypes",
                 'Write-Output "ANSWER:$answer"',
                 'Write-Output "CALLS:$script:ProbeCalls"',
             ]
@@ -1965,9 +1988,9 @@ def test_an_already_emitted_type_settles_it_without_asking_a_child():
                 "    @{ Name = 'CloseHandle'; Library = 'kernel32.dll'; Return = [bool]",
                 "       Args = @([IntPtr]); Ansi = $true }",
                 ")",
-                'Write-Output "PATHTYPE:$($null -ne (\'UnslothStudioFinalPathV3\' -as [type]))"',
+                "Write-Output \"PATHTYPE:$($null -ne ('UnslothStudioFinalPathV3' -as [type]))\"",
                 _one_function(source, "Initialize-StudioProcessImageNativeType"),
-                '$ok = Initialize-StudioProcessImageNativeType',
+                "$ok = Initialize-StudioProcessImageNativeType",
                 'Write-Output "PROCESS:$ok"',
                 'Write-Output "GATE:$script:GateCalls"',
             ]
@@ -2017,11 +2040,15 @@ def test_the_console_helper_keeps_a_type_it_already_has(script: str):
         )
     )
     assert result.returncode == 0, result.stderr + result.stdout
-    assert _lines(result, "GATE:") == ["GATE:0"], (
-        "a published console type was discarded because a child probe said no"
-    )
+    assert _lines(result, "GATE:") == [
+        "GATE:0"
+    ], "a published console type was discarded because a child probe said no"
 
 
+# A #!/bin/sh host, so POSIX only: Windows CreateProcess rejects a file with no
+# executable format, every case would come back false through the catch, and the
+# accept case would fail while the deadline case passed without waiting.
+@pytest.mark.skipif(os.name == "nt", reason = "the fake host is a shell script")
 @requires_pwsh
 def test_a_child_that_never_returns_does_not_hang_the_installer(tmp_path: Path):
     """The deadline. A probe that exists to keep the installer alive must not be the thing
@@ -2040,7 +2067,7 @@ def test_a_child_that_never_returns_does_not_hang_the_installer(tmp_path: Path):
             [
                 '$ErrorActionPreference = "Stop"',
                 _one_function(source, "Test-StudioEmitInChildProcess"),
-                f'Write-Output "ANSWER:$(Test-StudioEmitInChildProcess -HostPath \'{fake}\')"',
+                f"Write-Output \"ANSWER:$(Test-StudioEmitInChildProcess -HostPath '{fake}')\"",
             ]
         )
     )
