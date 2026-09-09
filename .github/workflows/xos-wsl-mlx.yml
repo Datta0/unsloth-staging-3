@@ -11,7 +11,7 @@ name: "10540+10560 WSL and MLX"
 
 on:
   push:
-    branches: [both-prs-xos]
+    branches: [both-prs-xos, wintests-xos]
   pull_request:
     branches: [main]
   workflow_dispatch:
