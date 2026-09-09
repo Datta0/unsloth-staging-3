@@ -3380,6 +3380,49 @@ def apply_chat_template_for_generation(
         raise
 
 
+# Windows loader errors that mean the image was refused rather than missing: 577
+# ERROR_INVALID_IMAGE_HASH is Smart App Control and App Control for Business, 225
+# ERROR_VIRUS_INFECTED is an antivirus blocking on access, 1260 is AppLocker or SRP.
+_BLOCKED_IMAGE_WINERRORS = frozenset({225, 577, 1260})
+
+
+"""Loader wording, for the case where the winerror did not survive the re-raise.
+
+Deliberately not the package name. "sentencepiece" appears in the ordinary message
+transformers emits when the package is simply not installed, and calling that a
+security block would tell an operator to go looking through their antivirus for a
+file that was never there. Only a refusal to load an image counts.
+"""
+_BLOCKED_IMAGE_PHRASES = (
+    "dll load failed",
+    "is not a valid win32 application",
+    "cannot verify the digital signature",
+    "blocked by",
+    "violated code integrity",
+)
+
+
+def _looks_like_a_blocked_import(exc: Optional[BaseException]) -> bool:
+    """Whether an exception is a native module the loader refused.
+
+    Optional[...] rather than the PEP 604 spelling: this module has no
+    ``from __future__ import annotations`` and the project floor is 3.9, where the
+    union is evaluated at definition time and would stop the module importing.
+
+    The winerror is checked first because it is unambiguous. The wording match is the
+    fallback for a wrapper that re-raised without one. The chain is walked because
+    transformers raises its own error from the original.
+    """
+    while exc is not None:
+        if getattr(exc, "winerror", None) in _BLOCKED_IMAGE_WINERRORS:
+            return True
+        text = str(exc).lower()
+        if any(phrase in text for phrase in _BLOCKED_IMAGE_PHRASES):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
 def resolve_native_chat_template(
     model_info: dict,
     active_model_name,
@@ -3411,7 +3454,23 @@ def resolve_native_chat_template(
         )
         native_tpl = nt.chat_template or False
     except Exception as exc:
-        logger.warning("Could not load native chat template for '%s': %s", template_source, exc)
+        # A tokenizer that will not build is not always a network problem. Smart App
+        # Control blocks sentencepiece's compiled extension by reputation, and the
+        # import error that follows arrived here as one warning among many while the
+        # model went on generating under a substituted template: wrong prompt
+        # formatting, and nothing naming the cause. Named at error level instead, since
+        # nothing downstream can recover from it and the user can act on it.
+        if _looks_like_a_blocked_import(exc):
+            logger.error(
+                "Could not load the native chat template for '%s' because a Python "
+                "extension would not load: %s. Prompt formatting falls back to a "
+                "generic template until this is resolved. If Windows blocked the file "
+                "(Smart App Control or antivirus), allow it and restart.",
+                template_source,
+                exc,
+            )
+        else:
+            logger.warning("Could not load native chat template for '%s': %s", template_source, exc)
         # A failed fetch is not "no template": leave the sentinel unset so the next call
         # retries (caching False would pin the tool-dropping override).
         return None
