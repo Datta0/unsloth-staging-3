@@ -100,6 +100,12 @@ jobs:
           if ($bad) { throw "$bad compiler invocation(s) still present" }
           Write-Host "no Add-Type or csc invocation in either installer"
 
+      # Only meaningful on Windows: off it, both arms degrade and agree for the wrong
+      # reason. See tests/ci/lock_identity.ps1 for what it measures and why.
+      - name: Do the native and lexical resolvers name the same lock
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./tests/ci/lock_identity.ps1
       - name: Structural diff against main, base versus head
         shell: pwsh
         run: |
