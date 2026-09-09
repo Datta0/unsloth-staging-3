@@ -7,11 +7,16 @@
 # It cannot be measured off Windows, where both arms degrade and every answer matches for
 # the wrong reason. Three inputs, because they are the three ways the two resolvers are
 # documented to differ: a plain path, an 8.3 alias, and a SUBST drive.
-$ErrorActionPreference = "Stop"
 # Two scripts, because a disagreement only counts against this PR if the PR introduced it.
 # tests/ci/base_install.ps1 is main's copy; if it disagrees on the same input, the property
 # belongs to native-versus-lexical resolution and predates the change.
+#
+# First, ahead of every statement: param is only a parameter block when nothing executable
+# precedes it, and behind the assignment below PowerShell read it as a command and the run
+# died before it measured anything.
 param([string]$Script = "install.ps1")
+
+$ErrorActionPreference = "Stop"
 
 $repoRoot = $PSScriptRoot | Split-Path | Split-Path
 $scriptPath = if ([System.IO.Path]::IsPathRooted($Script)) { $Script }
