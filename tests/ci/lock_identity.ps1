@@ -65,6 +65,21 @@ if ($letter) {
     if (Test-Path $letter) { $cases["subst"] = "$letter\" }
 }
 
+# The fourth spelling, and the one the audits singled out: a volume reached by its GUID
+# rather than its drive letter. GetFinalPathNameByHandleW can answer \\?\Volume{...}, which
+# after prefix stripping is a different string from the drive-letter spelling that the
+# lexical rung returns. No user types one, but a mount point without a drive letter is
+# reached this way, so it is worth one case rather than an assumption.
+try {
+    $guid = (Get-CimInstance Win32_Volume -ErrorAction Stop |
+        Where-Object { $_.DriveLetter -eq $env:SystemDrive } |
+        Select-Object -First 1).DeviceID
+    if ($guid) {
+        $rest = $root.Substring($env:SystemDrive.Length).TrimStart('\\')
+        $cases["volumeguid"] = (Join-Path $guid $rest)
+    }
+} catch {}
+
 $mismatch = 0
 $void = 0
 try {
