@@ -8,21 +8,35 @@
 # the wrong reason. Three inputs, because they are the three ways the two resolvers are
 # documented to differ: a plain path, an 8.3 alias, and a SUBST drive.
 $ErrorActionPreference = "Stop"
+# Two scripts, because a disagreement only counts against this PR if the PR introduced it.
+# tests/ci/base_install.ps1 is main's copy; if it disagrees on the same input, the property
+# belongs to native-versus-lexical resolution and predates the change.
+param([string]$Script = "install.ps1")
+
 $repoRoot = $PSScriptRoot | Split-Path | Split-Path
+$scriptPath = if ([System.IO.Path]::IsPathRooted($Script)) { $Script }
+              else { Join-Path $repoRoot $Script }
+Write-Host "measuring: $scriptPath"
 $ast = [System.Management.Automation.Language.Parser]::ParseFile(
-    (Join-Path $repoRoot "install.ps1"), [ref]$null, [ref]$null)
+    $scriptPath, [ref]$null, [ref]$null)
 function Src($name) {
     $f = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
         $args[0].Name -eq $name }, $true)
-    if ($f.Count -eq 0) { throw "missing $name" }
+    if ($f.Count -eq 0) { return $null }
     return $f[0].Extent.Text
 }
+# Whichever of these the script actually defines. main's copy has no emitter and no child
+# probe, and the two extra helpers it does have are picked up the same way, so one chain
+# description serves both scripts.
 $chain = @("Write-StudioLine","Write-StudioFinalPathDegraded","Test-StudioCanDefineNativeTypes",
-           "New-StudioDynamicAssembly","New-StudioEmittedNativeType",
+           "Test-StudioEmitInChildProcess","New-StudioDynamicAssembly","New-StudioEmittedNativeType",
+           "Test-StudioDirectoryUsable","Remove-StudioStalePrivateTempDirectories",
+           "Get-StudioPrivateTempRoots","New-StudioPrivateTempDirectory",
+           "Initialize-StudioTempEnvironment","Restore-StudioTempEnvironment",
            "Initialize-StudioFinalPathNativeType","Get-StudioNativeFinalPath",
            "Resolve-StudioLinkTarget","Get-StudioSubstTarget","Get-StudioLexicalPath",
            "Resolve-StudioFinalPathInfo","Get-StudioFinalPath","Get-StudioPathHash",
-           "Get-StudioInstallMutexName")
+           "Get-StudioInstallMutexName") | Where-Object { $null -ne (Src $_) }
 
 function Get-Name([string]$Path, [bool]$Refuse) {
     # A fresh child each time: these functions cache their answer in script scope on
@@ -106,6 +120,6 @@ try {
 Write-Host "CASES: $($cases.Keys -join ',')"
 Write-Host "DISAGREEMENTS: $mismatch"
 Write-Host "VOID_CASES: $void"
-if ($void -gt 0) { throw "every case measured one resolver against itself; the refusal did not take" }
+if ($void -gt 0) { throw "a case measured one resolver against itself; the refusal did not take" }
 # Reported, not thrown. A disagreement on an aliased path is a property the fallback has
 # always had; the number is what says whether this change widened it.

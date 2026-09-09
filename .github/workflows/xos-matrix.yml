@@ -105,7 +105,11 @@ jobs:
       - name: Do the native and lexical resolvers name the same lock
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./tests/ci/lock_identity.ps1
+        run: |
+          # main first. A disagreement on head only counts against this PR if main agrees on
+          # the same input, so the base run is the control and it is not optional.
+          ./tests/ci/lock_identity.ps1 -Script tests/ci/base_install.ps1
+          ./tests/ci/lock_identity.ps1 -Script install.ps1
       - name: Structural diff against main, base versus head
         shell: pwsh
         run: |
