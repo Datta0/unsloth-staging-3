@@ -1,0 +1,180 @@
+# 10540 + 10560 together, on every OS they touch and every OS they do not.
+#
+# The PRs change Windows installer scripts and two PowerShell launch sites in the CLI. The
+# Windows legs are the ones under test. The macOS, Linux and ARM legs are the CONTROL for
+# the opposite claim: that a change confined to Windows did not disturb anyone else. A green
+# tick on ubuntu is not a formality here, it is the evidence for "no effect elsewhere".
+#
+# Both architectures per OS, because reflection emit is a runtime feature and arm64 runners
+# use a different JIT.
+name: "10540+10560 cross-OS"
+
+on:
+  push:
+    branches: [both-prs-xos]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  suites:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            label: windows-x64-TOUCHED
+          - os: windows-11-arm
+            label: windows-arm64-TOUCHED
+          - os: ubuntu-latest
+            label: linux-x64-untouched
+          - os: ubuntu-24.04-arm
+            label: linux-arm64-untouched
+          - os: macos-15
+            label: macos-arm64-untouched
+          - os: macos-15-intel
+            label: macos-intel-untouched
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    name: ${{ matrix.label }}
+    env:
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Install test dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-asyncio pytest-timeout packaging pyyaml typer click rich pydantic
+
+      - name: The suites both PRs touch
+        shell: bash
+        run: |
+          python -m pytest \
+            tests/studio/test_installer_av_shapes.py \
+            tests/python/test_windows_installer_native_type_fallback.py \
+            tests/python/test_windows_installer_concurrency_guard.py \
+            tests/python/test_windows_setup_output_encoding.py \
+            tests/studio/test_workflow_guards_run_unfiltered.py \
+            -q
+          # unsloth_cli/tests/test_studio_runtime_gate_powershell.py is deliberately NOT
+          # here. It imports unsloth_cli.commands.studio, whose transitive closure is torch,
+          # transformers, trl, datasets and wandb, so putting it in a six-OS matrix means
+          # installing the full stack six times to assert two argv strings. It runs in the
+          # org CI and locally instead. What this matrix is for is the checks below, which
+          # need no dependencies at all and are the same on every platform.
+
+      - name: No compiler invocation survives anywhere in the installers
+        shell: pwsh
+        run: |
+          # Deterministic, not a grep for the word: the parser is asked for every command
+          # invocation by name, so a call hidden in a string or split across lines cannot
+          # slip past and a mention inside a comment cannot raise a false alarm.
+          $bad = 0
+          foreach ($file in @('install.ps1', 'studio/setup.ps1')) {
+              $ast = [System.Management.Automation.Language.Parser]::ParseFile(
+                  (Resolve-Path $file), [ref]$null, [ref]$null)
+              $calls = $ast.FindAll({
+                  $args[0] -is [System.Management.Automation.Language.CommandAst] }, $true)
+              foreach ($c in $calls) {
+                  $name = $c.GetCommandName()
+                  if ($name -in @('Add-Type', 'csc.exe', 'csc')) {
+                      Write-Host "FAIL $file line $($c.Extent.StartLineNumber): $name"
+                      $bad++
+                  }
+              }
+          }
+          if ($bad) { throw "$bad compiler invocation(s) still present" }
+          Write-Host "no Add-Type or csc invocation in either installer"
+
+      # Only meaningful on Windows: off it, both arms degrade and agree for the wrong
+      # reason. See tests/ci/lock_identity.ps1 for what it measures and why.
+      - name: Do the native and lexical resolvers name the same lock
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # main first. A disagreement on head only counts against this PR if main agrees on
+          # the same input, so the base run is the control and it is not optional.
+          ./tests/ci/lock_identity.ps1 -Script tests/ci/base_install.ps1
+          ./tests/ci/lock_identity.ps1 -Script install.ps1
+      - name: Structural diff against main, base versus head
+        shell: pwsh
+        run: |
+          ./tests/ci/ast_equivalence.ps1 -Base tests/ci/base_install.ps1 -Head install.ps1
+          ./tests/ci/ast_equivalence.ps1 -Base tests/ci/base_setup.ps1 -Head studio/setup.ps1
+
+      - name: Python AST equivalence for the CLI change
+        shell: python
+        run: |
+          import ast, sys, difflib
+
+          # The claim for 10560 is that it removes two list elements and changes nothing
+          # else. Compared as syntax trees rather than text, so a reformat cannot hide an
+          # edit and a comment cannot look like one.
+          base = ast.parse(open("tests/ci/base_studio.py", encoding="utf-8").read())
+          head = ast.parse(open("unsloth_cli/commands/studio.py", encoding="utf-8").read())
+
+          def fns(tree):
+              return {n.name: ast.dump(n) for n in ast.walk(tree)
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+
+          b, h = fns(base), fns(head)
+          added = sorted(set(h) - set(b))
+          removed = sorted(set(b) - set(h))
+          changed = sorted(k for k in set(b) & set(h) if b[k] != h[k])
+          print(f"functions: base {len(b)}, head {len(h)}, identical {len(set(b) & set(h)) - len(changed)}")
+          print("ADDED:", added)
+          print("REMOVED:", removed)
+          print("CHANGED:", changed)
+
+          assert not removed, f"10560 must not remove a function: {removed}"
+          assert not added, f"10560 must not add a function: {added}"
+          expected = {"_run_setup_script", "_refresh_desktop_shortcuts"}
+          assert set(changed) <= expected, (
+              f"only {sorted(expected)} may change, got {changed}"
+          )
+          for name in changed:
+              diff = [l for l in difflib.unified_diff(
+                  b[name].split(","), h[name].split(","), lineterm="")
+                  if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))]
+              print(f"  {name}: {len(diff)} AST node deltas")
+          print("PASS: the CLI change is confined to the two launch builders")
+
+      - name: An old installed app can still drive the new scripts
+        shell: bash
+        run: |
+          # v0.1.701-beta's Tauri host runs the repository's CURRENT install.ps1 with
+          # "--tauri" and optionally "--local", parsed out of $args rather than a param
+          # block. So the contract is the accepted flag STRINGS, and losing one would
+          # silently change behaviour for every already-installed app that updates.
+          fail=0
+          for pair in "tests/ci/base_install.ps1:install.ps1" "tests/ci/base_setup.ps1:studio/setup.ps1"; do
+            base="${pair%%:*}"; head="${pair##*:}"
+            grep -ohE '"--[a-z][a-z-]*"' "$base" | sort -u > /tmp/base_flags.txt
+            grep -ohE '"--[a-z][a-z-]*"' "$head" | sort -u > /tmp/head_flags.txt
+            echo "== $head"
+            if lost=$(comm -23 /tmp/base_flags.txt /tmp/head_flags.txt) && [ -n "$lost" ]; then
+              echo "BREAKING, flags an older caller may pass are gone: $lost"; fail=1
+            else
+              echo "  every flag on main is still accepted ($(wc -l < /tmp/head_flags.txt) total)"
+            fi
+          done
+          # The two the old Tauri host actually sends.
+          for flag in '"--tauri"' '"--local"'; do
+            grep -q -- "$flag" install.ps1 || { echo "MISSING $flag in install.ps1"; fail=1; }
+          done
+          [ "$fail" -eq 0 ] || exit 1
+          echo "PASS: old caller, new script"

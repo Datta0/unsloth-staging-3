@@ -1591,195 +1591,24 @@ function Ensure-VCRedist {
 # ─────────────────────────────────────────────
 $Rule = [string]::new([char]0x2500, 52)
 
-# Native declarations are emitted, never compiled. Add-Type on Windows PowerShell 5.1 has no
-# in-process compiler: -TypeDefinition and -MemberDefinition alike write C# to %TEMP% and run
-# csc.exe to get a DLL back, and behavioural antivirus blocks the result, because a windowless
-# PowerShell launching a compiler and writing executable content to %TEMP% is a dropper's shape
-# whatever the code says. Reflection emit builds the same stub in memory: no compiler process, no
-# source on disk, no DLL, and an assembly whose Location is empty. install.ps1 carries the same
-# helper, and for the same reason.
-# See install.ps1: App Control's Dynamic Code Security always blocks loading unsigned
-# assemblies built with System.Reflection.Emit, and Microsoft documents the parent process as
-# usually stopped or crashing rather than raising, so this has to be a gate and not a catch.
-$script:StudioCanDefineNativeTypes = $null
-function Test-StudioCanDefineNativeTypes {
-    if ($null -ne $script:StudioCanDefineNativeTypes) { return $script:StudioCanDefineNativeTypes }
-    $languageMode = "FullLanguage"
-    try { $languageMode = [string]$ExecutionContext.SessionState.LanguageMode } catch {}
-    if ($languageMode -ne "FullLanguage") {
-        $script:StudioCanDefineNativeTypes = $false
-        return $false
-    }
-    $active = $false
-    try {
-        $guard = Get-CimInstance -Namespace "root\Microsoft\Windows\DeviceGuard" `
-            -ClassName "Win32_DeviceGuard" -ErrorAction Stop
-        # 0 off, 1 audit, 2 enforced.
-        if ($guard -and [int]$guard.UsermodeCodeIntegrityPolicyEnforcementStatus -ne 0) {
-            $active = $true
-        }
-    } catch {}
-    if (-not $active) {
-        $script:StudioCanDefineNativeTypes = $true
-        return $true
-    }
-    # Which policy decides this, and Win32_DeviceGuard does not say. Option 19 Dynamic Code
-    # Security always blocks unsigned System.Reflection.Emit assemblies and is enforced even in
-    # an audit policy before Windows 11 24H2, while an audit policy without it emits fine. So a
-    # child process tries it. Same reasoning as install.ps1, which carries the full note.
-    $script:StudioCanDefineNativeTypes = Test-StudioEmitInChildProcess
-    return $script:StudioCanDefineNativeTypes
-}
-
-# The same emit, in a process that is allowed to die. A blocked dynamic load usually stops the
-# parent, so this is asked in a child; silence is refusal.
-function Test-StudioEmitInChildProcess {
-    $probe = @'
-try {
-    $name = New-Object System.Reflection.AssemblyName 'UnslothStudioEmitProbe'
-    $access = [System.Reflection.Emit.AssemblyBuilderAccess]::Run
-    $assembly = $null
-    try { $assembly = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly($name, $access) }
-    catch { $assembly = [AppDomain]::CurrentDomain.DefineDynamicAssembly($name, $access) }
-    $module = $assembly.DefineDynamicModule('UnslothStudioEmitProbe')
-    $builder = $module.DefineType('UnslothStudioEmitProbe', 'Public, Class, AutoClass, AnsiClass, BeforeFieldInit')
-    $null = $builder.DefinePInvokeMethod('CloseHandle', 'kernel32.dll', 'CloseHandle',
-        'Public, Static, HideBySig, PinvokeImpl',
-        [System.Reflection.CallingConventions]::Standard, [bool], @([IntPtr]),
-        [System.Runtime.InteropServices.CallingConvention]::Winapi,
-        [System.Runtime.InteropServices.CharSet]::Ansi)
-    $null = $builder.CreateType()
-    if ('UnslothStudioEmitProbe' -as [type]) { Write-Output 'STUDIO_EMIT_OK' }
-} catch {}
-'@
-    # This host, not a guessed one: a 5.1 answer does not carry to pwsh or the other way.
-    $hostExe = $null
-    try {
-        $leaves = if ($PSVersionTable.PSEdition -eq "Core") { @("pwsh.exe", "pwsh") }
-                  else { @("powershell.exe", "powershell") }
-        foreach ($leaf in $leaves) {
-            $candidate = Join-Path $PSHOME $leaf
-            if (Test-Path -LiteralPath $candidate) { $hostExe = $candidate; break }
-        }
-    } catch {}
-    if (-not $hostExe) { return $false }
-    try {
-    # SINGLE quotes throughout, and that is load-bearing rather than style. Windows
-    # PowerShell 5.1 binds a native command's arguments the legacy way: it wraps the
-    # value in double quotes and appends the body verbatim, without escaping the double
-    # quotes inside it. The first one inside therefore CLOSES the wrapper, the rest of
-    # the probe is re-split on whitespace, and the child runs
-    # `if (UnslothStudioEmitProbe -as [type])`, a command lookup that throws into the
-    # probe's own catch. The answer would be "no emit here" on every 5.1 host, which is
-    # the interpreter studio/src-tauri/src/install.rs spawns. A body with no double
-    # quote has nothing to lose. Passing the body base64-encoded also fixes it
-    # and is what the documentation suggests, but base64 PowerShell is the shape
-    # this whole change exists to stop resembling, and
-    # tests/studio/test_installer_av_shapes.py rejects it. Verified both ways
-        # with $PSNativeCommandArgumentPassing.
-        $out = & $hostExe -NoProfile -NonInteractive -Command $probe 2>$null
-        return (($out | Out-String) -match "STUDIO_EMIT_OK")
-    } catch {
-        return $false
-    }
-}
-
-function New-StudioDynamicAssembly {
-    <#
-    Both spellings of "define a dynamic assembly", because the two PowerShell hosts that
-    run this file are on different runtimes. The static
-    AssemblyBuilder::DefineDynamicAssembly is documented for .NET Framework 4.5 through
-    4.8.1 as well as .NET Core, so Windows PowerShell 5.1 should take the first branch. It
-    is tried rather than assumed because nothing here can test a .NET Framework host, and
-    getting it wrong is not a visible error: the catch would cache the thunk as unavailable
-    and every install would silently lose it.
-
-    AppDomain.CurrentDomain.DefineDynamicAssembly is the .NET Framework spelling and is
-    absent on .NET Core, so it is the fallback rather than the first try.
-    #>
-    param([Parameter(Mandatory = $true)][System.Reflection.AssemblyName]$AssemblyName)
-    $access = [System.Reflection.Emit.AssemblyBuilderAccess]::Run
-    try {
-        return [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly(
-            $AssemblyName, $access)
-    } catch [System.Management.Automation.MethodException] {
-        return [AppDomain]::CurrentDomain.DefineDynamicAssembly($AssemblyName, $access)
-    } catch [System.Management.Automation.RuntimeException] {
-        # A missing static surfaces as a RuntimeException on some hosts rather than a
-        # MethodException. Both mean "no such method here", and a real emit failure throws
-        # from the AppDomain call too, so the caller still sees it.
-        return [AppDomain]::CurrentDomain.DefineDynamicAssembly($AssemblyName, $access)
-    }
-}
-
-function New-StudioEmittedNativeType {
-    param(
-        [Parameter(Mandatory = $true)][string]$TypeName,
-        [Parameter(Mandatory = $true)][object[]]$Imports
-    )
-    $assemblyName = New-Object System.Reflection.AssemblyName $TypeName
-    $assembly = New-StudioDynamicAssembly -AssemblyName $assemblyName
-    $module = $assembly.DefineDynamicModule($TypeName)
-    $builder = $module.DefineType(
-        $TypeName, "Public, Class, AutoClass, AnsiClass, BeforeFieldInit")
-
-    $winapi = [System.Runtime.InteropServices.CallingConvention]::Winapi
-    # Per import, because CharSet selects name mangling as well as marshalling: Unicode probes
-    # <Name>W before <Name>, Ansi probes <Name> before <Name>A. Declaring the one the C# this
-    # replaces declared keeps the metadata honest and puts the export that does exist first.
-    $unicode = [System.Runtime.InteropServices.CharSet]::Unicode
-    $ansi = [System.Runtime.InteropServices.CharSet]::Ansi
-    $standard = [System.Reflection.CallingConventions]::Standard
-    $attributes = "Public, Static, HideBySig, PinvokeImpl"
-    $preserveSig = [System.Reflection.MethodImplAttributes]::PreserveSig
-
-    foreach ($import in $Imports) {
-        $charSet = if ($import.ContainsKey("Ansi") -and $import.Ansi) { $ansi } else { $unicode }
-        $method = $builder.DefinePInvokeMethod(
-            $import.Name, $import.Library, $import.Name, $attributes,
-            $standard, $import.Return, $import.Args, $winapi, $charSet)
-        $method.SetImplementationFlags(
-            $method.GetMethodImplementationFlags() -bor $preserveSig)
-        # `out uint` in the C# this replaces, and DefinePInvokeMethod has no way to say
-        # so: a by-ref type alone emits `ref`, which is In and Out unset. The value is
-        # blittable and every caller initialises it first, so the marshaller pins and
-        # writes back either way, but the metadata is what a reader and any future
-        # marshalling change go by, so it says what the declaration said.
-        foreach ($position in @($import.Out)) {
-            if ($position) { $null = $method.DefineParameter($position, "Out", $null) }
-        }
-    }
-    $null = $builder.CreateType()
-    return $null -ne ($TypeName -as [type])
-}
-
 function Enable-StudioVirtualTerminal {
     if ($env:NO_COLOR) { return $false }
     # A redirected stdout is not a console and GetConsoleMode fails on a non-console handle, so the
-    # block below could only return $false anyway. The CLI and the desktop app both pipe us, so
-    # that is the path they are on.
+    # block below could only return $false anyway. Answer without Add-Type, which runs csc.exe and
+    # drops source in %TEMP%. The CLI and the desktop app both pipe us, so this is the path the
+    # compile was on.
     if ($script:StudioStdoutRedirected) { return $false }
-    if (-not (Test-StudioCanDefineNativeTypes)) { return $false }
     try {
-        if (-not ("StudioVTNative" -as [type])) {
-            $null = New-StudioEmittedNativeType -TypeName "StudioVTNative" -Imports @(
-                @{ Name = "GetStdHandle"; Library = "kernel32.dll"; Return = [IntPtr]
-                   Args = @([int])
-                   Ansi = $true },
-                @{ Name = "GetConsoleMode"; Library = "kernel32.dll"; Return = [bool]
-                   Args = @([IntPtr], [uint32].MakeByRefType())
-                   Ansi = $true
-                   Out = @(2) },
-                @{ Name = "SetConsoleMode"; Library = "kernel32.dll"; Return = [bool]
-                   Args = @([IntPtr], [uint32])
-                   Ansi = $true }
-            )
-        }
-        $h = [StudioVTNative]::GetStdHandle(-11)
+        Add-Type -Namespace StudioVT -Name Native -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int nStdHandle);
+[DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m);
+[DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m);
+'@ -ErrorAction Stop
+        $h = [StudioVT.Native]::GetStdHandle(-11)
         [uint32]$mode = 0
-        if (-not [StudioVTNative]::GetConsoleMode($h, [ref]$mode)) { return $false }
+        if (-not [StudioVT.Native]::GetConsoleMode($h, [ref]$mode)) { return $false }
         $mode = $mode -bor 0x0004
-        return [StudioVTNative]::SetConsoleMode($h, $mode)
+        return [StudioVT.Native]::SetConsoleMode($h, $mode)
     } catch {
         return $false
     }
