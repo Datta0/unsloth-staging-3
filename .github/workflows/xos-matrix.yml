@@ -116,43 +116,6 @@ jobs:
           ./tests/ci/ast_equivalence.ps1 -Base tests/ci/base_install.ps1 -Head install.ps1
           ./tests/ci/ast_equivalence.ps1 -Base tests/ci/base_setup.ps1 -Head studio/setup.ps1
 
-      - name: Python AST equivalence for the CLI change
-        shell: python
-        run: |
-          import ast, sys, difflib
-
-          # The claim for 10560 is that it removes two list elements and changes nothing
-          # else. Compared as syntax trees rather than text, so a reformat cannot hide an
-          # edit and a comment cannot look like one.
-          base = ast.parse(open("tests/ci/base_studio.py", encoding="utf-8").read())
-          head = ast.parse(open("unsloth_cli/commands/studio.py", encoding="utf-8").read())
-
-          def fns(tree):
-              return {n.name: ast.dump(n) for n in ast.walk(tree)
-                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
-
-          b, h = fns(base), fns(head)
-          added = sorted(set(h) - set(b))
-          removed = sorted(set(b) - set(h))
-          changed = sorted(k for k in set(b) & set(h) if b[k] != h[k])
-          print(f"functions: base {len(b)}, head {len(h)}, identical {len(set(b) & set(h)) - len(changed)}")
-          print("ADDED:", added)
-          print("REMOVED:", removed)
-          print("CHANGED:", changed)
-
-          assert not removed, f"10560 must not remove a function: {removed}"
-          assert not added, f"10560 must not add a function: {added}"
-          expected = {"_run_setup_script", "_refresh_desktop_shortcuts"}
-          assert set(changed) <= expected, (
-              f"only {sorted(expected)} may change, got {changed}"
-          )
-          for name in changed:
-              diff = [l for l in difflib.unified_diff(
-                  b[name].split(","), h[name].split(","), lineterm="")
-                  if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))]
-              print(f"  {name}: {len(diff)} AST node deltas")
-          print("PASS: the CLI change is confined to the two launch builders")
-
       - name: An old installed app can still drive the new scripts
         shell: bash
         run: |

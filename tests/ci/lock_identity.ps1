@@ -48,7 +48,17 @@ function Get-Name([string]$Path, [bool]$Refuse) {
     # purpose, so the two arms cannot share a session without one poisoning the other.
     $lines = @('$ErrorActionPreference = "Stop"', '$script:StudioStdoutRedirected = $true')
     $lines += ($chain | ForEach-Object { Src $_ })
-    if ($Refuse) { $lines += 'function Test-StudioCanDefineNativeTypes { return $false }' }
+    if ($Refuse) {
+        # Both levers, because the two scripts refuse in different places. The gate is
+        # 10540's and main's copy does not call it, so overriding only that left the
+        # control running the native rung twice and the guard below voided every case.
+        # The initializer exists in both and returning false from it IS the lexical rung.
+        $lines += 'function Test-StudioCanDefineNativeTypes { return $false }'
+        $lines += 'function Initialize-StudioFinalPathNativeType {'
+        $lines += '    $script:StudioFinalPathNativeState = $false'
+        $lines += '    return $false'
+        $lines += '}'
+    }
     # The arm has to PROVE which rung it took. Both arms agreeing is only evidence if they
     # really were different runs: if the refusal did not take, this measures one resolver
     # against itself and cannot fail.
