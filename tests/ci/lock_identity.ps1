@@ -30,12 +30,20 @@ function Get-Name([string]$Path, [bool]$Refuse) {
     $lines = @('$ErrorActionPreference = "Stop"', '$script:StudioStdoutRedirected = $true')
     $lines += ($chain | ForEach-Object { Src $_ })
     if ($Refuse) { $lines += 'function Test-StudioCanDefineNativeTypes { return $false }' }
+    # The arm has to PROVE which rung it took. Both arms agreeing is only evidence if they
+    # really were different runs: if the refusal did not take, this measures one resolver
+    # against itself and cannot fail.
     $lines += "Write-Output (Get-StudioInstallMutexName -Path '$Path')"
+    $lines += 'Write-Output "NATIVE:$($script:StudioFinalPathNativeState)"'
     $file = Join-Path $env:TEMP ("lockid_" + [guid]::NewGuid().ToString("N") + ".ps1")
     Set-Content -LiteralPath $file -Value ($lines -join "`n") -Encoding utf8
     try { $out = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $file 2>&1 }
     finally { Remove-Item -LiteralPath $file -ErrorAction SilentlyContinue }
-    return (($out | Where-Object { $_ -match "^Global\\" }) | Select-Object -First 1)
+    $native = (($out | Where-Object { $_ -match "^NATIVE:" }) | Select-Object -First 1)
+    return [pscustomobject]@{
+        Name   = (($out | Where-Object { $_ -match "^Global\\" }) | Select-Object -First 1)
+        Native = ("$native" -replace "^NATIVE:", "")
+    }
 }
 
 $root = Join-Path $env:TEMP ("lockid " + [guid]::NewGuid().ToString("N").Substring(0, 8))
@@ -58,17 +66,22 @@ if ($letter) {
 }
 
 $mismatch = 0
+$void = 0
 try {
     foreach ($case in $cases.Keys) {
         $native = Get-Name $cases[$case] $false
         $lexical = Get-Name $cases[$case] $true
-        $agree = ($native -eq $lexical)
-        Write-Host ("{0,-8} native={1}" -f $case, $native)
-        Write-Host ("{0,-8} lexical={1}  AGREE={2}" -f $case, $lexical, $agree)
+        $agree = ($native.Name -eq $lexical.Name)
+        Write-Host ("{0,-8} native   rung={1} name={2}" -f $case, $native.Native, $native.Name)
+        Write-Host ("{0,-8} lexical  rung={1} name={2}  AGREE={3}" -f $case, $lexical.Native, $lexical.Name, $agree)
+        if ($native.Native -ne "True" -or $lexical.Native -ne "False") {
+            Write-Host "VOID: $case did not run two different rungs (native=$($native.Native) lexical=$($lexical.Native))"
+            $void++
+        }
         # Repeat the native arm: the same input twice must give the same name, which is
         # the idempotency half of the question.
         $again = Get-Name $cases[$case] $false
-        if ($again -ne $native) { Write-Host "UNSTABLE: $case"; $mismatch++ }
+        if ($again.Name -ne $native.Name) { Write-Host "UNSTABLE: $case"; $mismatch++ }
         if (-not $agree) { $mismatch++ }
     }
 } finally {
@@ -77,5 +90,7 @@ try {
 }
 Write-Host "CASES: $($cases.Keys -join ',')"
 Write-Host "DISAGREEMENTS: $mismatch"
+Write-Host "VOID_CASES: $void"
+if ($void -gt 0) { throw "every case measured one resolver against itself; the refusal did not take" }
 # Reported, not thrown. A disagreement on an aliased path is a property the fallback has
 # always had; the number is what says whether this change widened it.
