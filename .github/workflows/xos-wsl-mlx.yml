@@ -57,7 +57,6 @@ jobs:
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet pytest pytest-asyncio pytest-timeout packaging pyyaml typer rich pydantic
           UNSLOTH_IS_PRESENT=1 UNSLOTH_COMPILE_DISABLE=1 python -m pytest \
-            unsloth_cli/tests/test_studio_runtime_gate_powershell.py \
             tests/studio/test_installer_av_shapes.py -q
 
   mlx:

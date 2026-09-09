@@ -69,8 +69,13 @@ jobs:
             tests/python/test_windows_installer_concurrency_guard.py \
             tests/python/test_windows_setup_output_encoding.py \
             tests/studio/test_workflow_guards_run_unfiltered.py \
-            unsloth_cli/tests/test_studio_runtime_gate_powershell.py \
             -q
+          # unsloth_cli/tests/test_studio_runtime_gate_powershell.py is deliberately NOT
+          # here. It imports unsloth_cli.commands.studio, whose transitive closure is torch,
+          # transformers, trl, datasets and wandb, so putting it in a six-OS matrix means
+          # installing the full stack six times to assert two argv strings. It runs in the
+          # org CI and locally instead. What this matrix is for is the checks below, which
+          # need no dependencies at all and are the same on every platform.
 
       - name: No compiler invocation survives anywhere in the installers
         shell: pwsh
