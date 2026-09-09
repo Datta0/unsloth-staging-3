@@ -1,0 +1,101 @@
+# The two environments the plain matrix cannot represent.
+#
+# WSL, because a user there runs the Linux path from a Windows host: sys.platform is "linux"
+# inside the guest, so the PowerShell installer never executes and the CLI takes its non
+# Windows branch. That is the claim, and it is worth executing rather than asserting.
+#
+# MLX, because macOS Apple Silicon takes a separate branch in unsloth/__init__.py that skips
+# _gpu_init entirely, and a change that runs before the platform check would surface there
+# first.
+name: "10540+10560 WSL and MLX"
+
+on:
+  push:
+    branches: [both-prs-xos]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  wsl:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    name: wsl-ubuntu-on-windows-host
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: Vampire/setup-wsl@v3
+        with:
+          distribution: Ubuntu-24.04
+          additional-packages: python3 python3-pip python3-venv git
+
+      - name: What platform does Python report inside the guest
+        shell: wsl-bash {0}
+        run: |
+          python3 - <<'PY'
+          import sys
+          print("sys.platform =", sys.platform)
+          # The whole WSL claim in one assertion: a Windows-gated change cannot reach a
+          # process that reports linux, and every guard in these PRs keys on win32.
+          assert sys.platform == "linux", sys.platform
+          print("PASS: WSL is linux to Python, so the Windows-only guards cannot fire")
+          PY
+
+      - name: The CLI suite inside WSL
+        shell: wsl-bash {0}
+        run: |
+          python3 -m venv /tmp/venv
+          . /tmp/venv/bin/activate
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet pytest pytest-asyncio pytest-timeout packaging
+          UNSLOTH_IS_PRESENT=1 UNSLOTH_COMPILE_DISABLE=1 python -m pytest \
+            unsloth_cli/tests/test_studio_runtime_gate_powershell.py \
+            tests/studio/test_installer_av_shapes.py -q
+
+  mlx:
+    runs-on: macos-15
+    timeout-minutes: 45
+    name: macos-mlx-branch
+    env:
+      UNSLOTH_IS_PRESENT: '1'
+      UNSLOTH_COMPILE_DISABLE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest pytest-asyncio pytest-timeout packaging
+          # Best effort: an Intel-built runner has no MLX, and the point of the leg is the
+          # branch, not the accelerator.
+          python -m pip install mlx || echo "mlx unavailable on this runner"
+
+      - name: The MLX branch is reachable and takes no Windows path
+        shell: python
+        run: |
+          import importlib.util, sys
+          print("sys.platform =", sys.platform)
+          assert sys.platform == "darwin", sys.platform
+          print("mlx installed:", importlib.util.find_spec("mlx") is not None)
+          # Nothing in either PR may be reachable here. Asserted against the source rather
+          # than by importing unsloth, which needs the full stack.
+          src = open("unsloth_cli/commands/studio.py", encoding="utf-8").read()
+          assert "-WindowStyle" not in src, "the removed flag came back"
+          print("PASS: macOS sees no Windows launch arguments")
+
+      - name: The CLI suite on macOS
+        run: |
+          python -m pytest unsloth_cli/tests/test_studio_runtime_gate_powershell.py \
+            tests/studio/test_installer_av_shapes.py -q
