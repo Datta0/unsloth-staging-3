@@ -605,7 +605,6 @@ export function useTauriUpdate(isExternalServer = false) {
         const bundle = await desktopUpdateBundleStatus();
         if (bundle.downloaded && sameUpdateVersion(bundle.version, version)) {
           setUpdateProgress(100);
-          patchPreparation({ shell: "done", shellProgress: 100 });
           return;
         }
         // A webview reload during a download leaves the native one running with no
