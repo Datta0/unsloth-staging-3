@@ -55,7 +55,7 @@ jobs:
           python3 -m venv /tmp/venv
           . /tmp/venv/bin/activate
           python -m pip install --quiet --upgrade pip
-          python -m pip install --quiet pytest pytest-asyncio pytest-timeout packaging
+          python -m pip install --quiet pytest pytest-asyncio pytest-timeout packaging pyyaml typer rich
           UNSLOTH_IS_PRESENT=1 UNSLOTH_COMPILE_DISABLE=1 python -m pytest \
             unsloth_cli/tests/test_studio_runtime_gate_powershell.py \
             tests/studio/test_installer_av_shapes.py -q
@@ -77,7 +77,7 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest pytest-asyncio pytest-timeout packaging
+          python -m pip install pytest pytest-asyncio pytest-timeout packaging pyyaml typer rich
           # Best effort: an Intel-built runner has no MLX, and the point of the leg is the
           # branch, not the accelerator.
           python -m pip install mlx || echo "mlx unavailable on this runner"
