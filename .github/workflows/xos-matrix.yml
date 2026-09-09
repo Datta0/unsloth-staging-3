@@ -58,7 +58,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pytest pytest-asyncio pytest-timeout packaging pyyaml typer rich pydantic
+          python -m pip install pytest pytest-asyncio pytest-timeout packaging pyyaml typer click rich pydantic
 
       - name: The suites both PRs touch
         shell: bash
