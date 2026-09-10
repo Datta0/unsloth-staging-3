@@ -33,6 +33,7 @@ import {
   useSettingsDialogStore,
   useShortcut,
 } from "@/features/settings";
+import { useLowDiskNotice } from "@/features/settings/hooks/use-low-disk-notice";
 import { useTrainingUnloadGuard } from "@/features/training";
 import { TransformersUpgradeDialog } from "@/features/transformers-upgrade";
 import { useSidebarPin } from "@/hooks/use-sidebar-pin";
@@ -151,6 +152,15 @@ const AudioPage = lazy(() =>
 
 function PersonalizationSyncMount() {
   usePersonalizationSync(hasAuthToken());
+  return null;
+}
+
+// A full disk is not a training problem, so the warning cannot live on the
+// training route: it belongs to whichever route the user happens to be on when
+// space runs out. Mounted here it subscribes once for the session, and stays
+// subscribed across navigation, instead of coming and going with /studio.
+function LowDiskNoticeMount() {
+  useLowDiskNotice();
   return null;
 }
 
@@ -544,6 +554,7 @@ function RootLayout() {
       <PersonalizationSyncMount />
       <ReloadSnapshotPrivacy />
       {!isAuthFlowRoute && <ChatSettingsHydrationMount />}
+      {!isAuthFlowRoute && <LowDiskNoticeMount />}
       {/* Opens itself when API traffic arrives; hides on the full monitor page. */}
       {!isAuthFlowRoute && <ApiMonitorOverlay />}
       <HfTokenWarningDialog />
