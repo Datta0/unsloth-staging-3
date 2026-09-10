@@ -6391,3 +6391,5 @@ fi
 
 # Every byte above is parsed before this line runs, which is the point.
 _unsloth_main "$@"
+
+# probe: staging path-filter check c
