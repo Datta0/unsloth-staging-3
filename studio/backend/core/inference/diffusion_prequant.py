@@ -489,10 +489,7 @@ def read_prequant_metadata(path: str) -> dict:
 # The fingerprint algorithm, in the block itself: the name moves with a payload order or hash change so two recipes are never compared under one name.
 FINGERPRINT_ALGO = "md5-packed-v1"
 
-# Which attributes of a torchao weight subclass carry the QUANTIZED BYTES, in a fixed order. Read off the installed
-# torchao's own ``tensor_data_names`` / ``optional_tensor_data_names`` (0.17), keyed by class NAME because the same
-# class is re-exported under several module paths. A listed value is descended into. An unlisted class is not hashed
-# AT ALL: this is a corruption tripwire, so it has to read as "not covered" instead of as "equal".
+# The attributes carrying a torchao weight's QUANTIZED BYTES, in a fixed order, read off torchao 0.17's own ``tensor_data_names`` and keyed by class NAME (the class is re-exported under several module paths). An unlisted class is not hashed at all: a corruption tripwire has to read as "not covered", never as "equal".
 _FINGERPRINT_PAYLOAD: dict = {
     "NVFP4Tensor": ("qdata", "scale", "per_tensor_scale"),
     "Float8Tensor": ("qdata", "scale"),
@@ -930,8 +927,7 @@ def load_prequantized_transformer(
 
         apply_activation_rotation(transformer, metadata, logger = logger)
 
-        # assign=True gave the module the checkpoint's own tensors; a second reference would keep every CPU copy
-        # alive across to(device), which on a unified-memory host doubles the transient peak.
+        # assign=True handed the module the checkpoint's tensors: a second reference keeps every CPU copy alive across to(device), doubling the transient peak on a unified-memory host.
         del state_dict
         del ckpt
 

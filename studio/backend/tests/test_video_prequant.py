@@ -1416,8 +1416,7 @@ def test_a_conventional_plan_drops_no_shard_the_load_will_not_seed(monkeypatch):
         _planned_denoiser_request(monkeypatch, wan, transformer_quant = "nvfp4", speed_mode = "off")
         is None
     )
-    # And the modular workflow, which honours an explicit scheme whatever the speed mode is, still
-    # asks about the raw request.
+    # And the modular workflow, which honours an explicit scheme whatever the speed mode is, still asks about the raw request.
     h3 = detect_video_family("MiniMaxAI/MiniMax-H3")
     assert h3 is not None and h3.modular_workflow
     assert (
@@ -1488,8 +1487,7 @@ def test_the_seeded_denoiser_repo_is_claimed_against_a_concurrent_delete(monkeyp
     monkeypatch.setattr(backend, "_video_planned_auto_denoiser_scheme", lambda *a, **k: "nvfp4")
     monkeypatch.setattr(backend, "_denoiser_prequant_verified", lambda *a, **k: True)
     monkeypatch.setattr(backend, "_run_load_h3_native", lambda **kwargs: None)
-    # Sampled from inside the build, which is where the seed opens the checkpoint: a claim published
-    # after that point cannot revoke a delete the guard already admitted.
+    # Sampled from inside the build, where the seed opens the checkpoint: a claim published after that point cannot revoke a delete the guard already admitted.
     claimed: list = []
     monkeypatch.setattr(
         backend, "load_pipeline", lambda **kwargs: claimed.extend(backend.loading_repo_ids())

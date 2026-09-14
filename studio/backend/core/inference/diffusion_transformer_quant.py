@@ -191,8 +191,7 @@ def apply_small_m_padding(
     return wrapped
 
 
-# NVFP4 PER-FAMILY zero-row guard list: torchao's NVFP4 dynamic-activation path reduces over the WHOLE input and
-# raises on numel() == 0, which HunyuanVideo-1.5 reaches on every default t2v render through the attention trim.
+# Zero-row guard per family: torchao's NVFP4 activation path reduces over the WHOLE input and raises on numel() == 0, which HunyuanVideo-1.5 reaches on every default t2v render through the attention trim.
 _HUNYUAN15_NVFP4_ZERO_ROW_TOKENS = ("image_embedder", "context_embedder_2")
 _NVFP4_FAMILY_ZERO_ROW_NAME_TOKENS: dict[str, tuple[str, ...]] = {
     "hunyuanvideo-1.5": _HUNYUAN15_NVFP4_ZERO_ROW_TOKENS,
@@ -254,8 +253,7 @@ def exclude_tokens_for_scheme(scheme: str, family: Optional[str] = None) -> tupl
     return ()
 
 
-# GEMM tiling floors per scheme, as the number every quantized Linear's in/out features must divide by. Public because
-# the runtime filter, the offline builder and the checkpoint validator must read the same number.
+# GEMM tiling floor per scheme, the divisor every quantized Linear's in/out features must meet. Public because the runtime filter, the offline builder and the checkpoint validator must read the same number.
 _SCHEME_DIVISIBLE: dict[str, int] = {TQ_FP8: 16, TQ_NVFP4: 16, TQ_MXFP8: 32}
 
 
