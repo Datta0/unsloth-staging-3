@@ -10154,12 +10154,8 @@ def test_generation_in_flight_never_builds_a_backend(fake_runtime, monkeypatch):
 
 
 def test_the_download_plan_resolves_the_same_nvfp4_rung_the_load_does(monkeypatch):
-    # The load-time selector asks with the base and a hosted-checkpoint probe, because a gated auto
-    # rung is offered only for the base its record covers. A planning selector that leaves either
-    # out answers a different scheme, and _uncached_prequant_repo is the guard that keeps an auto
-    # GGUF pick from fetching a second denoiser: it cleared a rung whose checkpoint was cached
-    # while the load went and pulled the NVFP4 one inline, past the plan's progress, disk-space and
-    # cancellation staging.
+    # The load-time selector asks with the base and a hosted-checkpoint probe, since a gated auto rung is offered only for the base its record covers, so a planning selector leaving either out answers a different scheme.
+    # _uncached_prequant_repo keeps an auto GGUF pick from fetching a second denoiser inline, past the plan's progress, disk-space and cancellation staging.
     from types import SimpleNamespace
 
     import core.inference.diffusion as dmod
@@ -10178,8 +10174,7 @@ def test_the_download_plan_resolves_the_same_nvfp4_rung_the_load_does(monkeypatc
         tq, "_scheme_supported", lambda scheme, device, unproven_ok = False: scheme != "fp8"
     )
     monkeypatch.setattr(dmod, "prequant_checkpoint_cached", lambda source, **kw: False)
-    # The gate record was measured on flashinfer, and the head stands only where that backend
-    # serves the device.
+    # The gate record was measured on flashinfer, and the head stands only where that backend serves the device.
     monkeypatch.setattr(ops, "select_nvfp4_backend", lambda device = None: "flashinfer")
 
     target = SimpleNamespace(device = "cuda", dtype = None)

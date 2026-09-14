@@ -39,9 +39,7 @@ PREQUANT_FORMAT = "unsloth_prequant_transformer_state_dict_v1"
 # hand-edited tag nor a builder that forgot one half can produce something that loads.
 PREQUANT_FORMAT_ROTATED = "unsloth_prequant_transformer_state_dict_v2"
 
-# v3 is v1 plus a PER-LAYER PRECISION POLICY: NVFP4 and fp8 weights side by side, chosen layer by layer. Its own tag,
-# because an older build would otherwise read such a file as a whole-model nvfp4 artifact and render precisions no gate
-# measured. Biconditional with the declaration: a v3 artifact MUST declare a policy and a v1/v2 one must NOT.
+# v3 is v1 plus a PER-LAYER PRECISION POLICY: NVFP4 and fp8 weights side by side, chosen layer by layer. Its own tag, because an older build would otherwise read such a file as a whole-model nvfp4 artifact and render precisions no gate measured. Biconditional with the declaration: a v3 artifact MUST declare a policy and a v1/v2 one must NOT.
 PREQUANT_FORMAT_POLICY = "unsloth_prequant_transformer_state_dict_v3"
 
 PREQUANT_FORMATS = (PREQUANT_FORMAT, PREQUANT_FORMAT_ROTATED, PREQUANT_FORMAT_POLICY)
@@ -173,8 +171,7 @@ _SCHEME_REQUIRED_GLOBALS: dict = {
             "torchao.quantization.quantize_.common.kernel_preference.KernelPreference",
         }
     ),
-    # The UNION with fp8: a v3 policy checkpoint holds Float8Tensor weights beside the NVFP4Tensor
-    # ones, and the nvfp4 names alone would trip on them as an UnpicklingError mid-load.
+    # The UNION with fp8: a v3 policy checkpoint holds Float8Tensor weights beside the NVFP4Tensor ones, and the nvfp4 names alone would trip on them as an UnpicklingError mid-load.
     "nvfp4": frozenset(
         {
             "torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor",
@@ -952,8 +949,7 @@ def load_prequantized_transformer(
 
         apply_activation_rotation(transformer, metadata, logger = logger)
 
-        # Gated on the scheme so that an int8 or fp8 artifact never pays for the flashinfer probe,
-        # whose first call can JIT a kernel.
+        # Gated on the scheme so that an int8 or fp8 artifact never pays for the flashinfer probe, whose first call can JIT a kernel.
         if scheme == "nvfp4":
             from .diffusion_nvfp4_linear import convert_nvfp4_backend
             from .diffusion_nvfp4_ops import select_nvfp4_backend
@@ -1164,8 +1160,7 @@ def _load_transformer_config(
     raise last  # type: ignore[misc]
 
 
-# By NAME: the class is re-exported under several module paths, and importing torchao here would pull it into a check
-# that runs before the load.
+# By NAME: the class is re-exported under several module paths, and importing torchao here would pull it into a check that runs before the load.
 _FLOAT8_TENSOR_CLASS = "Float8Tensor"
 
 

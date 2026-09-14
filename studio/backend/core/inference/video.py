@@ -911,8 +911,7 @@ def _video_auto_denoiser_scheme(
             requested,
             family = getattr(fam, "name", None),
             base_repo = base_repo,
-            # Same resolver as the whole-model check below, so the scheme auto picks is one this
-            # call has already proven is fully covered.
+            # Same resolver as the whole-model check below, so the scheme auto picks is one this call has already proven is fully covered.
             has_prequant = lambda candidate: (
                 denoiser_prequant_sources(fam, candidate, base_repo) is not None
             ),
@@ -6158,8 +6157,7 @@ class VideoBackend:
                         raise _VideoGenerationCancelled()
                     _tick(done)
 
-                # Driven off scheduler.step rather than the callback below, since only some
-                # families expose a callback and the step index has to be right for all of them.
+                # Driven off scheduler.step rather than the callback below, since only some families expose a callback and the step index has to be right for all of them.
                 from .diffusion_nvfp4_protect import protect_generation
 
                 protect_ctx = protect_generation(pipe, steps, logger = logger)

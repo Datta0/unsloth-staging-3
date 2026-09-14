@@ -2176,9 +2176,7 @@ def test_a_policy_checkpoint_is_validated_end_to_end():
 
 
 def test_the_fp8_invariants_cover_the_fp8_half_of_a_policy_checkpoint():
-    # A policy artifact is declared nvfp4 and is mostly Float8Tensor, so the per-row granularity and
-    # the activation floor decide whether ITS fp8 layers render or go black. Gating both on
-    # scheme == fp8 skipped every one of them.
+    # A policy artifact is declared nvfp4 and is mostly Float8Tensor, so the per-row granularity and the activation floor decide whether ITS fp8 layers render or go black. Gating both on scheme == fp8 skipped every one of them.
     logger = _Recorder()
     ckpt = {
         "format": pq.PREQUANT_FORMAT_POLICY,

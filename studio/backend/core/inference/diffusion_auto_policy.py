@@ -37,9 +37,7 @@ _QUANT_STEADY_FACTOR: dict[str, float] = {
     "nvfp4": 0.33,
 }
 
-# A policy artifact is mostly fp8 by weight, so it lands NEAR the fp8 factor rather than near 0.33,
-# and sizing it at 0.33 makes the planner keep a model resident that does not fit. Keyed on the
-# POLICY id, not the family: retuning the layer set changes the number.
+# A policy artifact is mostly fp8 by weight, so it lands NEAR the fp8 factor rather than near 0.33, and sizing it at 0.33 makes the planner keep a model resident that does not fit. Keyed on the POLICY id, not the family: retuning the layer set changes the number.
 _POLICY_STEADY_FACTOR: dict[str, float] = {
     "zimg_f8mod_toq34_v1": 0.52,
     "flux_mod_single_v1": 0.53,

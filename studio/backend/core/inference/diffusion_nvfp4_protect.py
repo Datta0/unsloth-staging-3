@@ -197,8 +197,7 @@ def protect_generation(
         yield ctl
         return
     if not ctl.capable_layers():
-        # Only NVFP4FlashInferLinear consults the controller: a torchao load runs W4A4 at every step
-        # whatever the schedule says, and must not be reported as protected.
+        # Only NVFP4FlashInferLinear consults the controller: a torchao load runs W4A4 at every step whatever the schedule says, and must not be reported as protected.
         if logger is not None:
             logger.warning(
                 "[nvfp4] protect schedule %r requested but no protect-capable NVFP4 layer is "
@@ -228,8 +227,7 @@ def protect_generation(
         ctl.advance()
         return out
 
-    # Restoring a bound class method by assignment would leave an instance attribute shadowing the
-    # class forever, so unwind by deleting unless there really was one before this wrap.
+    # Restoring a bound class method by assignment would leave an instance attribute shadowing the class forever, so unwind by deleting unless there really was one before this wrap.
     had_own = "step" in getattr(scheduler, "__dict__", {})
     scheduler.step = _step
     try:

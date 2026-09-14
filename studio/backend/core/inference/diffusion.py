@@ -1727,8 +1727,7 @@ class DiffusionBackend:
                 target,
                 getattr(fam, "name", None),
                 base_repo = base_repo,
-                # Same probe as the retry uses below, so the two cannot disagree about which
-                # rungs exist.
+                # Same probe as the retry uses below, so the two cannot disagree about which rungs exist.
                 has_prequant = lambda candidate: usable_prequant_source(
                     fam, candidate, path_override = path_override, base_repo = base_repo
                 )
@@ -4755,9 +4754,7 @@ class DiffusionBackend:
                 )
                 if transformer is not None:
                     if scheme == TQ_NVFP4:
-                        # Autotune off the request path. Only the M = 1 modulation shapes are
-                        # knowable here; the resolution-dependent ones are tuned in
-                        # ``GraphedForward``'s warm-up, which runs before any capture.
+                        # Autotune off the request path. Only the M = 1 modulation shapes are knowable here; the resolution-dependent ones are tuned in ``GraphedForward``'s warm-up, which runs before any capture.
                         from .diffusion_nvfp4_linear import nvfp4_prewarm
                         nvfp4_prewarm(transformer, (1,), logger = logger)
                     pipe = self._assemble_pipe(
@@ -6083,8 +6080,7 @@ class DiffusionBackend:
                 if "callback_on_step_end" in call_params:
                     kwargs["callback_on_step_end"] = _on_step
 
-                # The EFFECTIVE denoise steps: img2img at strength < 1 denoises a fraction of `steps`, and a negative
-                # index in the protect schedule has to land on a step the loop reaches.
+                # The EFFECTIVE denoise steps: img2img at strength < 1 denoises a fraction of `steps`, and a negative index in the protect schedule has to land on a step the loop reaches.
                 strength_applied = effective_request_strength(
                     strength,
                     init_pil is not None,
@@ -6152,8 +6148,7 @@ class DiffusionBackend:
                     # __call__, so a raised call leaves a residual the next forward trips over.
                     if state.transformer_cache:
                         self._reset_step_cache(state.pipe)
-                    # Armed per CHUNK, not per generate: a batch that splits runs one denoise loop each, starting
-                    # again at step 0. It counts scheduler.step, which a step cache does not skip.
+                    # Armed per CHUNK, not per generate: a batch that splits runs one denoise loop each, starting again at step 0. It counts scheduler.step, which a step cache does not skip.
                     protect_ctx = protect_generation(pipe, denoise_steps, logger = logger)
                     try:
                         # inference_mode is faster than no_grad and numerically identical here.
