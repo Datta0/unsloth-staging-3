@@ -6774,8 +6774,7 @@ class VideoBackend:
             diffusion_cuda_graph.uninstall_all(
                 getattr(getattr(state, "pipe", None), "_unsloth_cuda_graphs", ()) or ()
             )
-            # The PDL barrier is allocated under this model's allocator state and must not be
-            # inherited by the next model's capture.
+            # The PDL barrier belongs to this model's allocator state, never to the next capture.
             try:
                 from .diffusion_nvfp4_linear import reset_nvfp4_state
                 reset_nvfp4_state()

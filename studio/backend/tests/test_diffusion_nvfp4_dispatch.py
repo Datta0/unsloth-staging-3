@@ -222,8 +222,7 @@ def test_the_transpose_cache_is_bounded():
 
 
 def test_the_transpose_cache_releases_a_weight_that_was_collected():
-    """A load superseded between its prewarm and its commit returns without any reset, so the only
-    thing that can free its weights is the cache letting go of them on its own."""
+    """A superseded load never resets, so only the cache letting go can free its weights."""
     import gc
 
     weight = _Ptr(4096)
@@ -235,8 +234,7 @@ def test_the_transpose_cache_releases_a_weight_that_was_collected():
 
 
 def test_a_live_weight_survives_a_superseded_loads_collection():
-    """The point of the weakref keying: dropping the stale load must not cost the replacement its
-    own entries, which a blanket reset would."""
+    """Dropping the stale load keeps the replacement's entries, which a blanket reset would not."""
     import gc
 
     live = _Ptr(64)
@@ -281,8 +279,7 @@ def test_describe_reports_what_is_cached(monkeypatch):
 
 
 def test_a_quantiser_built_for_a_failed_verify_is_never_handed_out(monkeypatch):
-    """verify() builds the quantiser with force BEFORE it knows the answer, so a cache read ahead
-    of the gate handed the failed device the very quantiser its verify rejected."""
+    """A cache read ahead of the gate would hand a failed device the quantiser its verify rejected."""
     _fake_flashinfer(monkeypatch)
     monkeypatch.setattr(ops, "_device_index", lambda device: int(device))
     dispatch._QUANT_FN[0] = ("fn", True)
@@ -294,8 +291,7 @@ def test_a_quantiser_built_for_a_failed_verify_is_never_handed_out(monkeypatch):
 
 
 def test_the_unload_reset_also_forgets_the_preflight_that_ran_verify():
-    """verify() runs ONLY from inside the preflight, and the preflight is memoised per device: a
-    reset that keeps it leaves the next load on flashinfer with the cached dispatch off."""
+    """A reset that keeps the memoised preflight leaves the next load with the cached dispatch off."""
     from core.inference import diffusion_nvfp4_linear as nl
     try:
         ops._PREFLIGHT[0] = {"ok": True, "fast_dispatch": True}
@@ -312,8 +308,7 @@ def _block_after(source: str, marker: str, lines: int) -> str:
 
 
 def test_an_aborted_load_drops_the_caches_that_pin_the_failed_model():
-    """A load that reached nvfp4_prewarm and then failed leaves the transposed-weight cache holding
-    a view of every warmed weight, and a view is not something clear_gpu_cache() can free."""
+    """A failed prewarm leaves views of every warmed weight, which clear_gpu_cache() cannot free."""
     import inspect
 
     from core.inference.diffusion import DiffusionBackend
@@ -406,8 +401,7 @@ def test_the_preflight_unlocks_the_fast_dispatch_and_says_so():
 
 
 def test_a_collected_layer_takes_its_cached_weights_and_their_vram_with_it():
-    """The superseded-load case: the worker returns at its token check without ever reaching a
-    reset, so the cache has to release the dead layer by itself, VRAM included."""
+    """A worker that returns at its token check never resets: the cache frees the dead layer's VRAM."""
     torch = _cuda_or_skip()
     import gc
 

@@ -4087,7 +4087,7 @@ class DiffusionBackend:
                         # Drop the exception before clearing the cache: its traceback pins the dense transformer's
                         # VRAM.
                         del exc
-                        # The NVFP4 transposed-weight cache holds VIEWS of the failed transformer; clear_gpu_cache() cannot free what a view pins.
+                        # The NVFP4 transposed-weight cache holds VIEWS of the failed transformer, which clear_gpu_cache() cannot free.
                         try:
                             from .diffusion_nvfp4_linear import reset_nvfp4_state
                             reset_nvfp4_state()
@@ -6371,8 +6371,7 @@ class DiffusionBackend:
         # Before clear_gpu_cache(), or the graph pool stays reserved for the life of the process.
         cuda_graph.uninstall_all(state.cuda_graphs)
         gguf_compile.uninstall_all()
-        # The PDL barrier is allocated under this model's allocator state and must not be
-        # inherited by the next model's capture.
+        # The PDL barrier belongs to this model's allocator state, never to the next capture.
         try:
             from .diffusion_nvfp4_linear import reset_nvfp4_state
             reset_nvfp4_state()

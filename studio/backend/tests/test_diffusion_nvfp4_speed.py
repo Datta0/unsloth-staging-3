@@ -386,8 +386,7 @@ def test_the_barrier_is_allocated_once_per_device(stub_kernels):
 
 
 def test_the_barrier_fill_precedes_every_gemm(stub_kernels):
-    """A kernel MUST exist between the activation quantiser and the GEMM (PDL without
-    griddepcontrol)."""
+    """A kernel MUST exist between the activation quantiser and the GEMM (PDL, no griddepcontrol)."""
     for _ in range(3):
         _mm_once(1)
     order = [name for name, _ in stub_kernels.launches if name in ("zero_", "mm_fp4")]
@@ -597,8 +596,7 @@ def test_the_kernel_declines_a_shape_or_dtype_it_does_not_cover(monkeypatch):
 
 
 def test_the_kernel_declines_below_the_size_floor_and_above_int32(monkeypatch):
-    """Below the floor the launch costs more than the pass saves (1024x10240 measured 0.84x of
-    ``add_`` on B200); above int32 the flat offsets would wrap."""
+    """Below the floor the launch costs more than it saves (0.84x on B200); above int32 offsets wrap."""
     torch = pytest.importorskip("torch")
     from core.inference import diffusion_nvfp4_bias as fb
 

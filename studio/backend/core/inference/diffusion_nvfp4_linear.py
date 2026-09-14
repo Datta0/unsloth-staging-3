@@ -128,8 +128,7 @@ def nvfp4_linear_class():
                 )
                 out = F.linear(flat, weight)
             else:
-                # The guard stays under torch.compile (measured: zero graph breaks); without it a
-                # flashinfer launch can reach the card the process is not currently on.
+                # Survives torch.compile (zero graph breaks); without it a flashinfer launch can reach the wrong card.
                 with _device_guard(flat):
                     xq, x_sf = torch.ops.unsloth_nvfp4.quantize(flat, self.a_gsf)
                     out = torch.ops.unsloth_nvfp4.mm(

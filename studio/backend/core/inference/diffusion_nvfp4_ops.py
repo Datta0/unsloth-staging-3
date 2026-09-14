@@ -163,8 +163,7 @@ def _mm_impl(xq: Any, wq: Any, x_sf: Any, w_sf: Any, alpha: Any, n: int, backend
         else:
             out = torch.empty(m, n, device = xq.device, dtype = torch.bfloat16)
             _fire_barrier(xq.device)
-        # The cached dispatch: same tactic the AutoTuner would choose, minus the per-call runner
-        # rebuild. Anything unverified returns None and the public entry point runs.
+        # Same tactic the AutoTuner would choose, minus the per-call runner rebuild; unverified returns None.
         if dispatch.enabled(xq.device):
             wq_t, w_sf_t = dispatch.transposed(wq), dispatch.transposed(w_sf)
             plan = dispatch.gemm_plan(xq, wq_t, x_sf, w_sf_t, alpha, out, n, backend)
