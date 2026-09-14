@@ -449,8 +449,7 @@ class _CountedBytes(_Bytes):
 
 
 def test_a_class_whose_payload_slots_all_read_none_is_not_fingerprinted():
-    # A torchao release that keeps the class name and renames every payload attribute must read as
-    # uncovered, not as the md5 of an empty stream (the same digest for every weight).
+    # A torchao release that keeps the class name and renames every payload attribute must read as uncovered, not as the md5 of an empty stream (the same digest for every weight).
     from core.inference.diffusion_prequant import packed_weight_fingerprint
 
     renamed = Float8Tensor(b"q0")

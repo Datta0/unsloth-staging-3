@@ -580,8 +580,7 @@ def activation_scale_metadata(
     }
 
 
-# GPTQ scoring modes. "check" decides per layer on the OUTPUT error GPTQ optimises; "meta" decides on the Frobenius
-# WEIGHT error, which GPTQ raises by construction and which therefore admits nothing.
+# GPTQ scoring modes. "check" decides per layer on the OUTPUT error GPTQ optimises; "meta" on the Frobenius WEIGHT error, which GPTQ raises by construction and which therefore admits nothing.
 GPTQ_SCORE_MODES = ("check", "meta")
 
 

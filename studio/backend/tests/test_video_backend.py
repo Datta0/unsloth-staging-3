@@ -9142,8 +9142,7 @@ def test_a_seed_the_plan_declined_is_not_re_taken_by_the_load(fake_runtime, monk
     monkeypatch.setattr(video_mod, "dense_transformer_supported", lambda target: True)
     monkeypatch.setattr(video_mod, "quantize_transformer", lambda *a, **k: "nvfp4")
     calls, _modules = _stub_denoiser_seed(monkeypatch, plan_scheme = None)
-    # The load's own probe knows nothing of the offload decision the plan took, and this test card
-    # is roomy enough for it to answer yes.
+    # The load's own probe knows nothing of the offload decision the plan took, and this test card is roomy enough for it to answer yes.
     monkeypatch.setattr(video_mod, "_video_auto_denoiser_scheme", lambda fam, **kw: "nvfp4")
 
     backend = VideoBackend()
@@ -9242,8 +9241,7 @@ def test_the_download_plan_stages_both_experts_artifacts(monkeypatch):
         ),
     }
     monkeypatch.setattr(dq, "denoiser_prequant_sources", lambda fam, scheme, base: sources)
-    # The plan asks the LOAD's own seed question, which reads the device this pick would land on.
-    # Pinned here so the staging assertions below do not depend on the test host's card.
+    # The plan asks the LOAD's own seed question, so the device is pinned here and the staging assertions below do not depend on the test host's card.
     monkeypatch.setattr(video_mod, "_video_auto_denoiser_scheme", lambda fam, **kw: "nvfp4")
 
     plan = VideoBackend().download_plan(
