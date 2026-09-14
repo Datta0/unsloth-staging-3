@@ -54,6 +54,101 @@ _adamw_mod = _load_module(
 )
 make_q_galore_param_groups = _adamw_mod.make_q_galore_param_groups
 
+
+_BNB_OPTIMIZER_BACKEND = {}
+
+
+def requires_bnb_optimizer(device):
+    """Skip unless bitsandbytes can really run an optimizer step on ``device``.
+
+    ``bitsandbytes.supported_torch_devices`` is the wrong thing to ask. It does not exist
+    at all before 0.46.0, and from 0.46.0 through 0.49.x it already lists "cpu" even
+    though the CPU optimizer kernels only landed in 0.50.0. Gating on it therefore lets
+    these tests run, and fail, on 0.47.x and 0.49.x -- both of which pyproject.toml
+    allows (`bitsandbytes>=0.45.5,!=0.46.0,!=0.48.0`, no upper bound).
+
+    Observed on CPU with torch 2.10.0:
+        0.45.5  NameError: name 'str2optimizer32bit' is not defined
+        0.47.0  AttributeError: 'NoneType' object has no attribute 'shape'
+        0.49.2  AttributeError: 'NoneType' object has no attribute 'shape'
+        0.50.2  works
+
+    So run one step and find out. The probe drives bitsandbytes' own AdamW32bit rather
+    than QGaLoreAdamW8bit, so a genuine regression in the code under test still fails
+    the test instead of silently turning it into a skip.
+    """
+    available = _BNB_OPTIMIZER_BACKEND.get(device)
+    if available is None:
+        try:
+            import bitsandbytes
+
+            probe = nn.Parameter(torch.ones(2, device = device))
+            probe.grad = torch.zeros(2, device = device)
+            bitsandbytes.optim.AdamW32bit([probe], lr = 0.0).step()
+            available = True
+        except Exception:
+            available = False
+        _BNB_OPTIMIZER_BACKEND[device] = available
+    if not available:
+        pytest.skip(f"This bitsandbytes version cannot run an optimizer step on {device}")
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+@pytest.mark.parametrize("projected", [True, False])
+@pytest.mark.parametrize("initial_value", [0.0, 1.0])
+def test_default_optimizer_updates_match_adamw(projected, initial_value):
+    pytest.importorskip("bitsandbytes")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    requires_bnb_optimizer(device)
+    param = nn.Parameter(torch.full((2, 2), initial_value, device = device))
+    reference = nn.Parameter(param.detach().clone())
+    group = {"params": [param]}
+    if projected:
+        group.update(rank = 2, scale = 1.0, quant = False)
+    optimizer = _adamw_mod.QGaLoreAdamW8bit([group], lr = 0.1, weight_decay = 0.0)
+    reference_optimizer = torch.optim.AdamW([reference], lr = 0.1, weight_decay = 0.0)
+    # A diagonal gradient keeps full-rank projection aligned with the AdamW reference.
+    gradient = torch.diag(torch.tensor([2.0, 1.0], device = device))
+    for weight, opt in [(param, optimizer), (reference, reference_optimizer)]:
+        (weight * gradient).sum().backward()
+        opt.step()
+    torch.testing.assert_close(param, reference)
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+def test_legacy_bitsandbytes_options_are_forwarded_by_name(monkeypatch):
+    original_init = _adamw_mod.Optimizer2State.__init__
+    received = []
+
+    def legacy_init(
+        self,
+        *args,
+        percentile_clipping = 100,
+        block_wise = True,
+        **kwargs,
+    ):
+        received.append((percentile_clipping, block_wise))
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(_adamw_mod.Optimizer2State, "__init__", legacy_init)
+    _adamw_mod.QGaLoreAdamW8bit(
+        [nn.Parameter(torch.ones(2))],
+        percentile_clipping = 95,
+        block_wise = False,
+    )
+    assert received == [(95, False)]
+
+
+@pytest.mark.skipif(not _adamw_mod._HAS_BNB, reason = "bitsandbytes is required")
+@pytest.mark.parametrize("name,value", [("percentile_clipping", 95), ("block_wise", False)])
+def test_removed_bitsandbytes_options_are_rejected(name, value):
+    import inspect
+    if name in inspect.signature(_adamw_mod.Optimizer2State.__init__).parameters:
+        pytest.skip("This bitsandbytes version still supports the option")
+    with pytest.raises(ValueError, match = name):
+        _adamw_mod.QGaLoreAdamW8bit([nn.Parameter(torch.ones(2))], **{name: value})
+
+
 # ======================================================================
 # Projector tests
 # ======================================================================
