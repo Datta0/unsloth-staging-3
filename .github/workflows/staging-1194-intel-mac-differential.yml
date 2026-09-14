@@ -48,9 +48,19 @@ jobs:
         continue-on-error: true
         run: python -c "import unsloth_zoo; print('import ok')"
 
+      - name: Import the module the test actually needs
+        id: impc
+        continue-on-error: true
+        run: python -c "from unsloth_zoo.compiler import higher_precision_layernorms; print('compiler import ok')"
+
+      - name: Run the layernorm scope tests
+        id: tests
+        continue-on-error: true
+        run: python -m pytest tests/test_higher_precision_layernorm_scope.py -q -p no:cacheprovider
+
       - name: Verdict
         run: |
-          echo "side=${{ matrix.side }} import=${{ steps.imp.outcome }}"
+          echo "side=${{ matrix.side }} import=${{ steps.imp.outcome }} compiler=${{ steps.impc.outcome }} tests=${{ steps.tests.outcome }}"
           if [ "${{ steps.imp.outcome }}" != "success" ]; then
             echo "unsloth_zoo does not import on Intel macOS for this side."
           fi
