@@ -40,8 +40,7 @@ def family_inference_infos() -> list[dict[str, Any]]:
     for name, (transformer_gb, text_encoders_gb, vae_gb) in _FAMILY_BF16_GB.items():
         companions_gb = text_encoders_gb + vae_gb
         estimated = {"bf16": _round1(transformer_gb + companions_gb)}
-        # A policy artifact is mostly fp8 by weight, so the whole-model 0.33 would advertise a
-        # footprint gigabytes below what the load takes.
+        # A policy artifact is mostly fp8 by weight, so the whole-model 0.33 would advertise a footprint gigabytes below what the load takes.
         policy_factor = policy_steady_factor(name, bases.get(name.strip().lower()))
         for scheme, factor in _QUANT_STEADY_FACTOR.items():
             if scheme == "nvfp4" and policy_factor is not None:

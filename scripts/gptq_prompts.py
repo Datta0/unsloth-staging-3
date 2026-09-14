@@ -10,8 +10,7 @@ that suite so a test can assert the disjointness.
 
 from __future__ import annotations
 
-# Copied verbatim from ``prequant_accuracy_gate.PROMPT_SUITE``, not imported: that script is not
-# always beside this one, and a test compares the copy.
+# Copied verbatim from ``prequant_accuracy_gate.PROMPT_SUITE``, not imported: that script is not always beside this one, and a test compares the copy.
 GATE_SUITE_PROMPTS: tuple = (
     (
         "a photoreal close-up portrait of an older fisherman, weathered skin, sharp "

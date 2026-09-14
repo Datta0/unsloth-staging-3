@@ -265,8 +265,7 @@ DEFAULT_CALIB_PROMPTS = str(Path(__file__).resolve().parent / "gptq_prompts.py")
 DEFAULT_IMAGE_CALIB_GRID = "1024"
 DEFAULT_VIDEO_CALIB_GRID = "832x480x25"
 
-# Deliberately not the family's shipped schedule: a second moment and an amax converge over the
-# trajectory rather than over its length, and the shipped one is hours per artifact.
+# Deliberately not the family's shipped schedule: a second moment and an amax converge over the trajectory rather than over its length, and the shipped one is hours per artifact.
 DEFAULT_VIDEO_CALIB_STEPS = 20
 
 
@@ -581,8 +580,7 @@ def activation_scale_metadata(
     }
 
 
-# GPTQ scoring modes. "check" decides per layer on the OUTPUT error GPTQ optimises; "meta" decides on the Frobenius
-# WEIGHT error, which GPTQ raises by construction and which therefore admits nothing.
+# GPTQ scoring modes. "check" decides per layer on the OUTPUT error GPTQ optimises; "meta" on the Frobenius WEIGHT error, which GPTQ raises by construction and which therefore admits nothing.
 GPTQ_SCORE_MODES = ("check", "meta")
 
 
@@ -1216,8 +1214,7 @@ def main(argv = None) -> int:
         require_divisible = require_divisible,
     )
 
-    # Resolved BEFORE anything touches the weights: its count assertions turn a rename into a
-    # refused build rather than a differently-quantised artifact.
+    # Resolved BEFORE anything touches the weights: its count assertions turn a rename into a refused build rather than a differently-quantised artifact.
     assignment: dict = {}
     if policy is not None:
         from core.inference.diffusion_nvfp4_policy import (
@@ -1235,8 +1232,7 @@ def main(argv = None) -> int:
             flush = True,
         )
 
-    # REPLAYED GPTQ, before the calibration below and quantize_: only the 4-bit operand may be
-    # corrected, and an activation scale has to describe the weights the artifact SHIPS.
+    # REPLAYED GPTQ, before the calibration below and quantize_: only the 4-bit operand may be corrected, and an activation scale has to describe the weights the artifact SHIPS.
     gptq_plan: Optional[dict] = None
     gptq_pass: dict = {}
     gptq_where: dict = {}
@@ -1414,8 +1410,7 @@ def main(argv = None) -> int:
             height = calib_height,
             num_frames = calib_frames,
             guidance_via_guider = bool(getattr(fam, "guidance_via_guider", False)),
-            # Left unset: WanPipeline defaults the low-noise expert's guidance to the high-noise
-            # one's, which IS this family's default.
+            # Left unset: WanPipeline defaults the low-noise expert's guidance to the high-noise one's, which IS this family's default.
             cfg2_kwarg = None,
             seed = args.calib_seed,
             **kwargs,

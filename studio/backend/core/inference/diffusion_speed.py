@@ -427,16 +427,11 @@ def _denoiser_dits(pipe: Any) -> list:
     return dits
 
 
-# Repeated blocks measured to make inductor raise CantSplit under dynamic = True: a block that
-# concatenates the text and image streams gets two separate dynamic symbols, and inductor's Mod
-# never cancels an Add over an Add, so the split it needs is unprovable. ``dynamic = False`` is the
-# only escape (mark_static is overridden, and ``dynamic = None`` crashes on the second shape).
-# MEASURED, not inferred: the merge is necessary but NOT sufficient, so nothing joins this set on
-# code reading alone.
+# Repeated blocks MEASURED to make inductor raise CantSplit under dynamic = True: concatenating the text and image streams gives two dynamic symbols and inductor's Mod never cancels an Add over an Add, so the split is unprovable. ``dynamic = False`` is the only escape (mark_static is overridden, ``dynamic = None`` crashes on the second shape).
+# Stream merging is necessary but NOT sufficient, so nothing joins this set on code reading alone.
 _STREAM_MERGING_BLOCKS: frozenset[str] = frozenset({"FluxSingleTransformerBlock"})
 
-# The same cat matched on source. OFF by default because it over-flags: the escape hatch for a new
-# family that crashes before its class can be named above.
+# The same cat matched on source. OFF by default because it over-flags: the escape hatch for a new family that crashes before its class can be named above.
 _STREAM_MERGE_DETECT_ENV = "UNSLOTH_STATIC_STREAM_MERGE_DETECT"
 _STREAM_MERGE_SOURCE = re.compile(
     r"torch\.cat\(\s*\[\s*(?:encoder_hidden_states\s*,\s*hidden_states"

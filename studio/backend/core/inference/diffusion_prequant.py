@@ -39,9 +39,7 @@ PREQUANT_FORMAT = "unsloth_prequant_transformer_state_dict_v1"
 # hand-edited tag nor a builder that forgot one half can produce something that loads.
 PREQUANT_FORMAT_ROTATED = "unsloth_prequant_transformer_state_dict_v2"
 
-# v3 is v1 plus a PER-LAYER PRECISION POLICY: NVFP4 and fp8 weights side by side, chosen layer by layer. Its own tag,
-# because an older build would otherwise read such a file as a whole-model nvfp4 artifact and render precisions no gate
-# measured. Biconditional with the declaration: a v3 artifact MUST declare a policy and a v1/v2 one must NOT.
+# v3 is v1 plus a PER-LAYER PRECISION POLICY: NVFP4 and fp8 weights side by side, chosen layer by layer. Its own tag, because an older build would otherwise read such a file as a whole-model nvfp4 artifact and render precisions no gate measured. Biconditional with the declaration: a v3 artifact MUST declare a policy and a v1/v2 one must NOT.
 PREQUANT_FORMAT_POLICY = "unsloth_prequant_transformer_state_dict_v3"
 
 PREQUANT_FORMATS = (PREQUANT_FORMAT, PREQUANT_FORMAT_ROTATED, PREQUANT_FORMAT_POLICY)
@@ -173,8 +171,7 @@ _SCHEME_REQUIRED_GLOBALS: dict = {
             "torchao.quantization.quantize_.common.kernel_preference.KernelPreference",
         }
     ),
-    # The UNION with fp8: a v3 policy checkpoint holds Float8Tensor weights beside the NVFP4Tensor
-    # ones, and the nvfp4 names alone would trip on them as an UnpicklingError mid-load.
+    # The UNION with fp8: a v3 policy checkpoint holds Float8Tensor weights beside the NVFP4Tensor ones, and the nvfp4 names alone would trip on them as an UnpicklingError mid-load.
     "nvfp4": frozenset(
         {
             "torchao.prototype.mx_formats.nvfp4_tensor.NVFP4Tensor",
@@ -511,10 +508,7 @@ def read_prequant_metadata(path: str) -> dict:
 # The fingerprint algorithm, in the block itself: the name moves with a payload order or hash change so two recipes are never compared under one name.
 FINGERPRINT_ALGO = "md5-packed-v1"
 
-# Which attributes of a torchao weight subclass carry the QUANTIZED BYTES, in a fixed order. Read off the installed
-# torchao's own ``tensor_data_names`` / ``optional_tensor_data_names`` (0.17), keyed by class NAME because the same
-# class is re-exported under several module paths. A listed value is descended into. An unlisted class is not hashed
-# AT ALL: this is a corruption tripwire, so it has to read as "not covered" instead of as "equal".
+# The attributes carrying a torchao weight's QUANTIZED BYTES, in a fixed order, read off torchao 0.17's own ``tensor_data_names`` and keyed by class NAME (the class is re-exported under several module paths). An unlisted class is not hashed at all: a corruption tripwire has to read as "not covered", never as "equal".
 _FINGERPRINT_PAYLOAD: dict = {
     "NVFP4Tensor": ("qdata", "scale", "per_tensor_scale"),
     "Float8Tensor": ("qdata", "scale"),
@@ -952,16 +946,14 @@ def load_prequantized_transformer(
 
         apply_activation_rotation(transformer, metadata, logger = logger)
 
-        # Gated on the scheme so that an int8 or fp8 artifact never pays for the flashinfer probe,
-        # whose first call can JIT a kernel.
+        # Gated on the scheme so that an int8 or fp8 artifact never pays for the flashinfer probe, whose first call can JIT a kernel.
         if scheme == "nvfp4":
             from .diffusion_nvfp4_linear import convert_nvfp4_backend
             from .diffusion_nvfp4_ops import select_nvfp4_backend
             convert_nvfp4_backend(
                 transformer, metadata, select_nvfp4_backend(device), logger = logger
             )
-        # assign=True gave the module the checkpoint's own tensors; a second reference would keep every CPU copy
-        # alive across to(device), which on a unified-memory host doubles the transient peak.
+        # assign=True handed the module the checkpoint's tensors: a second reference keeps every CPU copy alive across to(device), doubling the transient peak on a unified-memory host.
         del state_dict
         del ckpt
 
@@ -1164,8 +1156,7 @@ def _load_transformer_config(
     raise last  # type: ignore[misc]
 
 
-# By NAME: the class is re-exported under several module paths, and importing torchao here would pull it into a check
-# that runs before the load.
+# By NAME: the class is re-exported under several module paths, and importing torchao here would pull it into a check that runs before the load.
 _FLOAT8_TENSOR_CLASS = "Float8Tensor"
 
 

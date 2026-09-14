@@ -16,8 +16,7 @@ from typing import Any, Mapping, Optional, Sequence
 FP4_MAX = 6.0
 FP8_MAX = 448.0
 
-# Damping ladder for the Cholesky, smallest first: the Hessian is positive SEMI-definite at best,
-# so the answer to a failed factorisation is more damping, not another quantiser.
+# Damping ladder for the Cholesky, smallest first: the Hessian is positive SEMI-definite at best, so the answer to a failed factorisation is more damping, not another quantiser.
 DAMP_LADDER: tuple = (0.01, 0.05, 0.1, 0.5, 1.0)
 
 

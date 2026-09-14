@@ -309,8 +309,7 @@ def policy_metadata_error(metadata: Any) -> Optional[str]:
     return None
 
 
-# By class NAME: torchao's subclasses are re-exported under several module paths and move between
-# releases, and asking for the name keeps this module torch-lazy.
+# By class NAME: torchao's subclasses are re-exported under several module paths and move between releases, and asking for the name keeps this module torch-lazy.
 _EXPECTED_WEIGHT_CLASS = {
     PRECISION_NVFP4: "NVFP4Tensor",
     PRECISION_FP8: "Float8Tensor",

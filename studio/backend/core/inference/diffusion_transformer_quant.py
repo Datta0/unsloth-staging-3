@@ -191,8 +191,7 @@ def apply_small_m_padding(
     return wrapped
 
 
-# NVFP4 PER-FAMILY zero-row guard list: torchao's NVFP4 dynamic-activation path reduces over the WHOLE input and
-# raises on numel() == 0, which HunyuanVideo-1.5 reaches on every default t2v render through the attention trim.
+# Zero-row guard per family: torchao's NVFP4 activation path reduces over the WHOLE input and raises on numel() == 0, which HunyuanVideo-1.5 reaches on every default t2v render through the attention trim.
 _HUNYUAN15_NVFP4_ZERO_ROW_TOKENS = ("image_embedder", "context_embedder_2")
 _NVFP4_FAMILY_ZERO_ROW_NAME_TOKENS: dict[str, tuple[str, ...]] = {
     "hunyuanvideo-1.5": _HUNYUAN15_NVFP4_ZERO_ROW_TOKENS,
@@ -254,8 +253,7 @@ def exclude_tokens_for_scheme(scheme: str, family: Optional[str] = None) -> tupl
     return ()
 
 
-# GEMM tiling floors per scheme, as the number every quantized Linear's in/out features must divide by. Public because
-# the runtime filter, the offline builder and the checkpoint validator must read the same number.
+# GEMM tiling floor per scheme, the divisor every quantized Linear's in/out features must meet. Public because the runtime filter, the offline builder and the checkpoint validator must read the same number.
 _SCHEME_DIVISIBLE: dict[str, int] = {TQ_FP8: 16, TQ_NVFP4: 16, TQ_MXFP8: 32}
 
 
@@ -265,9 +263,7 @@ def divisible_for_scheme(scheme: str) -> int:
 
 
 # Per-arch preference for ``auto``, best first. On Blackwell fp8 leads: on B200 plain fp8 dynamic is faster AND more
-# accurate at DiT shapes, while mxfp8 block scaling only adds overhead. nvfp4 stays OUT of this arch-wide table and
-# reaches auto only through ``_FAMILY_AUTO_PREFER``: a tier cannot express "only where a per-layer policy was measured
-# and its checkpoint gated", which is the only form in which nvfp4 is worth offering.
+# accurate at DiT shapes, while mxfp8 block scaling only adds overhead. nvfp4 stays OUT of this arch-wide table and reaches auto only through ``_FAMILY_AUTO_PREFER``: a tier cannot express "only where a per-layer policy was measured and its checkpoint gated", the only form in which nvfp4 is worth offering.
 # Consumer / workstation GPUs move int8 first: they halve fp8/fp16 FP32-accumulate.
 _AUTO_LADDER: tuple[tuple[tuple[int, int], tuple[str, ...]], ...] = (
     (
@@ -317,8 +313,7 @@ class _AutoPrefer:
     backend: Optional[str] = None
 
 
-# Keys are lowercased family names, so the 480p and 720p HunyuanVideo-1.5 tiers are separate rows.
-# The three image rows are gated and inert as shipped; nvfp4 sits below fp8 in them (memory lever, not speed).
+# Keys are lowercased family names, so the 480p and 720p HunyuanVideo-1.5 tiers are separate rows. The three image rows are gated and inert as shipped; nvfp4 sits below fp8 in them (memory lever, not speed).
 _FAMILY_AUTO_PREFER: dict[str, _AutoPrefer] = {
     "z-image": _AutoPrefer(
         floor = (10, 0), schemes = (TQ_FP8, TQ_NVFP4, TQ_MXFP8, TQ_INT8), gated = True
@@ -400,8 +395,7 @@ def _family_denied(
     return True
 
 
-# Training is denied nvfp4 for EVERY family as a rule, not as rows: the evidence behind nvfp4 is an
-# inference gate, and a LoRA over 4-bit frozen linears is a convergence question nobody has run.
+# Training is denied nvfp4 for EVERY family as a rule, not as rows: the evidence behind nvfp4 is an inference gate, and a LoRA over 4-bit frozen linears is a convergence question nobody has run.
 _TRAIN_DENY_NVFP4_REASON = (
     "nvfp4 is inference-only: the accuracy gate behind it measures a frozen forward at a "
     "per-layer policy, and no training run has been measured on 4-bit frozen linears"
@@ -451,8 +445,7 @@ def explain_unusable_scheme(
     the last is what the message used to say."""
     if family_denies_scheme(family, scheme, base_repo):
         if scheme == TQ_NVFP4:
-            # Naming the record separates "measured to break this DiT" from "nobody has measured
-            # THIS checkpoint yet", and only the second is fixable by running something.
+            # Naming the record separates "measured to break this DiT" from "nobody has measured THIS checkpoint yet", and only the second is fixable by running something.
             return (
                 f"'{scheme}' is ruled out for family '{family}'"
                 + (f" on base '{base_repo}'" if base_repo else "")
@@ -770,14 +763,12 @@ def _auto_scheme_order(
     head: tuple[str, ...] = ()
     if prefer is not None and cap >= prefer.floor:
         if prefer.consumer_ok or not _is_consumer_gpu(device):
-            # Without a record the row is untested, and a record measured on one NVFP4 backend says
-            # nothing about the other.
+            # Without a record the row is untested, and a record measured on one NVFP4 backend says nothing about the other.
             if not prefer.gated or (
                 _nvfp4_gate_passed(family, base_repo)
                 and _nvfp4_gate_backend_ok(family, base_repo, device)
             ):
-                # The same bytes reverse the ordering through the other backend, so the head
-                # stands only where the measured one serves this device.
+                # The same bytes reverse the ordering through the other backend, so the head stands only where the measured one serves this device.
                 if prefer.backend is None or _nvfp4_backend_is(device, prefer.backend):
                     head = prefer.schemes
     order: list[str] = []
@@ -1402,8 +1393,7 @@ def quantize_transformer(
             from .diffusion_nvfp4_policy import quantize_with_policy, resolve_policy
             policy = resolve_policy(family, base_repo)
         if policy is not None:
-            # Fails closed: ``PolicyMismatch`` lands in the except below and drops to GGUF rather
-            # than shipping precisions nothing measured.
+            # Fails closed: ``PolicyMismatch`` lands in the except below and drops to GGUF rather than shipping precisions nothing measured.
             quantize_with_policy(
                 transformer,
                 policy,

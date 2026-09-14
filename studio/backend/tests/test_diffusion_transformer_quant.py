@@ -2224,8 +2224,7 @@ def _gate_row(family, base_repo, policy_id, **overrides):
         "policy_version": 1,
         "checkpoint_sha256": "b" * 64,
         "all_pass": True,
-        # Every checked-in record was measured here; the gated head only stands on the backend
-        # its record names.
+        # Every checked-in record was measured here; the gated head only stands on the backend its record names.
         "backend": "flashinfer",
     }
     row.update(overrides)

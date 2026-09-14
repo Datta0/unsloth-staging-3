@@ -120,8 +120,7 @@ def global_scale(t: Any):
     return (FP4_MAX * FP8_MAX / t.float().abs().amax().clamp(min = 1e-8)).reshape(1).to(t.device)
 
 
-# Exposed as plain functions as well as through ``torch.ops`` so that a test can assert the call
-# ORDER inside them, which is what the barrier below rests on.
+# Exposed as plain functions as well as through ``torch.ops`` so that a test can assert the call ORDER inside them, which is what the barrier below rests on.
 
 
 def _quantize_impl(x: Any, global_sf: Any):
@@ -393,8 +392,7 @@ def nvfp4_preflight(device: Any = None, *, refresh: bool = False) -> dict:
     except Exception as exc:  # noqa: BLE001 - every failure mode here means "use torchao"
         rec["reason"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         if _transient_preflight_failure(exc):
-            # Not memoised: the probe runs during AUTO planning while the model the arbiter is about
-            # to evict still owns the card, so an allocation failure says "not now", not "not here".
+            # Not memoised: the probe runs during AUTO planning while the model the arbiter is about to evict still owns the card, so an allocation failure says "not now", not "not here".
             return dict(rec)
 
     with _PREFLIGHT_LOCK:

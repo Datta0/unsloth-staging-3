@@ -364,8 +364,7 @@ class GraphedForward:
             if self.protect_keyed is None:
                 self.protect_keyed = _protect_keyed(self.module)
                 if self.protect_keyed:
-                    # Arming the lever splits every input shape into two calls, so the same shapes
-                    # need twice the graphs or half of them fall out of the cap and run eager.
+                    # Arming the lever splits every input shape into two calls, so the same shapes need twice the graphs or half of them fall out of the cap and run eager.
                     self.max_graphs *= 2
                     if self.logger is not None:
                         self.logger.info(
@@ -375,8 +374,7 @@ class GraphedForward:
                             self.max_graphs,
                         )
             if self.protect_keyed:
-                # One graph per branch: a graph recorded at a W4A4 step and replayed at a W4A16
-                # one would report the lever as measured while it never fired.
+                # One graph per branch: a graph recorded at a W4A4 step and replayed at a W4A16 one would report the lever as measured while it never fired.
                 key = key + protect_graph_key()
             entry = self.cache.get(key)
         except Exception:  # noqa: BLE001 - an unhashable tree is simply not capturable
@@ -473,8 +471,7 @@ class GraphedForward:
         static_args, static_kwargs = _rebuild(entry.in_spec, entry.static)
 
         if nvfp4_layers:
-            # BEFORE the warm-up and so before the capture: the autotuner's candidate launches
-            # would be recorded rather than measured, baking in the default tactic.
+            # BEFORE the warm-up and so before the capture: the autotuner's candidate launches would be recorded rather than measured, baking in the default tactic.
             from .diffusion_nvfp4_linear import nvfp4_prewarm
             nvfp4_prewarm(self.module, _prewarm_token_counts(live), logger = self.logger)
 

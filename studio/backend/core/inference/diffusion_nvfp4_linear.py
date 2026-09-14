@@ -30,8 +30,7 @@ ACT_SCALES_KEY = "act_global_scales"
 POLICY_KEY = "nvfp4_policy"
 POLICY_BAKED_KEY = "activation_scales_baked"
 
-# Shared across ALL instances: a per-module cache would pay the profiling pass once per layer for
-# a tactic FlashInfer already caches per shape.
+# Shared across ALL instances: a per-module cache would pay the profiling pass once per layer for a tactic FlashInfer already caches per shape.
 _TUNED_SHAPES: set = set()
 
 
@@ -86,15 +85,13 @@ def nvfp4_linear_class():
             self.in_features = int(in_features)
             self.out_features = int(out_features)
             self.backend = str(backend)
-            # Defaults to False so a calibrating path reads as unbaked: a capture would freeze a
-            # scale that is still moving.
+            # Defaults to False so a calibrating path reads as unbaked: a capture would freeze a scale that is still moving.
             self.activation_scales_baked = bool(activation_scales_baked)
             self.register_buffer("wq", wq)
             self.register_buffer("w_sf", w_sf)
             self.register_buffer("alpha", alpha)
             self.register_buffer("a_gsf", a_gsf)
-            # A stored buffer rather than ``alpha * a_gsf``, which reconstructs it only to within
-            # a rounding: the protected step must read the weight the GEMM reads, bit for bit.
+            # A stored buffer rather than ``alpha * a_gsf``, which reconstructs it only to within a rounding: the protected step must read the weight the GEMM reads, bit for bit.
             self.register_buffer(
                 "w_scale",
                 (alpha * a_gsf) if w_scale is None else w_scale,
@@ -107,20 +104,16 @@ def nvfp4_linear_class():
         def forward(self, x):
             shape = x.shape
             flat = x.reshape(-1, self.in_features)
-            # FlashInfer's ``fp4_quantize`` raises on fp32 input while torchao's path accepts it,
-            # and Wan2.2's fp32 time embedder feeds exactly that into a quantized layer. Returning
-            # the caller's own dtype keeps nn.Linear's contract; both casts are no-ops at bf16.
+            # FlashInfer's ``fp4_quantize`` raises on fp32 input while torchao's path accepts it, and Wan2.2's fp32 time embedder feeds exactly that into a quantized layer. Returning the caller's own dtype keeps nn.Linear's contract; both casts are no-ops at bf16.
             out_dtype = flat.dtype
             if out_dtype not in (torch.bfloat16, torch.float16):
                 flat = flat.to(torch.bfloat16)
             if flat.shape[0] == 0:
-                # torchao's nvfp4 activation path raises on numel() == 0, and an attention trim
-                # can hand a quantized Linear an empty batch. A shape check costs no synchronize.
+                # torchao's nvfp4 activation path raises on numel() == 0, and an attention trim can hand a quantized Linear an empty batch. A shape check costs no synchronize.
                 return flat.new_zeros((0, self.out_features), dtype = out_dtype).reshape(
                     *shape[:-1], self.out_features
                 )
-            # ``armed`` is fixed for the life of the load, so an unarmed load never guards on
-            # ``protected`` and compiles exactly the forward that shipped.
+            # ``armed`` is fixed for the life of the load, so an unarmed load never guards on ``protected`` and compiles exactly the forward that shipped.
             if self.protect.armed and self.protect.protected:
                 # W4A16 on the SAME bytes, decoded for this call only. No flashinfer kernel here.
                 weight = dequantize_nvfp4_weight(

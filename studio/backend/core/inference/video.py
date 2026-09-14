@@ -911,8 +911,7 @@ def _video_auto_denoiser_scheme(
             requested,
             family = getattr(fam, "name", None),
             base_repo = base_repo,
-            # Same resolver as the whole-model check below, so the scheme auto picks is one this
-            # call has already proven is fully covered.
+            # Same resolver as the whole-model check below, so the scheme auto picks is one this call has already proven is fully covered.
             has_prequant = lambda candidate: (
                 denoiser_prequant_sources(fam, candidate, base_repo) is not None
             ),
@@ -931,8 +930,7 @@ def _video_auto_denoiser_scheme(
         return None
 
 
-# The planner DECIDED against the seed (distinct from never having run): a load whose pull kept the dense shards on
-# this decline must not re-take the decision against post-teardown capacity and fetch the artifact inline.
+# The planner DECIDED against the seed (not the same as never having run): a load whose pull kept the dense shards on this decline must not re-take the decision against post-teardown capacity.
 DENOISER_SEED_DECLINED = "__declined__"
 
 
@@ -1653,9 +1651,7 @@ class VideoBackend:
             video_seed_declined = video_auto_denoiser == DENOISER_SEED_DECLINED
             if video_seed_declined:
                 video_auto_denoiser = None
-            # A conventional load seeds only what _video_auto_denoiser_scheme returns (None under speed_mode="off" even
-            # for an explicit scheme); the raw request would drop dense shards the load then tops up inline, outside the
-            # plan's progress, cancel and disk preflight. The modular path honours the raw request, so it keeps it.
+            # A conventional load seeds only what _video_auto_denoiser_scheme returns (None under speed_mode="off"), so the raw request would drop dense shards the load tops up inline, outside progress, cancel and the disk preflight. The modular path honours the raw request, so it keeps it.
             conventional_denoiser = kind == "pipeline" and not getattr(
                 fam, "modular_workflow", None
             )
@@ -1721,8 +1717,7 @@ class VideoBackend:
                             H3_TE_QUANT_REPO,
                             H3_LEGACY_TE_QUANT_REPO,
                         )
-                    # The seeded denoiser comes from a third repo too; this branch drops the dense DiT shards, so a
-                    # delete admitted mid-fetch would leave the load with no denoiser at all.
+                    # This branch drops the dense DiT shards, so a delete admitted mid-fetch over the seeded denoiser's own repo would leave the load with no denoiser at all.
                     if skip_transformer_weights:
                         claimed = self._denoiser_prequant_repo_ids(
                             fam,
@@ -3173,8 +3168,7 @@ class VideoBackend:
         if video_planned == DENOISER_SEED_DECLINED:
             video_planned = None
         if kind == "pipeline" and not getattr(fam, "modular_workflow", None):
-            # The planned scheme IS the conventional seed decision (None under speed_mode="off" even for an explicit
-            # request), so a raw-request fallback would stage an artifact and drop shards the load then opens neither of.
+            # The planned scheme IS the conventional seed decision, so a raw-request fallback would stage an artifact and drop shards the load then opens neither of.
             transformer_quant = video_planned
         else:
             transformer_quant = video_planned or transformer_quant
@@ -6164,8 +6158,7 @@ class VideoBackend:
                         raise _VideoGenerationCancelled()
                     _tick(done)
 
-                # Driven off scheduler.step rather than the callback below, since only some
-                # families expose a callback and the step index has to be right for all of them.
+                # Driven off scheduler.step rather than the callback below, since only some families expose a callback and the step index has to be right for all of them.
                 from .diffusion_nvfp4_protect import protect_generation
 
                 protect_ctx = protect_generation(pipe, steps, logger = logger)

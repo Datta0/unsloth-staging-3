@@ -354,8 +354,7 @@ def test_a_remote_base_may_not_be_published_under_another_repos_identity(monkeyp
     build = _script()
     saved = _stub_build_stack(monkeypatch, _fake_state_dict())
     out = tmp_path / "build.pt"
-    # 480p weights, 720p identity: same shapes, same prequant repo, and the 720p family declares
-    # its own filename, so nothing after this point can tell the two apart.
+    # 480p weights, 720p identity: same shapes, same prequant repo, and the 720p family declares its own filename, so nothing after this point can tell the two apart.
     code = build.main(
         [
             "--base",
@@ -399,8 +398,7 @@ def test_a_remote_base_may_not_be_published_under_another_repos_identity(monkeyp
     assert code == 0
     assert saved["ckpt"]["metadata"]["base_model_id"] == "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
     assert saved["from_pretrained"]["base"] == str(local)
-    # A remote --base the loader would call the same model keeps working, and no --base-id at all
-    # is untouched.
+    # A remote --base the loader would call the same model keeps working, and no --base-id at all is untouched.
     assert (
         build.base_id_refusal(
             "unsloth/Wan2.2-T2V-A14B-Diffusers", "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
@@ -599,8 +597,7 @@ def test_a_calibrated_build_stamps_which_weights_are_corrected(monkeypatch, tmp_
         "frac_diff": 0.0,
     }
     assert "gptq" not in saved["ckpt"]["metadata"]["fingerprint"]
-    # The block is published with the checkpoint, so it names the files and never the build host's
-    # directory layout.
+    # The block is published with the checkpoint, so it names the files and never the build host's directory layout.
     assert block["source"] == "gptq"
     assert block["meta_path"] == "gptq_meta.json" and block["score_path"] == "gptq_check.json"
     assert not any(os.sep in str(block[field]) for field in ("source", "meta_path", "score_path"))
@@ -1021,8 +1018,7 @@ def test_the_calibration_flags_are_refused_for_a_build_that_cannot_honour_them()
     assert "unrotated" in build.calibration_refusal(
         scheme = "nvfp4", gptq_prompts = 4, bake = False, **rotated
     )
-    # The scales are measured before the rotation, and convert_nvfp4_backend replaces the
-    # ConvRotLinear the loader installed, so the online half would be dropped.
+    # The scales are measured before the rotation, and convert_nvfp4_backend replaces the ConvRotLinear the loader installed, so the online half would be dropped.
     for prompts in (0, 4):
         assert "--convrot-groupsize" in build.calibration_refusal(
             scheme = "nvfp4", gptq_prompts = prompts, bake = True, **rotated
