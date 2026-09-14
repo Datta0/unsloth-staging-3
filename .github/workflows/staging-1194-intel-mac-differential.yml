@@ -1,0 +1,56 @@
+name: staging-1194 intel mac base vs head
+
+# The macos-15-intel leg of the xplat matrix failed at IMPORT of unsloth_zoo with
+# "module 'torch._inductor' has no attribute 'config'", before any of PR 1194's code
+# runs. torch stopped shipping x86_64 macOS wheels after 2.2.x, and that torch predates
+# the inductor config surface unsloth_zoo touches at import. If upstream main fails the
+# same way, the leg is VOID for this PR rather than a regression it caused.
+
+on:
+  push:
+    branches: [pr-1194-xplat-ci]
+  workflow_dispatch:
+
+jobs:
+  differential:
+    runs-on: macos-15-intel
+    timeout-minutes: 30
+    env:
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        side: [base, head]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Report the platform torch we actually get
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch transformers pytest
+          python -c "import platform, torch; print('machine', platform.machine()); print('torch', torch.__version__)"
+          python -c "import torch._inductor as i; print('has config:', hasattr(i, 'config'))"
+
+      - name: Install unsloth_zoo (${{ matrix.side }})
+        run: |
+          if [ "${{ matrix.side }}" = "base" ]; then
+            python -m pip install --no-deps "unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo@main"
+          else
+            python -m pip install --no-deps .
+          fi
+
+      - name: Can unsloth_zoo even be imported here
+        id: imp
+        continue-on-error: true
+        run: python -c "import unsloth_zoo; print('import ok')"
+
+      - name: Verdict
+        run: |
+          echo "side=${{ matrix.side }} import=${{ steps.imp.outcome }}"
+          if [ "${{ steps.imp.outcome }}" != "success" ]; then
+            echo "unsloth_zoo does not import on Intel macOS for this side."
+          fi
