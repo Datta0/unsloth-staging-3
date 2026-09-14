@@ -1,0 +1,115 @@
+name: staging-1194 layernorm scope xplat
+
+on:
+  push:
+    branches: [pr-1194-xplat-ci]
+  workflow_dispatch:
+
+jobs:
+  layernorm-scope:
+    name: ${{ matrix.os }} py${{ matrix.python }} tf${{ matrix.transformers }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-15 is Apple Silicon, macos-15-intel is x86_64, windows-11-arm is ARM64.
+        os: [ubuntu-latest, ubuntu-24.04-arm, windows-latest, windows-11-arm, macos-15, macos-15-intel]
+        python: ["3.12"]
+        transformers: ["5.17.0"]
+        include:
+          # Oldest and newest supported transformers, and the oldest supported python.
+          - os: ubuntu-latest
+            python: "3.10"
+            transformers: "4.57.6"
+          - os: windows-latest
+            python: "3.10"
+            transformers: "4.57.6"
+          - os: macos-15
+            python: "3.10"
+            transformers: "4.57.6"
+    env:
+      UNSLOTH_ZOO_DISABLE_GPU_INIT: "1"
+      UNSLOTH_COMPILE_DISABLE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "transformers==${{ matrix.transformers }}" pytest
+          python -m pip install --no-deps .
+          python -c "import torch, transformers; print(torch.__version__, transformers.__version__)"
+
+      - name: Layernorm scope tests
+        shell: bash
+        run: python -m pytest tests/test_higher_precision_layernorm_scope.py -v -p no:cacheprovider
+
+      - name: Line-ending robustness (checkout.autocrlf can hand us CRLF on Windows)
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os, inspect, transformers
+          from unsloth_zoo.compiler import higher_precision_layernorms
+          from transformers.models.llama4 import modeling_llama4
+
+          src = inspect.getsource(modeling_llama4)
+          print("source has CRLF:", "\r\n" in src)
+          for label, text in (("lf", src.replace("\r\n", "\n")),
+                              ("crlf", src.replace("\r\n", "\n").replace("\n", "\r\n"))):
+              os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"] = "0"
+              higher_precision_layernorms(text)
+              print(label, "->", os.environ["UNSLOTH_HIGH_PRECISION_LAYERNORM"])
+          PY
+
+      - name: Whole-corpus differential against this platform's transformers
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast, glob, os, re, inspect, transformers
+          root = os.path.join(os.path.dirname(transformers.__file__), "models")
+          RE = re.compile(r"\nclass[^\(\n]{1,}Norm\(nn\.Module\).+?def __init__.+?self.weight.+?\nclass[^\(\n]{1,}",
+                          re.DOTALL | re.MULTILINE)
+
+          def decide(t):
+              if "self.weight.to(torch.float32)" in t: return "float32"
+              if "(self.weight * hidden_states).to(" in t: return "float32"
+              if "self.weight * hidden_states.to(" in t: return "float16"
+              if "self.weight.float()" in t: return "float32"
+              if "return output * self.weight" in t: return "float16"
+              return "float16"
+
+          files = sorted(glob.glob(os.path.join(root, "**", "modeling_*.py"), recursive=True))
+          matched = bad = 0
+          for f in files:
+              try: src = open(f, encoding="utf-8").read()
+              except Exception: continue
+              m = RE.search(src)
+              if not m: continue
+              matched += 1
+              s = m.start(0)
+              e = src.find("\nclass", s + 1)
+              if e == -1: e = len(src)
+              pr = src[s:e]
+              name = re.match(r"\nclass\s*([^\(]+)", src[s:]).group(1).strip()
+              try: tree = ast.parse(src)
+              except SyntaxError: continue
+              lines = src.splitlines(keepends=True)
+              gt = None
+              for node in tree.body:
+                  if isinstance(node, ast.ClassDef) and node.name == name:
+                      gt = "".join(lines[node.lineno - 1:node.end_lineno]); break
+              if gt is None: continue
+              if gt.strip() not in pr.strip():
+                  print("TRUNCATED", f, name); bad += 1
+              if decide(pr) != decide(gt):
+                  print("MISMATCH", f, name, decide(pr), decide(gt)); bad += 1
+          print(f"transformers={transformers.__version__} files={len(files)} matched={matched} bad={bad}")
+          raise SystemExit(1 if bad else 0)
+          PY
