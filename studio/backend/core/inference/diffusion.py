@@ -256,6 +256,37 @@ def _hf_token_in_play(hf_token: Optional[str]) -> bool:
         return False
 
 
+_DYNAMO_PARTIAL_RE = re.compile(
+    r"partially initialized module 'torch\._dynamo'|"
+    r"module 'torch\._dynamo' has no attribute 'utils'"
+)
+
+
+def dynamo_partial_init_message(exc: BaseException) -> Optional[str]:
+    """Rewrite the half-initialised ``torch._dynamo`` failure into the step that unblocks the
+    user, else None so an unrelated load error keeps its own text. Same contract as
+    ``hub_access_message``: only the toast changes, the raw exception still reaches the log.
+
+    Worth special-casing because the raw text names a private torch module and reads as a bug in
+    the model, while the actual remedy is a restart and nothing else. Measured on torch 2.10:
+    once a process loses this import race the state does not recover, so retrying the load in
+    the same process fails the same way (0 of 14 retries resolved)."""
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if _DYNAMO_PARTIAL_RE.search(str(exc)):
+            return (
+                "PyTorch's compiler module (torch._dynamo) ended up half-initialised in this "
+                "process, so the image model could not finish loading. Restart Unsloth and load "
+                "it again; this state does not clear on its own."
+            )
+        # Same walk as _gated_in_chain: `raise ... from None` means the raiser deliberately hid
+        # the inner error, so following __context__ past it would answer a visible, unrelated
+        # failure (corrupt weights, say) with restart advice that does not apply to it.
+        exc = exc.__cause__ or (None if exc.__suppress_context__ else exc.__context__)
+    return None
+
+
 def hub_access_message(exc: BaseException, *, had_token: bool) -> Optional[str]:
     """Rewrite a gated-repo failure into the step that actually unblocks the user, else None so an
     unrelated load error keeps its own text. Only the toast is affected; the raw exception,
@@ -2183,7 +2214,10 @@ class DiffusionBackend:
             # A cancelled/superseded load raised below; don't log/stamp it onto the current load.
             if self._load_token != token:
                 return
-            logger.error("diffusion.load_failed: %s", exc)
+            # exc_info: the client only ever gets str(exc) (see below), so without the traceback
+            # here a one-line failure is unattributable to any call site. #10350 and #10963 both
+            # sat unreproducible for want of the frames this logs.
+            logger.error("diffusion.load_failed: %s", exc, exc_info = True)
             if self._state is not None:
                 from .gpu_arbiter import DIFFUSION, restore_owner_account
                 from hub.services.models.account_access import restore_resident_metadata
@@ -2200,9 +2234,11 @@ class DiffusionBackend:
             from utils.native_path_leases import redact_native_paths
 
             try:
-                text = hub_access_message(
-                    exc, had_token = _hf_token_in_play(kwargs.get("hf_token"))
-                ) or str(exc)
+                text = (
+                    hub_access_message(exc, had_token = _hf_token_in_play(kwargs.get("hf_token")))
+                    or dynamo_partial_init_message(exc)
+                    or str(exc)
+                )
             except Exception:  # noqa: BLE001
                 text = str(exc)
             with self._lock:
@@ -4324,6 +4360,33 @@ class DiffusionBackend:
                     install_arch_patches,
                     uninstall_arch_patches,
                 )
+
+                # BEFORE the speed/compile block and the offload step below, because both reach
+                # torch._dynamo and whichever gets there first is the one that can lose the race:
+                # apply_speed_optims reads torch._dynamo.config (diffusion_speed.py), and
+                # diffusers.hooks imports the module outright from apply_memory_plan. Doing it here,
+                # on this one thread, is the whole mechanism; done after either, it is too late and
+                # the speed path's own best-effort handler would have quietly turned compile off
+                # while leaving the module poisoned for the offload (#10350, #10963).
+                # Normally a no-op: the background torch warm already did it at boot. Guarded around
+                # the IMPORT as well as the call, because utils.torch_warmup reaches
+                # importlib._bootstrap._ModuleLockManager, a private CPython name: a build lacking
+                # it must not take the load down. Best-effort, never a new failure.
+                try:
+                    from utils.torch_warmup import ensure_dynamo_imported
+                    if not ensure_dynamo_imported():
+                        # Not fatal, and deliberately not a retry: measured on torch 2.10, a
+                        # process that has lost this race does not recover (0 of 14 retries
+                        # resolved), and evicting the half-built package to re-import is the
+                        # C-extension purge that purge_partial_import already refuses. So the
+                        # useful thing is a breadcrumb: if the compile or offload step below dies
+                        # on dynamo, this line says the condition was already present.
+                        logger.warning(
+                            "diffusion.load: torch._dynamo is not importable in this process; "
+                            "if this load fails on a dynamo import, restart Unsloth"
+                        )
+                except Exception as exc:  # noqa: BLE001 - optimisation only
+                    logger.debug("dynamo pre-import skipped: %r", exc)
 
                 try:
                     if effective_speed != SPEED_OFF:
