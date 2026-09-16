@@ -6885,6 +6885,69 @@ exit 0
     # unsloth==2024.8, so install torch from the explicit index first. --upgrade-package (not
     # --upgrade) so upgrading unsloth cannot re-resolve torch from PyPI and strip the +cuXXX.
     # ── Helper: find no-torch-runtime.txt ──
+    # uv splits -r, -c and --overrides on whitespace and gives no way to quote around it, so any
+    # path handed to one of those flags has to be space-free (#6503, #10722, #11012). The fix for
+    # --overrides landed with the file it writes; this is the same problem on a path the user
+    # chooses, since a requirements file resolves under $RepoRoot or $VenvDir.
+    #
+    # Requirements only, and the name says so on purpose. A copy is safe here because
+    # no-torch-runtime.txt is a flat list with no relative -r/-c includes, whereas uv resolves an
+    # override's relative references against that file's own directory, so relocating an override
+    # would change what it means. New-UnslothTorchOverridesFile keeps its own handling for that
+    # reason rather than calling this.
+    #
+    # Mirrors uv_safe_path in studio/backend/utils/uv_path_safety.py, with a copy as a second
+    # chance before giving up. Returns a hashtable so the caller can delete a copy it made
+    # without ever deleting the user's own file.
+    function Get-UvSafeRequirementsPath {
+        param([Parameter(Mandatory = $true)][string]$Path)
+        if (-not $Path.Contains(" ")) { return @{ Path = $Path; Temporary = $false } }
+        $short = $null
+        try { $short = (New-Object -ComObject Scripting.FileSystemObject).GetFile($Path).ShortPath } catch { }
+        if ($short -and -not $short.Contains(" ")) { return @{ Path = $short; Temporary = $false } }
+
+        # No 8.3 name for the file: copy the list to a space-free directory instead. More than one
+        # candidate, because %TEMP% can carry the space itself, which is the #11012 case exactly,
+        # and 8.3 creation is commonly disabled on non-system volumes so its short name may not
+        # exist either. Each candidate is accepted only once it is confirmed space-free and
+        # writable, so a directory we cannot actually use is never selected.
+        $candidates = @(
+            [System.IO.Path]::GetTempPath()
+            $env:TEMP
+            $env:TMP
+            (Join-Path ([System.IO.Path]::GetPathRoot([System.IO.Path]::GetTempPath())) "Windows\Temp")
+            [System.IO.Path]::GetDirectoryName($Path)
+        )
+        foreach ($candidate in $candidates) {
+            if (-not $candidate) { continue }
+            $dir = $candidate
+            if ($dir.Contains(" ")) {
+                $dirShort = $null
+                try { $dirShort = (New-Object -ComObject Scripting.FileSystemObject).GetFolder($dir).ShortPath } catch { }
+                if (-not $dirShort -or $dirShort.Contains(" ")) { continue }
+                $dir = $dirShort
+            }
+            try {
+                $tmp = Join-Path $dir ("unsloth-reqs-" + [guid]::NewGuid().ToString("N") + ".txt")
+                Copy-Item -LiteralPath $Path -Destination $tmp -Force -ErrorAction Stop
+                if ($tmp.Contains(" ")) {
+                    Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                    continue
+                }
+                return @{ Path = $tmp; Temporary = $true }
+            } catch { continue }
+        }
+
+        # Nowhere space-free and writable was found. Say so: uv's own message for the split path
+        # names a fragment of the install root and reads as a missing or malformed requirements
+        # file, which is what made #11012 expensive to diagnose. The original is still returned so
+        # the install behaves exactly as it does today rather than failing somewhere new.
+        substep "[WARN] the requirements path contains a space and no space-free location was" "Yellow"
+        substep "available; uv splits such a path, so this install may fail. Set TMP and TEMP" "Yellow"
+        substep "to a path without spaces and run the installer again." "Yellow"
+        return @{ Path = $Path; Temporary = $false }
+    }
+
     function Find-NoTorchRuntimeFile {
         if ($StudioLocalInstall -and (Test-Path (Join-Path $RepoRoot "studio\backend\requirements\no-torch-runtime.txt"))) {
             return Join-Path $RepoRoot "studio\backend\requirements\no-torch-runtime.txt"
@@ -6987,7 +7050,12 @@ exit 0
             if ($baseInstallExit -eq 0) {
                 $NoTorchReq = Find-NoTorchRuntimeFile
                 if ($NoTorchReq) {
-                    $baseInstallExit = Invoke-InstallCommandRetry -Label "install no-torch runtime deps" { & $script:UvExe pip install --python $VenvPython --no-deps -r $NoTorchReq }
+                    $NoTorchReqSafe = Get-UvSafeRequirementsPath -Path $NoTorchReq
+                    $NoTorchReqArg = $NoTorchReqSafe.Path
+                    $baseInstallExit = Invoke-InstallCommandRetry -Label "install no-torch runtime deps" { & $script:UvExe pip install --python $VenvPython --no-deps -r $NoTorchReqArg }
+                    if ($NoTorchReqSafe.Temporary) {
+                        Remove-Item -LiteralPath $NoTorchReqArg -Force -ErrorAction SilentlyContinue
+                    }
                 }
             }
         } else {
@@ -7179,7 +7247,12 @@ exit 0
             if ($baseInstallExit -eq 0) {
                 $NoTorchReq = Find-NoTorchRuntimeFile
                 if ($NoTorchReq) {
-                    $baseInstallExit = Invoke-InstallCommandRetry -Label "install no-torch runtime deps" { & $script:UvExe pip install --python $VenvPython --no-deps -r $NoTorchReq }
+                    $NoTorchReqSafe = Get-UvSafeRequirementsPath -Path $NoTorchReq
+                    $NoTorchReqArg = $NoTorchReqSafe.Path
+                    $baseInstallExit = Invoke-InstallCommandRetry -Label "install no-torch runtime deps" { & $script:UvExe pip install --python $VenvPython --no-deps -r $NoTorchReqArg }
+                    if ($NoTorchReqSafe.Temporary) {
+                        Remove-Item -LiteralPath $NoTorchReqArg -Force -ErrorAction SilentlyContinue
+                    }
                 }
             }
         } elseif ($StudioLocalInstall) {
