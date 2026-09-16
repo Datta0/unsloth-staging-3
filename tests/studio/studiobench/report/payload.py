@@ -39,6 +39,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping, Sequence
 
+from ..scoring.from_payload import ATTEMPT_ROW_TYPES
 from ..scoring.schema import ExcludedCell, Measure, validate_payload
 
 RECORD_KINDS = (
@@ -217,9 +218,10 @@ ROW_TYPE_SECTIONS: Mapping[str, str] = {
     "action": "actions",
     "sample": "samples",
     "failure": "crashes",
-    # Bookkeeping about HOW the A/B was run, not a measurement of the app, so it belongs beside the
-    # identity fields where a reader can see whether the order was balanced.
-    "ab_plan": "header",
+    # Bookkeeping about HOW the A/B was run, not a measurement of the app. Its OWN section: the
+    # `header` section is collapsed to its FIRST row when the payload is assembled, so an ab_plan
+    # row filed there is silently dropped while record_counts still reports two header rows.
+    "ab_plan": "ab_plan",
     # The optional surface sweep. Its own section: a surface row is a coverage fact about the UI, not a
     # timing, and folding it into `actions` would put it in front of the scorer.
     "surface": "surfaces",
@@ -237,6 +239,52 @@ ROW_TYPE_SECTIONS: Mapping[str, str] = {
     # reader scanning FORWARD can discard the cell's window rows.
     "cell_aborted": "aborted_cells",
 }
+
+
+def merged_ab_plan(records: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """One plan out of however many sessions wrote one.
+
+    `--resume` appends to the same payload and emits a fresh `ab_plan` for the work THAT
+    session was asked to do, so the cells a later session added are named only in a later
+    row. Taking `[0]` would drop their order while `record_counts` still reports the plans
+    exist, which is the same silent loss that moving this row out of `header` was for, one
+    layer down.
+
+    `order` is the union, so nothing a later session added is dropped. The refs come from the
+    first plan; a resume whose refs disagree is refused upstream.
+
+    `balanced` is ANDed over the sessions that still OWN a cell, decided the same way
+    `latest_attempt_rows` decides it and not from the plan. A plan is written before its
+    session runs anything, so its `order` is a request: a `--resume --reps 2` that dies before
+    retrying the old pair leaves that pair owned by the unbalanced `--reps 1` session that did
+    run it, and the later plan's `True` would report a balance nothing measured.
+
+    Ownership is read off `ATTEMPT_ROW_TYPES`, not `cell` rows alone, and keyed on
+    `session_id`, which `Recorder.emit` stamps on every row including this one. Both come
+    straight from `latest_attempt_rows`: it moved off cell rows because an attempt hard-killed
+    mid-cell never writes its terminal row, so keying on that alone hands the cell back to the
+    older attempt. A second copy of that rule that disagreed would be worse than none.
+    """
+
+    plans = [r for r in records if r.get("row_type") == "ab_plan"]
+    if not plans:
+        return {}
+    plan = dict(plans[0])
+    order: list[Any] = []
+    for row in plans:
+        for cell_id in row.get("order", []):
+            if cell_id not in order:
+                order.append(cell_id)
+    plan["order"] = order
+    owner: dict[str, Any] = {}
+    for record in records:
+        if record.get("row_type") in ATTEMPT_ROW_TYPES and record.get("cell_id") is not None:
+            owner[str(record["cell_id"])] = record.get("session_id")
+    owning = set(owner.values())
+    # No attempt rows at all is not an experiment; the newest request is the best word there is.
+    live = [row for row in plans if row.get("session_id") in owning] or [plans[-1]]
+    plan["balanced"] = all(bool(row.get("balanced")) for row in live)
+    return plan
 
 
 def assemble_rows(path: str | Path, *, validate: bool = True) -> dict[str, Any]:
@@ -283,6 +331,7 @@ def assemble_rows(path: str | Path, *, validate: bool = True) -> dict[str, Any]:
         "surfaces": sections.get("surfaces", []),
         "aborted_cells": sections.get("aborted_cells", []),
         "comparability": (sections["comparability"][0] if sections.get("comparability") else {}),
+        "ab_plan": merged_ab_plan(records),
         "crashes": sections.get("crashes", []),
         "arms": [],
         "unknown_rows": unknown,
