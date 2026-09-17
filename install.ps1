@@ -1076,18 +1076,145 @@ function Install-UnslothStudio {
         }
     }
 
+    # ── BEGIN SHARED WITH studio/setup.ps1 (Get-NvidiaSmiCandidatePaths) ──
+    # Every directory nvidia-smi might be in, in the order worth trying, filtered to the ones that
+    # actually hold the binary. Callers still run their own Test-NvidiaSmiHasGpu over the result:
+    # existing is not the same as answering.
+    #
+    # Only two locations were searched before, and each addition below is a host where a real NVIDIA
+    # GPU was reported absent, which sends the installer to CPU-only PyTorch:
+    #
+    #   SysNative       From a 32-bit process "System32" is redirected to SysWOW64, which has no
+    #                   nvidia-smi. SysNative is the alias that reaches the real System32.
+    #   ProgramW64      In that same process $env:ProgramFiles is "Program Files (x86)".
+    #                   ProgramW6432 is the 64-bit Program Files whatever the process bitness.
+    #   x86             Not the driver's own location, but a machine that once had a 32-bit
+    #                   toolkit can carry a working copy there.
+    #   DriverStore     Where the driver package itself lives. Present on hosts where the copy
+    #                   into System32 did not happen, which is the #9255 population.
+    #
+    # Nothing is removed. One ordering does change, and deliberately: the two call sites disagreed
+    # with each other before, one trying System32 first and the other the NVSMI directory first, and
+    # a single list cannot keep both. System32 wins, because that is where the current driver puts
+    # its copy; NVSMI is the legacy location and a machine carrying both can have an older binary
+    # there reporting an older CUDA version. This only affects a host that has both, and only in
+    # which of two working binaries answers.
+    function Get-NvidiaSmiCandidatePaths {
+        $dirs = @()
+        # Current driver locations first, in BOTH process bitnesses, before any legacy one.
+        # System32 is the current driver in a 64-bit process. In a 32-bit process that name is
+        # redirected to SysWOW64, which has no nvidia-smi, and SysNative is the alias that reaches
+        # the real System32; ProgramW6432 is likewise the 64-bit Program Files whatever the
+        # bitness. Both have to come before $env:ProgramFiles, because in a 32-bit process that is
+        # the x86 tree, where a stale toolkit copy can sit and answer first.
+        if ($env:SystemRoot) { $dirs += (Join-Path $env:SystemRoot "System32") }
+        if ($env:SystemRoot) { $dirs += (Join-Path $env:SystemRoot "SysNative") }
+        if ($env:ProgramW6432) { $dirs += (Join-Path $env:ProgramW6432 "NVIDIA Corporation\NVSMI") }
+        if ($env:ProgramFiles) { $dirs += (Join-Path $env:ProgramFiles "NVIDIA Corporation\NVSMI") }
+        $pfx86 = ${env:ProgramFiles(x86)}
+        if ($pfx86) { $dirs += (Join-Path $pfx86 "NVIDIA Corporation\NVSMI") }
+        # Bounded on purpose. FileRepository holds every driver package the machine has ever had.
+        #
+        # The bound is applied to directories that ACTUALLY HOLD the binary, not to the nv* matches.
+        # NVIDIA ships several packages whose names start nv (HD audio, the virtual audio device,
+        # the network service), so a host with eight of those newer than the display driver would
+        # otherwise spend the whole allowance on directories with no nvidia-smi in them and report
+        # the machine as having none. Test-Path is a file existence check, not a process spawn; the
+        # bound that matters is on the candidates handed back, since each of those costs a probe.
+        try {
+            if ($env:SystemRoot) {
+                $repo = Join-Path $env:SystemRoot "System32\DriverStore\FileRepository"
+                if (Test-Path -LiteralPath $repo -PathType Container) {
+                    foreach ($dir in @(Get-ChildItem -LiteralPath $repo -Directory -Filter "nv*" -ErrorAction SilentlyContinue |
+                        Sort-Object LastWriteTime -Descending |
+                        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName "nvidia-smi.exe") -PathType Leaf } |
+                        Select-Object -First 8)) {
+                        $dirs += $dir.FullName
+                    }
+                }
+            }
+        } catch {}
+        $paths = @()
+        $seen = @{}
+        foreach ($dir in $dirs) {
+            if ([string]::IsNullOrWhiteSpace($dir)) { continue }
+            $candidate = Join-Path $dir "nvidia-smi.exe"
+            # Case-insensitive, because the same directory reached two ways must not be probed twice:
+            # each probe is a bounded process spawn with a wall-clock timeout behind it.
+            $key = $candidate.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) { $paths += $candidate }
+        }
+        return $paths
+    }
+    # ── END SHARED WITH studio/setup.ps1 (Get-NvidiaSmiCandidatePaths) ──
+
     # One list, because the presence probe and the driver-version probe must agree: a host only the first finds reports a GPU with no driver version, and the CUDA-major guard is then skipped.
+    # Reset per run: under `irm | iex` the script scope IS the caller's session, so a second
+    # invocation in one shell would otherwise reuse the first run's answer.
+    $script:WoaNvidiaSmiProbed = $false
+    $script:WoaNvidiaSmiPath = $null
+
     function Get-WoaNvidiaSmiPath {
+        # Memoised because the two callers each probe, and without this the whole candidate list
+        # would be walked twice with a bounded process spawn per entry.
+        if ($script:WoaNvidiaSmiProbed) { return $script:WoaNvidiaSmiPath }
+        $script:WoaNvidiaSmiProbed = $true
         $exe = $null
         try { $exe = (Get-Command nvidia-smi -ErrorAction SilentlyContinue).Source } catch { $exe = $null }
-        if ($exe) { return $exe }
-        foreach ($candidate in @(
-            "$env:SystemRoot\System32\nvidia-smi.exe",
-            "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
-        )) {
-            if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+        if ($exe) { $script:WoaNvidiaSmiPath = $exe; return $exe }
+        $found = @(Get-NvidiaSmiCandidatePaths)
+        if ($found.Count -eq 0) { return $null }
+        # The first candidate that ANSWERS, not the first that exists.
+        #
+        # Both callers immediately probe what this returns, and treat a non-answer as "no NVIDIA
+        # here": Test-WoaNvidiaPresent returns false and Get-WoaDriverCudaVersion returns null,
+        # which between them decide whether the native ARM64 CUDA stack is installed at all. So
+        # handing back a broken copy does not cost a retry, it declines the whole route.
+        #
+        # That was survivable when two locations were searched and is not now that the list is
+        # longer: every location added is another chance that the first entry is a stale copy
+        # sitting in front of a working one. Same reason the main detection loop stopped taking
+        # the first listing candidate.
+        # Same two-budget shape as the main detection loop, and for the same reasons. Each probe
+        # below is a bounded process spawn, and the list can now be eleven entries, so a wedged
+        # driver would otherwise hold Initialize-WoaNativeCudaTorch for minutes before the
+        # install even starts. The soft budget only applies once something has answered; only the
+        # hard one may end the scan with nothing, because that decides the whole ARM64 route.
+        $woaDeadline = (Get-Date).AddSeconds(30)
+        $woaHardDeadline = (Get-Date).AddSeconds(60)
+        $woaListing = $null
+        foreach ($p in $found) {
+            if ($null -ne $woaListing -and (Get-Date) -gt $woaDeadline) { break }
+            if ((Get-Date) -gt $woaHardDeadline) { break }
+            try {
+                $listing = Invoke-NvidiaSmiBounded $p @('-L')
+                if (-not ($LASTEXITCODE -eq 0 -and $listing -match '(?m)^\s*GPU\s+\d+')) { continue }
+                if (-not $woaListing) { $woaListing = $p }
+                # Two passes, because listing a GPU is not enough here. Get-WoaDriverCudaVersion
+                # asks this same binary for the CUDA banner, and a null answer does not merely
+                # lose a version: it skips the CUDA-major compatibility guard in
+                # Initialize-WoaNativeCudaTorch, which is what stops a native wheel newer than
+                # the installed driver being chosen. So prefer a candidate that answers BOTH.
+                if ((Get-Date) -gt $woaDeadline) { break }
+                $banner = Invoke-NvidiaSmiBounded $p
+                if ($banner -match 'CUDA(?: UMD)? Version:\s+\d+\.\d+') {
+                    $script:WoaNvidiaSmiPath = $p
+                    return $p
+                }
+            } catch {}
         }
-        return $null
+        # One that listed a GPU but never named a version is still better than one that did not
+        # answer at all: the callers' presence check works, and the version check declines.
+        if ($woaListing) {
+            $script:WoaNvidiaSmiPath = $woaListing
+            return $woaListing
+        }
+        # Nothing answered. Hand back the first that exists, which is what this did before, so a
+        # host where the probe cannot run is no worse off than it was.
+        $script:WoaNvidiaSmiPath = $found[0]
+        return $found[0]
     }
 
     function Test-WoaNvidiaPresent {
@@ -6908,6 +7035,9 @@ exit 0
     # so the banner below can skip a second query: detection already waited out the full
     # bound on this binary, and asking a hung nvidia-smi again only doubles the stall.
     $script:NvidiaSmiWedged = $false
+    # Reset per run: under `irm | iex` the script scope IS the caller's session.
+    $script:NvidiaPresenceOnly = $false
+    $script:NvidiaPresenceCudaFloor = $null
 
     function Test-NvidiaSmiHasGpu {
         param([Parameter(Mandatory = $true)][string]$Exe)
@@ -7070,21 +7200,261 @@ exit 0
         }
     } catch {}
     if (-not $HasNvidiaSmi) {
-        foreach ($p in @(
-            "$env:ProgramFiles\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
-            "$env:SystemRoot\System32\nvidia-smi.exe"
-        )) {
-            if (Test-Path $p) {
-                try {
-                    if (Test-NvidiaSmiHasGpu $p) { $HasNvidiaSmi = $true; $NvidiaSmiExe = $p; break }
-                } catch {}
-            }
+        # Two passes, not one, and the reason is the ordering this change introduces. Listing a
+        # GPU is not the same as being able to report a CUDA version: a partially installed or
+        # stale utility can answer -L and still print a banner Get-TorchIndexUrl cannot parse,
+        # and that path falls back to cu126. Taking the first binary that merely lists a GPU
+        # could therefore hand a cu128-capable host cu126 purely because of which directory is
+        # searched first. So prefer a candidate that answers BOTH questions, and only settle for
+        # one that just lists a GPU if none does.
+        #
+        # One deadline across the whole loop, not just the per-call one. Each candidate gets its own
+        # bounded runner, and on a host with a wedged driver every one of them waits out that bound
+        # before failing. The list is longer than it was, so what used to be two stalls could now be
+        # ten, and all of it is spent in front of the driver-library fallback that would have answered
+        # in milliseconds. The bound is on TIME rather than on the number of candidates because the
+        # cost being controlled is time: a machine where every probe answers at once still gets to
+        # try them all, and one where they hang stops early.
+        #
+        # Get-Date rather than a Stopwatch: Constrained Language Mode refuses the method calls, and
+        # this runs on hosts that enforce it.
+        # Enumerated BEFORE the clock starts. Discovery is Test-Path calls, but on a machine with a
+        # filesystem filter driver or slow storage it is not free, and charging it to the probe
+        # budget is how a slow disk turns into no GPU.
+        $smiCandidates = @(Get-NvidiaSmiCandidatePaths)
+        # Two budgets, because "stop early" means two different things here.
+        #
+        # The soft one applies ONLY once a usable answer is already in hand: there is a working
+        # nvidia-smi, and continuing just looks for a better CUDA banner. Giving that up costs at
+        # most a wheel family.
+        #
+        # The hard one is the only thing allowed to end the search with NOTHING found, because that
+        # outcome is CPU-only PyTorch on a machine with a GPU. The first version of this had a single
+        # budget and broke out of the loop after one slow failure, so a host whose System32 copy is
+        # broken and whose legacy NVSMI copy works lost its GPU entirely. That is strictly worse than
+        # the stall it was added to prevent.
+        $probeDeadline = (Get-Date).AddSeconds(30)
+        $probeHardDeadline = (Get-Date).AddSeconds(60)
+        $firstListing = $null
+        # Captured beside the path, because $script:NvidiaSmiWedged describes the LAST binary probed
+        # and the one this loop settles on can be an earlier one. Captured rather than assumed to be
+        # false: it is false today because a candidate only becomes $firstListing when its -L probe
+        # succeeded, and that is a property of Test-NvidiaSmiHasGpu rather than of this loop.
+        $firstListingWedged = $false
+        foreach ($p in $smiCandidates) {
+            # Only give up early when there is already something to fall back on.
+            if ($null -ne $firstListing -and (Get-Date) -gt $probeDeadline) { break }
+            # With nothing found, keep going to the hard bound. Reporting no GPU is the expensive
+            # answer, so it has to be the one that costs the most before it is reached.
+            if ((Get-Date) -gt $probeHardDeadline) { break }
+            try {
+                if (-not (Test-NvidiaSmiHasGpu $p)) { continue }
+                if (-not $firstListing) {
+                    $firstListing = $p
+                    $firstListingWedged = $script:NvidiaSmiWedged
+                }
+                # Rechecked here, not only at the top. The listing probe that just returned can have
+                # spent most of its own bound, and the banner probe below has a full bound of its
+                # own, so a candidate starting just inside the deadline could add nearly twice the
+                # per-probe timeout after it. There is already a usable answer in $firstListing at
+                # this point, so stopping costs at most a wheel family.
+                if ((Get-Date) -gt $probeDeadline) { break }
+                $banner = Invoke-NvidiaSmiBounded $p
+                if ($banner -match 'CUDA(?: UMD)? Version:\s+\d+\.\d+') {
+                    $HasNvidiaSmi = $true; $NvidiaSmiExe = $p; break
+                }
+            } catch {}
+        }
+        if (-not $HasNvidiaSmi -and $firstListing) {
+            $HasNvidiaSmi = $true; $NvidiaSmiExe = $firstListing
+            # Restored for the binary actually selected. A later candidate that timed out leaves the
+            # flag set for ITS path, and the guard downstream reads the flag to decide whether to ask
+            # the selected binary for the name, the compute capability and the driver version. Left
+            # alone, a working nvidia-smi would be treated as wedged and all three queries skipped
+            # because a different binary elsewhere on the machine hung.
+            $script:NvidiaSmiWedged = $firstListingWedged
         }
     }
+    # Moved above its callers rather than left beside the Intel registry fallback it used to
+    # sit next to. PowerShell does not hoist, and this file is one long body executed top to
+    # bottom, so the presence promotion below calling it from ~400 lines above its old home
+    # simply failed with "not recognized". Caught by the AST ordering check, not by the pwsh
+    # suites, which extract functions and define them in dependency order themselves.
+    # Bounded Win32_VideoController scan: the query can block forever on a degraded WMI
+    # repository, -ErrorAction only suppresses reported errors, and -OperationTimeoutSec is not
+    # enforced for the local COM session this uses, so out of process with a wall-clock kill is
+    # the only bound that holds. Ok = $false on an empty answer too, since a Windows host always
+    # has an adapter. Mirrors setup.ps1's copy.
+    function Invoke-BoundedVideoControllerScan {
+        param([int]$TimeoutSec = 15)
+        # Adapters carries the same records the Names list is built from, plus the three fields a
+        # vendor-exact presence test and a driver-version floor need. Names keeps its exact old shape
+        # and meaning, so every existing reader is untouched.
+        $result = [pscustomobject]@{ Ok = $false; Names = @(); Adapters = @() }
+        $job = $null
+        try {
+            $job = Start-Job -ScriptBlock {
+                Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
+                    Select-Object -Property Name, PNPDeviceID, ConfigManagerErrorCode, DriverVersion
+            }
+            if (Wait-Job -Job $job -Timeout $TimeoutSec) {
+                $rows = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
+                $result.Adapters = @($rows | Where-Object { $_ })
+                $names = @($rows | ForEach-Object { $_.Name })
+                $result.Names = @($names | Where-Object { $_ })
+                $result.Ok = ($result.Names.Count -gt 0)
+            } else {
+                Stop-Job -Job $job -ErrorAction SilentlyContinue
+            }
+        } catch {
+        } finally {
+            if ($job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
+        }
+        return $result
+    }
+
+    # Is there an NVIDIA display adapter on this machine, judged by PCI vendor ID and nothing else.
+    #
+    # Read this as the answer to "is a GPU present", because that is what $HasNvidiaSmi means to
+    # every gate downstream, and setting it true SUPPRESSES all AMD and Intel detection. A source
+    # that says yes on a machine with no NVIDIA card silently turns off AMD and Intel support, which
+    # is a worse failure than the one this exists to fix. So:
+    #
+    #   VEN_10DE only, never a marketing name. Names are localized, OEM rebranded and shared across
+    #   vendors; the vendor ID is assigned and exact. A card whose name says NVIDIA but whose vendor
+    #   ID is AMD's must answer no, and an OEM-rebranded NVIDIA card must answer yes.
+    #
+    #   ConfigManagerErrorCode 0 only. A driver record outliving its card, a disabled adapter and one
+    #   with a device problem all still appear in the inventory. Those count as absent, which is the
+    #   conservative direction: such a machine keeps exactly the detection it has today.
+    function Test-NvidiaAdapterPresent {
+        param($Scan = $null)
+        if ($null -eq $Scan) { $Scan = Invoke-BoundedVideoControllerScan }
+        foreach ($adapter in @($Scan.Adapters)) {
+            if ("$($adapter.PNPDeviceID)" -notmatch '(?i)ven_10de') { continue }
+            # 0 is a healthy adapter. $null means the field did not come back at all, which is not
+            # evidence of health, so it is refused rather than read as zero.
+            if ($null -eq $adapter.ConfigManagerErrorCode) { continue }
+            if ([int]$adapter.ConfigManagerErrorCode -ne 0) { continue }
+            return $true
+        }
+        # The same registry fallback the Intel path already uses, for a host whose WMI repository
+        # cannot answer. Guarded per subkey, so one unreadable entry does not discard the rest.
+        $classKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bfc1-08002be10318}"
+        try {
+            $subs = @(Get-ChildItem -LiteralPath $classKey -ErrorAction SilentlyContinue)
+        } catch { return $false }
+        foreach ($sub in $subs) {
+            try {
+                # Numeric subkeys only: "Properties" is ACL-restricted and is not an adapter.
+                if ("$($sub.PSChildName)" -notmatch '^\d+$') { continue }
+                $props = Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction SilentlyContinue
+                if ($props -and "$($props.MatchingDeviceId)" -match '(?i)ven_10de') { return $true }
+            } catch {}
+        }
+        return $false
+    }
+
+    # Is a healthy AMD or Intel display adapter also present. Same rules, different vendor IDs.
+    #
+    # This is what keeps the promotion below strictly additive. The problem being solved is an NVIDIA
+    # host sent to CPU-only wheels in silence. A hybrid host is not that host: it already gets AMD or
+    # Intel wheels today, so promoting NVIDIA there would suppress a working path in exchange for a
+    # GPU whose CUDA version nothing on the machine can report. Measured before this gate existed:
+    # such a host ended up with $HasNvidiaSmi true, AMD detection off, and a CPU index anyway.
+    function Test-OtherVendorAdapterPresent {
+        param($Scan = $null)
+        if ($null -eq $Scan) { $Scan = Invoke-BoundedVideoControllerScan }
+        foreach ($adapter in @($Scan.Adapters)) {
+            # 1002 is AMD/ATI, 8086 is Intel. Virtual and basic display adapters carry neither.
+            if ("$($adapter.PNPDeviceID)" -notmatch '(?i)ven_(1002|8086)') { continue }
+            if ($null -eq $adapter.ConfigManagerErrorCode) { continue }
+            if ([int]$adapter.ConfigManagerErrorCode -ne 0) { continue }
+            return $true
+        }
+        return $false
+    }
+
+    # The CUDA version an NVIDIA display driver of this release is known to carry, as @(major, minor),
+    # or $null. A FLOOR, never the exact version, and the user-visible line says so.
+    #
+    # Ported from studio/nvidia_probe.py's cuda_version_for_driver so the two cannot disagree; the
+    # parity test generates this table from that one.
+    #
+    # Windows reports the display driver version, not the NVIDIA release: "32.0.15.6094" is NVIDIA
+    # 560.94. The NVIDIA release is the last five digits with a point before the final two, which is
+    # the mapping NVIDIA's own release notes describe. Anything that does not look like that answers
+    # $null rather than a guess.
+    function Get-NvidiaDriverCudaFloor {
+        param([string]$DriverVersion)
+        if ([string]::IsNullOrWhiteSpace($DriverVersion)) { return $null }
+        $release = $null
+        # The Windows display-driver form, four dotted fields.
+        $m = [regex]::Match($DriverVersion, '^\s*\d+\.\d+\.(\d+)\.(\d+)\s*$')
+        if ($m.Success) {
+            $digits = ($m.Groups[1].Value + $m.Groups[2].Value)
+            if ($digits.Length -ge 5) {
+                $tail = $digits.Substring($digits.Length - 5)
+                $release = [int]$tail.Substring(0, 3)
+            }
+        } else {
+            # An already-NVIDIA-shaped version, which is what nvidia-smi and Linux report.
+            $m2 = [regex]::Match($DriverVersion, '^\s*(\d+)\.')
+            if ($m2.Success) { $release = [int]$m2.Groups[1].Value }
+        }
+        if ($null -eq $release) { return $null }
+        # Highest floor first, the same order and values as _DRIVER_MAJOR_CUDA.
+        foreach ($row in @(
+            @(580, 13, 0), @(570, 12, 8), @(560, 12, 6), @(555, 12, 5), @(550, 12, 4),
+            @(545, 12, 3), @(535, 12, 2), @(525, 12, 0), @(450, 11, 0)
+        )) {
+            if ($release -ge $row[0]) { return @($row[1], $row[2]) }
+        }
+        return $null
+    }
+
+    # The floor for whichever healthy NVIDIA adapter the bus reports, or $null.
+    function Get-NvidiaAdapterCudaFloor {
+        param($Scan = $null)
+        if ($null -eq $Scan) { $Scan = Invoke-BoundedVideoControllerScan }
+        foreach ($adapter in @($Scan.Adapters)) {
+            if ("$($adapter.PNPDeviceID)" -notmatch '(?i)ven_10de') { continue }
+            if ($null -eq $adapter.ConfigManagerErrorCode) { continue }
+            if ([int]$adapter.ConfigManagerErrorCode -ne 0) { continue }
+            $floor = Get-NvidiaDriverCudaFloor -DriverVersion "$($adapter.DriverVersion)"
+            if ($floor) { return $floor }
+        }
+        return $null
+    }
+
     if (-not $HasNvidiaSmi -and (Get-NvidiaLibraryInventory)) {
         # Same promotion as setup.ps1: the gates below read $HasNvidiaSmi as "NVIDIA GPU present".
         $HasNvidiaSmi = $true
         Write-StudioLine "   NVIDIA GPU found through the driver library; nvidia-smi is unavailable" -ForegroundColor Gray
+    }
+    # Last resort, and presence only.
+    #
+    # nvidia-smi was not found anywhere and the driver library named nothing, but a healthy NVIDIA
+    # adapter is on the PCI bus. Without this the host is sent to CPU-only wheels with nothing said
+    # about it, which is #9255.
+    #
+    # Gated on there being no healthy AMD or Intel adapter, and that gate is what makes this
+    # additive rather than a trade. A hybrid host already gets AMD or Intel wheels today, so
+    # promoting NVIDIA there would suppress a working path in exchange for a GPU whose CUDA version
+    # nothing on this machine can report. Measured without the gate: $HasNvidiaSmi true, AMD
+    # detection off, and a CPU index anyway, which is strictly worse than doing nothing.
+    #
+    # This says a GPU EXISTS. It says nothing about which CUDA version the driver supports, so the
+    # flag below records how we got here and the version ladder decides that separately.
+    if (-not $HasNvidiaSmi) {
+        $presenceScan = Invoke-BoundedVideoControllerScan
+        if ((Test-NvidiaAdapterPresent -Scan $presenceScan) -and
+            -not (Test-OtherVendorAdapterPresent -Scan $presenceScan)) {
+            $HasNvidiaSmi = $true
+            $script:NvidiaPresenceOnly = $true
+            $script:NvidiaPresenceCudaFloor = Get-NvidiaAdapterCudaFloor -Scan $presenceScan
+            Write-StudioLine "   NVIDIA GPU found on the PCI bus; nvidia-smi and the driver library are both unavailable" -ForegroundColor Gray
+        }
     }
     # nvidia-smi was already resolved above and never asked which card it found, so the
     # banner said "NVIDIA GPU detected" on every NVIDIA host alike. compute_cap is the
@@ -7624,33 +7994,6 @@ exit 0
         }
     }
 
-    # Bounded Win32_VideoController scan: the query can block forever on a degraded WMI
-    # repository, -ErrorAction only suppresses reported errors, and -OperationTimeoutSec is not
-    # enforced for the local COM session this uses, so out of process with a wall-clock kill is
-    # the only bound that holds. Ok = $false on an empty answer too, since a Windows host always
-    # has an adapter. Mirrors setup.ps1's copy.
-    function Invoke-BoundedVideoControllerScan {
-        param([int]$TimeoutSec = 15)
-        $result = [pscustomobject]@{ Ok = $false; Names = @() }
-        $job = $null
-        try {
-            $job = Start-Job -ScriptBlock {
-                Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
-                    Select-Object -ExpandProperty Name
-            }
-            if (Wait-Job -Job $job -Timeout $TimeoutSec) {
-                $names = @(Receive-Job -Job $job -ErrorAction SilentlyContinue)
-                $result.Names = @($names | Where-Object { $_ })
-                $result.Ok = ($result.Names.Count -gt 0)
-            } else {
-                Stop-Job -Job $job -ErrorAction SilentlyContinue
-            }
-        } catch {
-        } finally {
-            if ($job) { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue }
-        }
-        return $result
-    }
 
     # Registry fallback for the scan above, mirroring install_llama_prebuilt.py's
     # windows_intel_gpu_in_registry(): the display-adapter class key, one NNNN subkey per driver
@@ -7948,6 +8291,29 @@ exit 0
             $inventory = Get-NvidiaLibraryInventory
             if ($inventory) {
                 $major = $inventory.CudaMajor; $minor = $inventory.CudaMinor; $caps = $inventory.ComputeCaps
+            } elseif ($script:NvidiaPresenceOnly) {
+                # A GPU is known to be on the bus and NOTHING on this machine can name its CUDA
+                # version. Silently returning the CPU index here is #9255: a working NVIDIA card
+                # ends up on CPU-only PyTorch with no explanation.
+                #
+                # This branch is reached ONLY when the bus promotion fired, which requires a
+                # healthy NVIDIA adapter and no healthy AMD or Intel one. Every other machine that
+                # reaches "no nvidia-smi and no inventory" is an AMD, Intel or CPU-only host and
+                # still takes the silent CPU path below, unchanged. That gating is the whole reason
+                # this is safe to make loud: warning here cannot reach a machine with no NVIDIA GPU.
+                if ($script:NvidiaPresenceCudaFloor) {
+                    $major = [int]$script:NvidiaPresenceCudaFloor[0]
+                    $minor = [int]$script:NvidiaPresenceCudaFloor[1]
+                    # "at least", never the exact version: the display driver version maps to the
+                    # CUDA release its driver is known to CARRY, and a newer toolkit may be present.
+                    substep "nvidia-smi and the NVIDIA driver library are both unavailable; the display driver supports at least CUDA $major.$minor, selecting wheels for it" "Yellow"
+                } else {
+                    # A GPU, but not even a driver version to floor against. cu126 is the same
+                    # conservative family the unreadable-banner branch just below already picks,
+                    # and it is a far better answer than CPU on a machine with a working card.
+                    $major = 12; $minor = 6
+                    substep "an NVIDIA GPU is present but no source could name its CUDA version; defaulting to cu126. Set UNSLOTH_TORCH_INDEX_FAMILY to override" "Yellow"
+                }
             } elseif (-not $NvidiaSmiExe) {
                 return "$baseUrl/cpu"
             } else {
