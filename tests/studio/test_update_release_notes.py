@@ -1773,22 +1773,32 @@ def _assert_floored(source: str, scaled: str, narrow: str, card: str) -> None:
     ), f"min-h-0 lets the rail squeeze the {card} card past its floor"
 
 
+_CAP = re.compile(r"max-h-\[[^\]]*100dvh[^\]]*\]")
+
+
 def _corner_rails(provider: str) -> list[str]:
     """The class strings of the bottom-right overlay rails.
 
     Matched on the corner they are pinned to, which is the thing under test.
     The rail is anchored in CSS, so that corner is spelled in its classes.
+
+    The right STEP is not part of the claim and is not pinned: #11260 sat the rail
+    flush at right-0 so its clip lands on the screen edge, and a matcher spelling
+    right-4 answered "no rails" rather than "a rail moved", which reads as the
+    corner having been abandoned. Anchored-right is asserted; how far is not.
     """
-    return re.findall(r'"pointer-events-none fixed bottom-0 right-4 ([^"]*)"', provider)
+    return re.findall(r'"pointer-events-none fixed bottom-0 right-\d+ ([^"]*)"', provider)
 
 
 def _capped_rails(provider: str) -> int:
     """How many of those rails cap themselves to the viewport, in CSS.
 
-    2rem for the cards' band, less the 24px shadow gutter the rail adds around
-    them, so the gutter is not spent on the cards. See overlay-shadow-gutter.
+    The cap is viewport-relative, which is the guarantee; the arithmetic inside it
+    is not. It has already moved once (calc(100dvh - 8px) -> 100dvh when #11260
+    took the gutter into an inline style), and the px are covered where they are
+    decided, in overlay-shadow-gutter.test.ts.
     """
-    return sum(1 for rail in _corner_rails(provider) if "max-h-[calc(100dvh_-_8px)]" in rail)
+    return sum(1 for rail in _corner_rails(provider) if _CAP.search(rail))
 
 
 def test_the_class_matchers_tell_a_gated_rule_from_an_ungated_one():
@@ -1824,6 +1834,26 @@ def test_the_class_matchers_tell_a_gated_rule_from_an_ungated_one():
     for important in ("!min-h-0", "min-h-0!"):
         assert _split_variants(important)[1] == "min-h-0"
         assert _applies(important, "min-h-0"), f"{important} escapes the prohibition"
+
+
+def test_the_rail_matchers_fire_and_hold_their_fire():
+    """Both rail matchers are the sort that fails by matching nothing.
+
+    That is not hypothetical: each spelled a value #11260 changed, so three tests
+    read "the rail left its corner" and "the stack is gone" when the rail was
+    exactly where it should be. A matcher this file relies on is asked to answer
+    on both a rail and a non-rail rather than only being used.
+    """
+    flush = '"pointer-events-none fixed bottom-0 right-0 flex max-h-[100dvh] flex-col"'
+    inset = '"pointer-events-none fixed bottom-0 right-4 -mx-3 max-h-[calc(100dvh_-_8px)] px-3"'
+    for rail in (flush, inset):
+        assert len(_corner_rails(rail)) == 1, f"the matcher lost a rail: {rail}"
+        assert _capped_rails(rail) == 1, f"the cap went unseen: {rail}"
+
+    # A rail that left the corner, and a rail with no viewport cap, are the two
+    # things these matchers exist to report.
+    assert _corner_rails('"pointer-events-none fixed top-0 right-0 flex max-h-[100dvh]"') == []
+    assert _capped_rails('"pointer-events-none fixed bottom-0 right-0 flex max-h-96"') == 0
 
 
 def test_the_class_anchors_do_not_depend_on_any_order():
