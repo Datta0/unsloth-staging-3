@@ -217,6 +217,19 @@ LOCALE_REMOTE_SERVER_KEYS = frozenset(
 
 LOCALE_KEY = re.compile(r"^(\s*)([A-Za-z_][A-Za-z0-9_]*)\s*:")
 
+# A bare "Studio" naming this app is the other half of the same mistake, and the half that invites the first: a
+# contributor who finds one reasonably reads it as an abbreviation and writes the full old name back in (#11251).
+# Locale values are the one surface where this can be matched safely, being prose with no identifiers or paths in
+# them. "LM Studio" is a different product, so it is not this app under an abbreviation.
+LOCALE_BARE_STUDIO = re.compile(r"(?<!Unsloth )(?<!LM )\bStudio\b")
+
+BRANDING_RULE = (
+    "the desktop app displays itself as 'Unsloth'. Write 'Unsloth', not 'Unsloth Studio' and not a bare 'Studio'. "
+    "'Unsloth Studio' is for prose naming a REMOTE Studio server a user points this app at (see "
+    "LOCALE_REMOTE_SERVER_KEYS), and for compatibility identifiers that cannot change (ai.unsloth.studio, the "
+    "unsloth-studio crate, the NSIS INSTALLIDENTITY)."
+)
+
 
 def locale_entries(text: str) -> list[tuple[str, str]]:
     """Every leaf entry of a locale module as (dotted key path, value text).
@@ -260,6 +273,10 @@ def test_desktop_surfaces_do_not_restore_studio_branding() -> None:
         TAURI / "capabilities/default.json",
         TAURI / "src/main.rs",
         TAURI / "src/process.rs",
+        # Its LOGIN_REQUIRED sentinel is a sentence the tab shows, and is held byte-identical to
+        # DESKTOP_LOGIN_REQUIRED in features/settings/api/debug-logs.ts by a test in that file. Swept here because the
+        # TypeScript half was already swept, so the pair could only be renamed in lockstep away from the display name.
+        TAURI / "src/native_file_dialogs.rs",
         TAURI / "src/diagnostics/report.rs",
         TAURI / "src/diagnostics/phase_log.rs",
         TAURI / "windows/sign-with-trusted-signing.ps1",
@@ -284,7 +301,13 @@ def test_desktop_surfaces_do_not_restore_studio_branding() -> None:
         for key, value in locale_entries(read(path))
         if "Unsloth Studio" in value and key not in LOCALE_REMOTE_SERVER_KEYS
     ]
-    assert offenders == []
+    offenders += [
+        f"{path.relative_to(REPO)}::{key} (bare 'Studio')"
+        for path in sorted(LOCALES.rglob("*.ts"))
+        for key, value in locale_entries(read(path))
+        if LOCALE_BARE_STUDIO.search(value) and key not in LOCALE_REMOTE_SERVER_KEYS
+    ]
+    assert offenders == [], f"{BRANDING_RULE}\noffenders: {offenders}"
 
     workflow = read(REPO / ".github/workflows/release-desktop.yml")
     assert "Desktop app for Unsloth." in workflow
@@ -322,10 +345,17 @@ def test_the_branding_sweep_still_covers_the_frontend() -> None:
         ):
             assert key in entries, f"{path.name} lost {key}, so the sweep no longer sees it"
 
-    # The allowlist is prose-level, not a blanket: it spares three of the ~1,500 entries a catalog holds, and every
+    # The allowlist is prose-level, not a blanket: it spares two of the ~1,500 entries a catalog holds, and every
     # exempt key has to be one the catalogs actually define.
     english = dict(locale_entries(read(LOCALES / "en.ts")))
     assert LOCALE_REMOTE_SERVER_KEYS <= set(
         english
     ), f"exempt keys missing from en.ts: {sorted(LOCALE_REMOTE_SERVER_KEYS - set(english))}"
+
+    # The bare-"Studio" half is a negative lookbehind, which is exactly the kind of guard that passes by matching
+    # nothing, so it is asked to fire and to hold its fire on the two names that are not this app.
+    assert LOCALE_BARE_STUDIO.search("Retry or check the Studio backend.")
+    assert LOCALE_BARE_STUDIO.search("Studio serves an OpenAI-compatible API.")
+    assert not LOCALE_BARE_STUDIO.search("Connect to a remote Unsloth Studio")
+    assert not LOCALE_BARE_STUDIO.search("LM Studio")
     assert len(LOCALE_REMOTE_SERVER_KEYS) < len(english) / 100

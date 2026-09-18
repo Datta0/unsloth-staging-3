@@ -200,7 +200,13 @@ def test_restore_without_a_legacy_dir_or_an_app_dir_says_which_image_to_use(tmp_
     shutil.rmtree(app)
     res = _link(app, home, "--restore")
     assert res.returncode == 1
-    assert "run --restore under an image that has the Studio code" in res.stderr
+    # Asserted in the parts that carry the meaning rather than as one sentence, because the sentence is the part
+    # that moves: a product rename reworded it and this assertion was the only one of the five it touched that was
+    # not updated with it. What the test is for is that the error says which image to run --restore under, and names
+    # the directory that image has to have the code in.
+    assert "run --restore under an image" in res.stderr
+    assert f"code in {app}" in res.stderr
+    assert "Unsloth Studio" in res.stderr
     assert (home / "src").is_symlink()
 
 
