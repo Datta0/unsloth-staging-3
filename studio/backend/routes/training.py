@@ -461,9 +461,29 @@ def _has_adapter_metadata(path: Path) -> bool:
     return path.is_dir() and (path / "adapter_config.json").is_file()
 
 
-def _remote_untrainable_model_format(model_name: str, hf_token: HfTokenArg) -> Optional[str]:
+_HF_MODEL_ACCESS_DENIED = (
+    "Hugging Face denied access to this model. Add a valid Hugging Face "
+    "token with repository access and accept any required access terms, "
+    "then try again."
+)
+
+
+def _preflight_load_in_4bit(request) -> bool:
+    """The load mode the worker will really use: a full finetune is forced to 16-bit by
+    _build_training_worker_config. getattr, because model_construct() may leave the field unset."""
+    return bool(getattr(request, "load_in_4bit", True)) and (
+        getattr(request, "training_type", None) != "Full Finetuning"
+    )
+
+
+def _remote_untrainable_model_format(
+    model_name: str,
+    hf_token: HfTokenArg,
+    load_in_4bit: bool = True,
+) -> Optional[str]:
     from huggingface_hub import model_info as hf_model_info
     from hub.utils.hf_errors import hf_error_status
+    from utils.models.unsloth_mirror import unsloth_public_mirror
     from utils.security import load_scan_target
 
     # Registry aliases such as "Spark-TTS-0.5B/LLM" are not repos; probe the repo the trainer
@@ -498,11 +518,7 @@ def _remote_untrainable_model_format(model_name: str, hf_token: HfTokenArg) -> O
                 raise _hf_preflight_error(
                     422,
                     "hf_model_access_denied",
-                    (
-                        "Hugging Face denied access to this model. Add a valid Hugging Face "
-                        "token with repository access and accept any required access terms, "
-                        "then try again."
-                    ),
+                    _HF_MODEL_ACCESS_DENIED,
                 ) from error
             retry_available = attempt + 1 < len(timeouts)
             if transient_status:
@@ -538,6 +554,44 @@ def _remote_untrainable_model_format(model_name: str, hf_token: HfTokenArg) -> O
                     "Retry before starting training."
                 ),
             ) from error
+
+    if load_in_4bit and getattr(info, "gated", False):
+        from utils.transformers_version import latest_tier_active_for
+
+        # The start flips a latest-sidecar model to a 16-bit load, which has its own mapping.
+        if latest_tier_active_for(repo_id, account_hf_token(hf_token)):
+            load_in_4bit = False
+
+    # Gated model metadata is public, so verify access to its files separately.
+    if getattr(info, "gated", False) and unsloth_public_mirror(repo_id, load_in_4bit) is None:
+        from urllib.parse import quote
+        from huggingface_hub import constants
+        from huggingface_hub.utils import build_hf_headers, get_session, hf_raise_for_status
+
+        url = f"{constants.ENDPOINT}/api/models/{quote(repo_id, safe = '/')}/auth-check"
+        headers = build_hf_headers(token = account_hf_token(hf_token))
+        # Same two timeouts as the model_info probe above: a transient failure here admits a
+        # run that then dies in the worker with the raw Hub error, which is the whole point of
+        # asking. Retry it, then fail open, since only a definite denial may block a start.
+        for attempt, timeout in enumerate(timeouts):
+            try:
+                hf_raise_for_status(get_session().get(url, headers = headers, timeout = timeout))
+                break
+            except Exception as error:
+                status_code = hf_error_status(error)
+                if status_code in (401, 403):
+                    raise _hf_preflight_error(
+                        422,
+                        "hf_model_access_denied",
+                        _HF_MODEL_ACCESS_DENIED,
+                    ) from error
+                if attempt + 1 < len(timeouts):
+                    continue
+                logger.warning(
+                    "Could not verify access to gated %s (%s); starting anyway",
+                    repo_id,
+                    type(error).__name__,
+                )
 
     load_roots = ("", *(f"{subdir.strip('/')}/" for subdir in load_subdirs if subdir))
     root_files: set[str] = set()
@@ -976,7 +1030,9 @@ def _reject_untrainable_model_request(
                         "Retry before starting training."
                     ),
                 )
-            remote_format = _remote_untrainable_model_format(request.model_name, hf_token)
+            remote_format = _remote_untrainable_model_format(
+                request.model_name, hf_token, _preflight_load_in_4bit(request)
+            )
         except HTTPException as error:
             metadata_error = error
             from core.training.training import _resolve_model_snapshot
