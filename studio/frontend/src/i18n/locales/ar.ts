@@ -300,9 +300,10 @@ export const ar = {
     },
     keyboardShortcuts: {
       title: "اختصارات لوحة المفاتيح",
-      description:
-        "غيّر أي اختصار، أو امسحه لتحرير التركيبة لمتصفحك أو نظام التشغيل.",
       searchPlaceholder: "بحث في الاختصارات…",
+      keystrokePlaceholder: "اضغط اختصارًا للبحث",
+      searchByKeystrokes: "البحث بضغط المفاتيح",
+      searchByName: "البحث بالاسم",
       noResults: "لا توجد اختصارات مطابقة لهذا البحث.",
       unassigned: "غير معيّن",
       recording: "اضغط المفاتيح…",
@@ -874,6 +875,9 @@ export const ar = {
         showLoadedModels: "مؤشر النماذج المحمّلة",
         showLoadedModelsDescription:
           "إظهار بطاقة صغيرة في الزاوية السفلية اليمنى تعرض كل نموذج موجود حاليًا في الذاكرة (الدردشة، الكلام، الصور، الفيديو)، مع زر لإخراج كل منها.",
+        showWhisperUpdates: "إشعارات تحديث whisper.cpp",
+        showWhisperUpdatesDescription:
+          "التنبيه عند توفر إصدار أحدث من whisper.cpp لنماذج تحويل الكلام إلى نص. أوقف التشغيل إذا كنت لا تفرّغ الصوت.",
       },
       startup: {
         sectionTitle: "بدء التشغيل",

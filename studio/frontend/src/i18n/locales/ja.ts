@@ -302,9 +302,10 @@ export const ja = {
     },
     keyboardShortcuts: {
       title: "キーボードショートカット",
-      description:
-        "ショートカットを変更したり、消してブラウザや OS にそのキーを譲ったりできます。",
       searchPlaceholder: "ショートカットを検索…",
+      keystrokePlaceholder: "ショートカットを押して検索",
+      searchByKeystrokes: "キー入力で検索",
+      searchByName: "名前で検索",
       noResults: "該当するショートカットはありません。",
       unassigned: "未割り当て",
       recording: "キーを押してください…",
@@ -864,6 +865,8 @@ export const ja = {
         showLlamaUpdatesDescription: "新しいモデルを実行するための新しい llama.cpp ビルドが利用可能になったときに通知します。トレーニングのみを行う場合はオフにしてください。",
         showLoadedModels: "読み込み済みモデルのインジケーター",
         showLoadedModelsDescription: "現在メモリ上にあるすべてのモデル（チャット、音声、画像、動画）を一覧表示する小さなカードを右下に表示します。各モデルを解放するボタンが付いています。",
+        showWhisperUpdates: "whisper.cpp のアップデート通知",
+        showWhisperUpdatesDescription: "音声認識モデル向けの新しい whisper.cpp ビルドが利用可能になったときに通知します。音声を文字起こししない場合はオフにしてください。",
       },
       startup: {
         sectionTitle: "起動",
