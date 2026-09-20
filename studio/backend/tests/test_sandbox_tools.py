@@ -135,9 +135,13 @@ class TestUntrustedHostBlock:
     def test_untrusted_host_block_blocked(self, code):
         _blocked(code, expect_phrase = "Blocked: host not in sandbox allowlist")
 
-    def test_dynamic_url_not_statically_blocked(self):
-        # Static AST can't resolve runtime URLs; bash blocklist is the fallback.
-        _ok('import requests; url = "https://example.com/"; requests.get(url)')
+    def test_url_bound_to_a_variable_is_resolved(self):
+        # A single-assignment string binding is followed, so binding the URL to a name no longer
+        # walks past the allowlist.
+        _blocked(
+            'import requests; url = "https://example.com/"; requests.get(url)',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
 
 
 class TestHostNormalization:
@@ -2422,4 +2426,408 @@ class TestHfUploadEnvAndSecretLeakBlock:
             'huggingface_hub.upload_folder(folder_path="outputs",'
             ' repo_id="r", api_key="abc")',
             expect_phrase = "HF upload api_key= cannot be set",
+        )
+
+
+_METADATA_URL = "http://169.254.169.254/latest/meta-data/"
+
+
+class TestAliasedNetworkCalls:
+    """An aliased import or a session object used to produce a call name no prefix matched, so the
+    host allowlist never ran on it."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(f'import requests as r\nr.get("{_METADATA_URL}")', id = "module_alias"),
+            pytest.param(
+                f'from requests import get as fetch\nfetch("{_METADATA_URL}")',
+                id = "from_import_alias",
+            ),
+            pytest.param(
+                f'from requests import get\nget("{_METADATA_URL}")', id = "from_import_bare"
+            ),
+            pytest.param(
+                f'import urllib.request as ur\nur.urlopen("{_METADATA_URL}")',
+                id = "urllib_module_alias",
+            ),
+            pytest.param(
+                f'from urllib import request as rq\nrq.urlopen("{_METADATA_URL}")',
+                id = "urllib_submodule_alias",
+            ),
+            pytest.param(f'import httpx as hx\nhx.get("{_METADATA_URL}")', id = "httpx_module_alias"),
+        ],
+    )
+    def test_aliased_call_still_policed_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_alias_to_untrusted_host_blocked(self):
+        _blocked(
+            'import requests as r\nr.get("https://example.com/")',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests as r\nr.get("https://huggingface.co/api/models")',
+                id = "module_alias_allowed",
+            ),
+            pytest.param(
+                'from requests import get as fetch\nfetch("https://en.wikipedia.org/wiki/Foo")',
+                id = "from_import_alias_allowed",
+            ),
+        ],
+    )
+    def test_aliased_call_to_allowed_host_ok(self, code):
+        _ok(code)
+
+
+class TestSessionBoundNetworkCalls:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\ns = requests.Session()\ns.get("{_METADATA_URL}")',
+                id = "requests_session",
+            ),
+            pytest.param(
+                f'import requests as r\nses = r.Session()\nses.post("{_METADATA_URL}")',
+                id = "aliased_requests_session",
+            ),
+            pytest.param(
+                f'from requests.sessions import Session\ns = Session()\ns.get("{_METADATA_URL}")',
+                id = "session_from_import",
+            ),
+            pytest.param(
+                f'import httpx\nc = httpx.Client()\nc.get("{_METADATA_URL}")',
+                id = "httpx_client",
+            ),
+            pytest.param(
+                f'import httpx\nc = httpx.AsyncClient()\nc.get("{_METADATA_URL}")',
+                id = "httpx_async_client",
+            ),
+        ],
+    )
+    def test_session_method_policed_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_session_upload_shape_blocked(self):
+        _blocked(
+            "import requests\n"
+            "s = requests.Session()\n"
+            's.post("https://huggingface.co/upload", files={"f": open("a.bin", "rb")})',
+            expect_phrase = "Blocked: file upload disallowed in sandbox",
+        )
+
+    def test_session_to_allowed_host_ok(self):
+        _ok(
+            "import requests\n"
+            "s = requests.Session()\n"
+            's.get("https://huggingface.co/api/models")'
+        )
+
+
+class TestUrlBindingResolution:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\nu = "{_METADATA_URL}"\nrequests.get(u)', id = "bound_literal"
+            ),
+            pytest.param(
+                f'import requests\nrequests.get(url = "{_METADATA_URL}")', id = "url_keyword"
+            ),
+            pytest.param(
+                'import requests\nh = "169.254.169.254"\nrequests.get(f"http://{h}/latest")',
+                id = "fstring_bound_host",
+            ),
+            pytest.param(
+                'import requests\nbase = "http://169.254.169.254"\nrequests.get(base + "/latest")',
+                id = "concatenated_literal",
+            ),
+            pytest.param(
+                f'import requests\ns = requests.Session()\nu = "{_METADATA_URL}"\ns.get(u)',
+                id = "session_with_bound_url",
+            ),
+        ],
+    )
+    def test_bound_url_resolved_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nu = "https://huggingface.co/api/models"\nrequests.get(u)',
+                id = "bound_allowed_literal",
+            ),
+            pytest.param(
+                'import requests\nq = input()\nrequests.get(f"https://duckduckgo.com/html/?q={q}")',
+                id = "fstring_literal_host_dynamic_query",
+            ),
+            pytest.param(
+                'import requests\nbase = "https://api.github.com"\nrequests.get(base + "/repos/x")',
+                id = "concatenated_allowed_literal",
+            ),
+        ],
+    )
+    def test_bound_url_to_allowed_host_ok(self, code):
+        _ok(code)
+
+    def test_rebound_name_does_not_vouch_for_the_call(self):
+        # Two assignments to one name: the first value must not be usable to vouch for the second.
+        _blocked(
+            'import os, requests\nu = "https://huggingface.co"\nu = os.environ["TARGET"]\n'
+            "requests.get(u)",
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nfor u in ["https://huggingface.co"]:\n    requests.get(u)',
+                id = "loop_variable",
+            ),
+            pytest.param(
+                "import requests\ndef fetch(u):\n    return requests.get(u)\n"
+                'fetch("https://huggingface.co")',
+                id = "function_parameter",
+            ),
+            pytest.param(
+                'import requests\nurls = ["https://huggingface.co"]\nrequests.get(urls[0])',
+                id = "list_subscript",
+            ),
+            pytest.param(
+                'import requests\nr = requests.get("https://api.github.com/x").json()\n'
+                'requests.get(r["url"])',
+                id = "response_field",
+            ),
+        ],
+    )
+    def test_targets_from_inside_the_program_keep_their_prior_treatment_ok(self, code):
+        # A documented limit, not an oversight: these are unresolvable but not chosen off-source,
+        # and blocking them would break ordinary fetch-a-list-of-pages code. Same verdict as before
+        # the resolver existed.
+        _ok(code)
+
+
+class TestExternallySourcedTargets:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import os, requests\nrequests.get(os.environ["TARGET"])', id = "env_var_target"
+            ),
+            pytest.param(
+                'import os, requests\nu = os.environ["TARGET"]\nrequests.get(u)',
+                id = "env_var_bound",
+            ),
+            pytest.param(
+                'import os, requests\nu = os.getenv("TARGET")\nrequests.get(u)',
+                id = "getenv_bound",
+            ),
+            pytest.param("import requests\nrequests.get(input())", id = "user_input_target"),
+            pytest.param("import requests\nu = input()\nrequests.get(u)", id = "user_input_bound"),
+            pytest.param(
+                'import requests\nrequests.get(f"{input()}/latest")', id = "fstring_dynamic_host"
+            ),
+            pytest.param("import sys, requests\nrequests.get(sys.argv[1])", id = "argv_target"),
+            pytest.param(
+                "import urllib.request\nurllib.request.urlopen(input())", id = "urlopen_dynamic"
+            ),
+        ],
+    )
+    def test_target_chosen_outside_the_source_blocked(self, code):
+        _blocked(
+            code, expect_phrase = "Blocked: request target is read from the environment or input"
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param("import requests\ns = requests.Session()", id = "session_constructor"),
+            pytest.param(
+                "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
+                id = "socket_constructor",
+            ),
+            pytest.param("import httpx\nc = httpx.Client(timeout = 5)", id = "httpx_constructor"),
+        ],
+    )
+    def test_constructors_without_a_url_ok(self, code):
+        _ok(code)
+
+
+class TestResolverRobustness:
+    """Regressions found by simulating the resolver against adversarial and ordinary source."""
+
+    def test_unterminated_authority_does_not_vouch_for_the_host_blocked(self):
+        # "https://huggingface.co" + input() really targets huggingface.co<whatever>, so the
+        # prefix must not be read as the host.
+        _blocked(
+            'import requests\nrequests.get("https://huggingface.co" + input())',
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    def test_unterminated_authority_resolves_when_the_rest_is_known_blocked(self):
+        _blocked(
+            'import requests\nx = "co"\nrequests.get("https://huggingface." + x + x + ".evil.org")',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    def test_terminated_authority_still_resolves_ok(self):
+        _ok('import requests\nq = input()\nrequests.get(f"https://duckduckgo.com/html/?q={q}")')
+
+    def test_one_name_used_twice_still_resolves_ok(self):
+        # `seen` tracks the current resolution path, not every name met, so x + x resolves.
+        _ok('import requests\nx = "api/models"\nrequests.get("https://huggingface.co/" + x + x)')
+
+    def test_a_long_binding_chain_does_not_raise(self):
+        chain = "".join(f"a{i} = a{i - 1}\n" for i in range(1, 5000))
+        code = 'import requests\na0 = "https://huggingface.co"\n' + chain + "requests.get(a4999)"
+        assert _check_code_safety(code) is None
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import requests as r\nimport socket as r\nr.get(input())", id = "requests_first"
+            ),
+            pytest.param(
+                "import socket as r\nimport requests as r\nr.get(input())", id = "socket_first"
+            ),
+            pytest.param(
+                "def unused():\n    import socket as r\nimport requests as r\nr.get(input())",
+                id = "import_in_a_function",
+            ),
+        ],
+    )
+    def test_a_name_imported_twice_resolves_to_nothing_either_way(self, code):
+        # ast.walk order is unspecified, so a doubly bound alias must not be resolved at all
+        # rather than resolved to whichever import the walk reached last.
+        assert _check_code_safety(code) is None, code
+
+    def test_a_subscript_write_does_not_discard_the_binding_blocked(self):
+        # table[u] = 0 reads u, it does not rebind it.
+        _blocked(
+            'import requests\nu = "http://169.254.169.254/latest/"\ntable = {}\ntable[u] = 0\n'
+            "requests.get(u)",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_attribute_write_does_not_discard_the_binding_blocked(self):
+        _blocked(
+            'import requests\nu = "http://169.254.169.254/latest/"\n'
+            "class C:\n    pass\nc = C()\nc.u = 0\nrequests.get(u)",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_match_capture_rebinds_the_name_ok(self):
+        # The capture replaces u, so the earlier literal may no longer vouch for the call.
+        _ok(
+            'import requests\nu = "https://huggingface.co"\nmatch input():\n'
+            "    case u:\n        pass\nrequests.get(u)"
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import requests\nurl = 'https://api.github.com/x'\nfor _ in range(3):\n"
+                "    resp = requests.get(url)\n    url = resp.links['next']['url']",
+                id = "pagination_rebind",
+            ),
+            pytest.param(
+                "import requests\nq = 'python'\n"
+                "u = 'https://duckduckgo.com/html/?q={}'.format(q)\nrequests.get(u)",
+                id = "str_format",
+            ),
+            pytest.param(
+                "import requests\nfrom urllib.parse import urljoin\n"
+                "u = urljoin('https://en.wikipedia.org', '/wiki/Python')\nrequests.get(u)",
+                id = "urljoin",
+            ),
+            pytest.param(
+                "import requests\ns = requests.Session()\n"
+                "for u in ['https://huggingface.co/api/models']:\n    s.get(u)",
+                id = "session_over_a_list",
+            ),
+            pytest.param(
+                "import requests\nurl = 'https://huggingface.co'\nurl += '/api/models'\n"
+                "requests.get(url)",
+                id = "augmented_assignment",
+            ),
+        ],
+    )
+    def test_ordinary_fetch_shapes_keep_working_ok(self, code):
+        _ok(code)
+
+
+class TestNameResolutionDoesNotLoseOrInventAHost:
+    """The resolver may add a name the policy checks; it may never remove one, and it may never
+    claim a host the call does not provably reach."""
+
+    def test_an_alias_that_renames_the_module_is_still_policed_blocked(self):
+        # `from requests import api as requests` spells the call requests.get while resolving to
+        # requests.api.get, which no network prefix matches. Both spellings are policed.
+        _blocked(
+            f'from requests import api as requests\nrequests.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_alias_that_renames_the_module_still_blocks_uploads(self):
+        _blocked(
+            "from requests import api as requests\n"
+            'requests.post("https://huggingface.co/", files = {"f": ("s.txt", b"x")})',
+            expect_phrase = "Blocked: file upload disallowed in sandbox",
+        )
+
+    def test_a_backslash_in_the_authority_does_not_smuggle_a_metadata_host_blocked(self):
+        # requests percent-encodes the backslash into the path, so the real host is the IP.
+        _blocked(
+            'import requests\nrequests.get("http://169.254.169.254\\\\@huggingface.co/latest/")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @staticmethod
+    def _verdicts(template: str) -> tuple:
+        allowed = _check_code_safety(template.format(host = "https://huggingface.co/"))
+        untrusted = _check_code_safety(template.format(host = "https://example.com/"))
+        return allowed, untrusted
+
+    def test_a_half_known_sum_vouches_for_nothing(self):
+        # str.__add__ returns NotImplemented for a non-str right operand and Python then calls its
+        # __radd__, which may return any string at all, so the left literal is not a prefix.
+        template = (
+            "import requests\nclass Swap:\n    def __radd__(self, prefix):\n"
+            '        return "http://169.254.169.254/"\nrequests.get("{host}" + Swap())'
+        )
+        allowed, untrusted = self._verdicts(template)
+        assert allowed == untrusted, (allowed, untrusted)
+        assert allowed is None, allowed
+
+    def test_a_binding_in_another_scope_vouches_for_nothing(self):
+        template = 'import requests\ndef unused():\n    u = "{host}"\nrequests.get(u)'
+        allowed, untrusted = self._verdicts(template)
+        assert allowed == untrusted, (allowed, untrusted)
+        assert allowed is None, allowed
+
+    def test_a_deleted_binding_vouches_for_nothing(self):
+        template = 'import requests\nu = "{host}"\ndel u\nrequests.get(u)'
+        allowed, untrusted = self._verdicts(template)
+        assert allowed == untrusted, (allowed, untrusted)
+        assert allowed is None, allowed
+
+    def test_a_binding_in_the_calling_scope_is_still_resolved_blocked(self):
+        _blocked(
+            f'import requests\ndef go():\n    u = "{_METADATA_URL}"\n    requests.get(u)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_module_binding_is_resolved_inside_a_function_blocked(self):
+        _blocked(
+            f'import requests\nu = "{_METADATA_URL}"\ndef go():\n    requests.get(u)',
+            expect_phrase = "Blocked: cloud-metadata host",
         )
