@@ -135,9 +135,13 @@ class TestUntrustedHostBlock:
     def test_untrusted_host_block_blocked(self, code):
         _blocked(code, expect_phrase = "Blocked: host not in sandbox allowlist")
 
-    def test_dynamic_url_not_statically_blocked(self):
-        # Static AST can't resolve runtime URLs; bash blocklist is the fallback.
-        _ok('import requests; url = "https://example.com/"; requests.get(url)')
+    def test_url_bound_to_a_variable_is_resolved(self):
+        # A single-assignment string binding is followed, so binding the URL to a name no longer
+        # walks past the allowlist.
+        _blocked(
+            'import requests; url = "https://example.com/"; requests.get(url)',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
 
 
 class TestHostNormalization:
@@ -2423,3 +2427,2889 @@ class TestHfUploadEnvAndSecretLeakBlock:
             ' repo_id="r", api_key="abc")',
             expect_phrase = "HF upload api_key= cannot be set",
         )
+
+
+_METADATA_URL = "http://169.254.169.254/latest/meta-data/"
+
+
+class TestAliasedNetworkCalls:
+    """An aliased import or a session object used to produce a call name no prefix matched, so the
+    host allowlist never ran on it."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(f'import requests as r\nr.get("{_METADATA_URL}")', id = "module_alias"),
+            pytest.param(
+                f'from requests import get as fetch\nfetch("{_METADATA_URL}")',
+                id = "from_import_alias",
+            ),
+            pytest.param(
+                f'from requests import get\nget("{_METADATA_URL}")', id = "from_import_bare"
+            ),
+            pytest.param(
+                f'import urllib.request as ur\nur.urlopen("{_METADATA_URL}")',
+                id = "urllib_module_alias",
+            ),
+            pytest.param(
+                f'from urllib import request as rq\nrq.urlopen("{_METADATA_URL}")',
+                id = "urllib_submodule_alias",
+            ),
+            pytest.param(f'import httpx as hx\nhx.get("{_METADATA_URL}")', id = "httpx_module_alias"),
+        ],
+    )
+    def test_aliased_call_still_policed_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_alias_to_untrusted_host_blocked(self):
+        _blocked(
+            'import requests as r\nr.get("https://example.com/")',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests as r\nr.get("https://huggingface.co/api/models")',
+                id = "module_alias_allowed",
+            ),
+            pytest.param(
+                'from requests import get as fetch\nfetch("https://en.wikipedia.org/wiki/Foo")',
+                id = "from_import_alias_allowed",
+            ),
+        ],
+    )
+    def test_aliased_call_to_allowed_host_ok(self, code):
+        _ok(code)
+
+
+class TestSessionBoundNetworkCalls:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\ns = requests.Session()\ns.get("{_METADATA_URL}")',
+                id = "requests_session",
+            ),
+            pytest.param(
+                f'import requests as r\nses = r.Session()\nses.post("{_METADATA_URL}")',
+                id = "aliased_requests_session",
+            ),
+            pytest.param(
+                f'from requests.sessions import Session\ns = Session()\ns.get("{_METADATA_URL}")',
+                id = "session_from_import",
+            ),
+            pytest.param(
+                f'import httpx\nc = httpx.Client()\nc.get("{_METADATA_URL}")',
+                id = "httpx_client",
+            ),
+            pytest.param(
+                f'import httpx\nc = httpx.AsyncClient()\nc.get("{_METADATA_URL}")',
+                id = "httpx_async_client",
+            ),
+        ],
+    )
+    def test_session_method_policed_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_session_upload_shape_blocked(self):
+        _blocked(
+            "import requests\n"
+            "s = requests.Session()\n"
+            's.post("https://huggingface.co/upload", files={"f": open("a.bin", "rb")})',
+            expect_phrase = "Blocked: file upload disallowed in sandbox",
+        )
+
+    def test_session_to_allowed_host_ok(self):
+        _ok(
+            "import requests\n"
+            "s = requests.Session()\n"
+            's.get("https://huggingface.co/api/models")'
+        )
+
+
+class TestUrlBindingResolution:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\nu = "{_METADATA_URL}"\nrequests.get(u)', id = "bound_literal"
+            ),
+            pytest.param(
+                f'import requests\nrequests.get(url = "{_METADATA_URL}")', id = "url_keyword"
+            ),
+            pytest.param(
+                'import requests\nh = "169.254.169.254"\nrequests.get(f"http://{h}/latest")',
+                id = "fstring_bound_host",
+            ),
+            pytest.param(
+                'import requests\nbase = "http://169.254.169.254"\nrequests.get(base + "/latest")',
+                id = "concatenated_literal",
+            ),
+            pytest.param(
+                f'import requests\ns = requests.Session()\nu = "{_METADATA_URL}"\ns.get(u)',
+                id = "session_with_bound_url",
+            ),
+        ],
+    )
+    def test_bound_url_resolved_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nu = "https://huggingface.co/api/models"\nrequests.get(u)',
+                id = "bound_allowed_literal",
+            ),
+            pytest.param(
+                'import requests\nq = input()\nrequests.get(f"https://duckduckgo.com/html/?q={q}")',
+                id = "fstring_literal_host_dynamic_query",
+            ),
+            pytest.param(
+                'import requests\nbase = "https://api.github.com"\nrequests.get(base + "/repos/x")',
+                id = "concatenated_allowed_literal",
+            ),
+        ],
+    )
+    def test_bound_url_to_allowed_host_ok(self, code):
+        _ok(code)
+
+    def test_rebound_name_does_not_vouch_for_the_call(self):
+        # Two assignments to one name: the first value must not be usable to vouch for the second.
+        _blocked(
+            'import os, requests\nu = "https://huggingface.co"\nu = os.environ["TARGET"]\n'
+            "requests.get(u)",
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nfor u in ["https://huggingface.co"]:\n    requests.get(u)',
+                id = "loop_variable",
+            ),
+            pytest.param(
+                "import requests\ndef fetch(u):\n    return requests.get(u)\n"
+                'fetch("https://huggingface.co")',
+                id = "function_parameter",
+            ),
+            pytest.param(
+                'import requests\nurls = ["https://huggingface.co"]\nrequests.get(urls[0])',
+                id = "list_subscript",
+            ),
+            pytest.param(
+                'import requests\nr = requests.get("https://api.github.com/x").json()\n'
+                'requests.get(r["url"])',
+                id = "response_field",
+            ),
+        ],
+    )
+    def test_targets_from_inside_the_program_keep_their_prior_treatment_ok(self, code):
+        # A documented limit, not an oversight: these are unresolvable but not chosen off-source,
+        # and blocking them would break ordinary fetch-a-list-of-pages code. Same verdict as before
+        # the resolver existed.
+        _ok(code)
+
+
+class TestExternallySourcedTargets:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import os, requests\nrequests.get(os.environ["TARGET"])', id = "env_var_target"
+            ),
+            pytest.param(
+                'import os, requests\nu = os.environ["TARGET"]\nrequests.get(u)',
+                id = "env_var_bound",
+            ),
+            pytest.param(
+                'import os, requests\nu = os.getenv("TARGET")\nrequests.get(u)',
+                id = "getenv_bound",
+            ),
+            pytest.param("import requests\nrequests.get(input())", id = "user_input_target"),
+            pytest.param("import requests\nu = input()\nrequests.get(u)", id = "user_input_bound"),
+            pytest.param(
+                'import requests\nrequests.get(f"{input()}/latest")', id = "fstring_dynamic_host"
+            ),
+            pytest.param("import sys, requests\nrequests.get(sys.argv[1])", id = "argv_target"),
+            pytest.param(
+                "import urllib.request\nurllib.request.urlopen(input())", id = "urlopen_dynamic"
+            ),
+        ],
+    )
+    def test_target_chosen_outside_the_source_blocked(self, code):
+        _blocked(
+            code, expect_phrase = "Blocked: request target is read from the environment or input"
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param("import requests\ns = requests.Session()", id = "session_constructor"),
+            pytest.param(
+                "import socket\ns = socket.socket(socket.AF_INET, socket.SOCK_STREAM)",
+                id = "socket_constructor",
+            ),
+            pytest.param("import httpx\nc = httpx.Client(timeout = 5)", id = "httpx_constructor"),
+        ],
+    )
+    def test_constructors_without_a_url_ok(self, code):
+        _ok(code)
+
+
+class TestResolverRobustness:
+    """Regressions found by simulating the resolver against adversarial and ordinary source."""
+
+    def test_unterminated_authority_does_not_vouch_for_the_host_blocked(self):
+        # "https://huggingface.co" + input() really targets huggingface.co<whatever>, so the
+        # prefix must not be read as the host.
+        _blocked(
+            'import requests\nrequests.get("https://huggingface.co" + input())',
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    def test_unterminated_authority_resolves_when_the_rest_is_known_blocked(self):
+        _blocked(
+            'import requests\nx = "co"\nrequests.get("https://huggingface." + x + x + ".evil.org")',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    def test_terminated_authority_still_resolves_ok(self):
+        _ok('import requests\nq = input()\nrequests.get(f"https://duckduckgo.com/html/?q={q}")')
+
+    def test_one_name_used_twice_still_resolves_ok(self):
+        # `seen` tracks the current resolution path, not every name met, so x + x resolves.
+        _ok('import requests\nx = "api/models"\nrequests.get("https://huggingface.co/" + x + x)')
+
+    def test_a_long_binding_chain_does_not_raise(self):
+        chain = "".join(f"a{i} = a{i - 1}\n" for i in range(1, 5000))
+        code = 'import requests\na0 = "https://huggingface.co"\n' + chain + "requests.get(a4999)"
+        assert _check_code_safety(code) is None
+
+    def test_a_name_imported_twice_reads_as_the_import_above_the_call(self):
+        # Source order decides, not ast.walk order: the call sees the nearest import above it.
+        _blocked(
+            "import socket as r\nimport requests as r\nr.get(input())",
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    def test_an_import_below_the_call_does_not_answer_for_it(self):
+        _ok("import socket as r\nimport socket as r\nr.getaddrinfo(input(), 80)")
+
+    def test_a_call_between_two_imports_reads_as_the_first(self):
+        # The second import is below the call, so it cannot retrospectively unpolice it.
+        _blocked(
+            f'import requests as r\nr.get("{_METADATA_URL}")\nimport socket as r',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_import_in_another_scope_does_not_collide(self):
+        # The module-level r is requests whatever an unused function imported, so the call resolves
+        # and its externally sourced target is refused.
+        _blocked(
+            "def unused():\n    import socket as r\nimport requests as r\nr.get(input())",
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    def test_a_subscript_write_does_not_discard_the_binding_blocked(self):
+        # table[u] = 0 reads u, it does not rebind it.
+        _blocked(
+            'import requests\nu = "http://169.254.169.254/latest/"\ntable = {}\ntable[u] = 0\n'
+            "requests.get(u)",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_attribute_write_does_not_discard_the_binding_blocked(self):
+        _blocked(
+            'import requests\nu = "http://169.254.169.254/latest/"\n'
+            "class C:\n    pass\nc = C()\nc.u = 0\nrequests.get(u)",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_match_capture_rebinds_the_name_ok(self):
+        # The capture replaces u, so the earlier literal may no longer vouch for the call.
+        _ok(
+            'import requests\nu = "https://huggingface.co"\nmatch input():\n'
+            "    case u:\n        pass\nrequests.get(u)"
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import requests\nurl = 'https://api.github.com/x'\nfor _ in range(3):\n"
+                "    resp = requests.get(url)\n    url = resp.links['next']['url']",
+                id = "pagination_rebind",
+            ),
+            pytest.param(
+                "import requests\nq = 'python'\n"
+                "u = 'https://duckduckgo.com/html/?q={}'.format(q)\nrequests.get(u)",
+                id = "str_format",
+            ),
+            pytest.param(
+                "import requests\nfrom urllib.parse import urljoin\n"
+                "u = urljoin('https://en.wikipedia.org', '/wiki/Python')\nrequests.get(u)",
+                id = "urljoin",
+            ),
+            pytest.param(
+                "import requests\ns = requests.Session()\n"
+                "for u in ['https://huggingface.co/api/models']:\n    s.get(u)",
+                id = "session_over_a_list",
+            ),
+            pytest.param(
+                "import requests\nurl = 'https://huggingface.co'\nurl += '/api/models'\n"
+                "requests.get(url)",
+                id = "augmented_assignment",
+            ),
+        ],
+    )
+    def test_ordinary_fetch_shapes_keep_working_ok(self, code):
+        _ok(code)
+
+
+class TestNameResolutionDoesNotLoseOrInventAHost:
+    """The resolver may add a name the policy checks; it may never remove one, and it may never
+    claim a host the call does not provably reach."""
+
+    def test_an_alias_that_renames_the_module_is_still_policed_blocked(self):
+        # `from requests import api as requests` spells the call requests.get while resolving to
+        # requests.api.get, which no network prefix matches. Both spellings are policed.
+        _blocked(
+            f'from requests import api as requests\nrequests.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_alias_that_renames_the_module_still_blocks_uploads(self):
+        _blocked(
+            "from requests import api as requests\n"
+            'requests.post("https://huggingface.co/", files = {"f": ("s.txt", b"x")})',
+            expect_phrase = "Blocked: file upload disallowed in sandbox",
+        )
+
+    def test_a_backslash_in_the_authority_does_not_smuggle_a_metadata_host_blocked(self):
+        # requests percent-encodes the backslash into the path, so the real host is the IP.
+        _blocked(
+            'import requests\nrequests.get("http://169.254.169.254\\\\@huggingface.co/latest/")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @staticmethod
+    def _verdicts(template: str) -> tuple:
+        allowed = _check_code_safety(template.format(host = "https://huggingface.co/"))
+        untrusted = _check_code_safety(template.format(host = "https://example.com/"))
+        return allowed, untrusted
+
+    def test_a_half_known_sum_vouches_for_nothing(self):
+        # str.__add__ returns NotImplemented for a non-str right operand and Python then calls its
+        # __radd__, which may return any string at all, so the left literal is not a prefix.
+        template = (
+            "import requests\nclass Swap:\n    def __radd__(self, prefix):\n"
+            '        return "http://169.254.169.254/"\nrequests.get("{host}" + Swap())'
+        )
+        allowed, untrusted = self._verdicts(template)
+        assert allowed == untrusted, (allowed, untrusted)
+        assert allowed is None, allowed
+
+    def test_a_binding_in_another_scope_vouches_for_nothing(self):
+        template = 'import requests\ndef unused():\n    u = "{host}"\nrequests.get(u)'
+        allowed, untrusted = self._verdicts(template)
+        assert allowed == untrusted, (allowed, untrusted)
+        assert allowed is None, allowed
+
+    def test_a_deleted_binding_vouches_for_nothing(self):
+        template = 'import requests\nu = "{host}"\ndel u\nrequests.get(u)'
+        allowed, untrusted = self._verdicts(template)
+        assert allowed == untrusted, (allowed, untrusted)
+        assert allowed is None, allowed
+
+    def test_a_binding_in_the_calling_scope_is_still_resolved_blocked(self):
+        _blocked(
+            f'import requests\ndef go():\n    u = "{_METADATA_URL}"\n    requests.get(u)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_module_binding_is_resolved_inside_a_function_blocked(self):
+        _blocked(
+            f'import requests\nu = "{_METADATA_URL}"\ndef go():\n    requests.get(u)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+
+class TestRequestMethodAndWrapperArguments:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\nrequests.request("GET", "{_METADATA_URL}")', id = "requests"
+            ),
+            pytest.param(
+                f'import requests\ns = requests.Session()\ns.request("GET", "{_METADATA_URL}")',
+                id = "session",
+            ),
+            pytest.param(f'import httpx\nhttpx.request("GET", "{_METADATA_URL}")', id = "httpx"),
+            pytest.param(
+                f'import requests\nrequests.request("GET", url = "{_METADATA_URL}")',
+                id = "url_keyword",
+            ),
+        ],
+    )
+    def test_request_takes_the_url_second_blocked(self, code):
+        # .request(method, url): reading argument zero polices the verb and lets the target through.
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_a_computed_method_is_not_mistaken_for_the_target_ok(self):
+        _ok('import requests\nmeth = input()\nrequests.request(meth, "https://huggingface.co")')
+
+    def test_a_computed_url_on_request_is_still_blocked(self):
+        _blocked(
+            'import os, requests\nrequests.request("GET", os.environ["TARGET"])',
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import urllib.request\n"
+                f'req = urllib.request.Request("{_METADATA_URL}")\nurllib.request.urlopen(req)',
+                id = "bound_request_object",
+            ),
+            pytest.param(
+                "import urllib.request\n"
+                f'urllib.request.urlopen(urllib.request.Request("{_METADATA_URL}"))',
+                id = "inline_request_object",
+            ),
+        ],
+    )
+    def test_a_request_object_carries_its_url_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_a_request_object_to_an_allowed_host_ok(self):
+        _ok(
+            "import urllib.request\n"
+            'req = urllib.request.Request("https://en.wikipedia.org/wiki/Python")\n'
+            "urllib.request.urlopen(req)"
+        )
+
+
+class TestScopeAndReceiverAccuracy:
+    """Resolution has to follow Python's own name and attribute rules, or it refuses code that is
+    fine and reads a host off a binding the call never uses."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param('import sqlite3\nsqlite3.connect("state.db")', id = "literal_path"),
+            pytest.param(
+                'import sqlite3\npath = "state.db"\nsqlite3.connect(path)', id = "bound_path"
+            ),
+        ],
+    )
+    def test_a_non_socket_connect_is_not_a_host_ok(self, code):
+        _ok(code)
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import socket\ns = socket.socket()\ns.connect(("169.254.169.254", 80))',
+                id = "bound_socket",
+            ),
+            pytest.param(
+                'import socket\nh = "169.254.169.254"\ns = socket.socket()\ns.connect((h, 80))',
+                id = "bound_socket_bound_host",
+            ),
+            pytest.param(
+                'import socket\nsocket.socket().connect(("169.254.169.254", 80))',
+                id = "inline_socket",
+            ),
+            pytest.param(
+                "import socket\nwith socket.socket() as s:\n"
+                '    s.connect(("169.254.169.254", 80))',
+                id = "context_manager_socket",
+            ),
+            pytest.param(
+                'import socket\ndef go(s):\n    s.connect(("169.254.169.254", 80))',
+                id = "socket_passed_in",
+            ),
+        ],
+    )
+    def test_a_socket_connect_is_still_policed_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_a_parameter_shadows_an_external_global_ok(self):
+        # Python resolves the argument to the parameter; the module-level url is never read.
+        _ok(
+            "import requests\nurl = input()\ndef fetch(url):\n    requests.get(url)\n"
+            'fetch("https://huggingface.co/")'
+        )
+
+    def test_an_unshadowed_external_global_is_still_blocked(self):
+        _blocked(
+            'import os, requests\nurl = os.environ["TARGET"]\nrequests.get(url)',
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    def test_an_import_alias_does_not_escape_its_function_ok(self):
+        # The module-level open() is the builtin, whatever an unused function imported.
+        _ok("def unused():\n    from urllib.request import urlopen as open\nopen(input())")
+
+    def test_a_module_level_import_alias_still_resolves_blocked(self):
+        _blocked(
+            f'from urllib.request import urlopen\nurlopen("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_method_does_not_see_the_class_namespace_ok(self):
+        # A bare name in a method skips the class body and resolves to the module global.
+        _ok(
+            'import requests\nurl = "https://huggingface.co/api/models"\nclass C:\n'
+            f'    url = "{_METADATA_URL}"\n    def fetch(self):\n        requests.get(url)'
+        )
+
+    def test_a_class_body_still_sees_its_own_names_blocked(self):
+        _blocked(
+            f'import requests\nclass C:\n    url = "{_METADATA_URL}"\n    requests.get(url)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+
+class TestSessionAliasesAndShadowedAliases:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import requests\ns = requests.Session()\nclient = s\n"
+                f'client.get("{_METADATA_URL}")',
+                id = "one_hop",
+            ),
+            pytest.param(
+                "import requests\ns = requests.Session()\na = s\nb = a\n"
+                f'b.get("{_METADATA_URL}")',
+                id = "two_hops",
+            ),
+        ],
+    )
+    def test_a_session_held_through_another_name_is_policed_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_a_session_alias_still_blocks_uploads(self):
+        _blocked(
+            "import requests\ns = requests.Session()\nc = s\n"
+            's.post("https://huggingface.co/u", files = {"f": open("a.bin", "rb")})',
+            expect_phrase = "Blocked: file upload disallowed in sandbox",
+        )
+
+    def test_a_session_alias_to_an_allowed_host_ok(self):
+        _ok(
+            "import requests\ns = requests.Session()\nc = s\n"
+            'c.get("https://huggingface.co/api/models")'
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import requests as client\ndef go(client):\n    client.get(input())",
+                id = "parameter",
+            ),
+            pytest.param(
+                "import requests as r\ndef go():\n    r = object()\n    r.get(input())",
+                id = "local_assignment",
+            ),
+        ],
+    )
+    def test_a_nearer_binding_shadows_an_alias_ok(self, code):
+        _ok(code)
+
+    def test_an_unshadowed_alias_still_resolves_blocked(self):
+        _blocked(
+            f'import requests as client\nclient.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+
+class TestScopeEdgesAndWorkBudget:
+    def test_a_default_expression_runs_in_the_enclosing_scope_blocked(self):
+        # Defaults are evaluated at def time, before the body exists, so a local of the same name
+        # cannot vouch for them.
+        _blocked(
+            'import os, requests\nurl = os.environ["TARGET"]\n'
+            'def f(x = requests.get(url)):\n    url = "https://huggingface.co/"\n    return x',
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    def test_a_default_expression_resolves_the_enclosing_binding_blocked(self):
+        _blocked(
+            f'import requests\nurl = "{_METADATA_URL}"\ndef deco(fn):\n    return fn\n'
+            '@deco\ndef g(y = requests.get(url)):\n    url = "https://huggingface.co/"',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_global_declaration_is_not_a_rebinding_blocked(self):
+        # `global u` declares, it does not write, so the one module binding stays resolvable.
+        _blocked(
+            f'import requests\nu = "{_METADATA_URL}"\ndef unused():\n    global u\n'
+            "requests.get(u)",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_comprehension_target_does_not_rebind_the_outer_name_blocked(self):
+        # In Python 3 a comprehension has its own scope, so [r for r in ()] leaves the alias alone.
+        _blocked(
+            f'import requests as r\n[r for r in ()]\nr.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_resolution_is_bounded_on_a_doubling_binding_graph(self):
+        # s2 = s1 + s1 doubles the work per level: depth alone is not a budget.
+        import time
+
+        chain = "".join(f"s{i} = s{i - 1} + s{i - 1}\n" for i in range(1, 25))
+        code = "import requests\ns0 = 'x'\n" + chain + "requests.get(s24)"
+        started = time.perf_counter()
+        _check_code_safety(code)
+        assert time.perf_counter() - started < 2.0
+
+    def test_an_external_source_is_still_found_through_a_long_chain(self):
+        chain = "".join(f"v{i} = v{i - 1}\n" for i in range(1, 21))
+        _blocked(
+            "import os, requests\nv0 = os.environ['TARGET']\n" + chain + "requests.get(v20)",
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+
+class TestComprehensionIterableAndAliasOrder:
+    def test_the_leftmost_iterable_is_evaluated_outside_the_comprehension_blocked(self):
+        # Python evaluates it before the comprehension scope exists, so the target does not shadow
+        # the enclosing name it reads.
+        _blocked(
+            'import os, requests\nurl = os.environ["TARGET"]\n' "[x for url in requests.get(url)]",
+            expect_phrase = "Blocked: request target is read from the environment or input",
+        )
+
+    def test_a_comprehension_still_resolves_its_own_names_ok(self):
+        _ok(
+            'import requests\nurls = ["https://huggingface.co/api/models"]\n'
+            "[requests.get(u) for u in urls]"
+        )
+
+    def test_an_alias_still_applies_to_calls_before_its_rebind_blocked(self):
+        _blocked(
+            f'import requests as r\nr.get("{_METADATA_URL}")\nr = object()',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests as r\nr = object()\nr.get("{_METADATA_URL}")', id = "rebound_first"
+            ),
+            pytest.param(
+                "import requests as r\ndef go():\n    r = object()\n    r.get(input())",
+                id = "local_shadow",
+            ),
+        ],
+    )
+    def test_a_call_after_the_rebind_is_not_the_alias_ok(self, code):
+        _ok(code)
+
+
+class TestContextManagersWalrusesAndTheVersionFloor:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\nwith requests.Session() as s:\n    s.get("{_METADATA_URL}")',
+                id = "requests_session",
+            ),
+            pytest.param(
+                f'import httpx\nwith httpx.Client() as s:\n    s.get("{_METADATA_URL}")',
+                id = "httpx_client",
+            ),
+            pytest.param(
+                "import aiohttp\nasync def go():\n    async with aiohttp.ClientSession() as s:\n"
+                f'        await s.get("{_METADATA_URL}")',
+                id = "aiohttp_async_with",
+            ),
+        ],
+    )
+    def test_a_context_managed_client_is_policed_blocked(self, code):
+        # Each of these hands back the object itself, so the name still holds the session.
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_a_context_managed_client_to_an_allowed_host_ok(self):
+        _ok(
+            "import requests\nwith requests.Session() as s:\n"
+            '    s.get("https://huggingface.co/api/models")'
+        )
+
+    def test_a_walrus_in_a_comprehension_binds_outside_it_blocked(self):
+        # Python binds it in the containing scope, so the comprehension really does leave the
+        # metadata URL in u and the call below it fetches that, not the literal above.
+        _blocked(
+            'import requests\nu = "https://huggingface.co/"\n'
+            f'[(u := "{_METADATA_URL}") for _ in [0]]\nrequests.get(u)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_walrus_below_the_call_does_not_answer_for_it_ok(self):
+        _ok(
+            'import requests\nu = "https://huggingface.co/api/models"\nrequests.get(u)\n'
+            f'[(u := "{_METADATA_URL}") for _ in [0]]'
+        )
+
+    def test_a_walrus_outside_a_comprehension_still_resolves_blocked(self):
+        _blocked(
+            f'import requests\nif (u := "{_METADATA_URL}"):\n    requests.get(u)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_the_analysis_runs_where_match_is_not_in_the_ast(self, monkeypatch):
+        # match arrived in 3.10 and the package floor is 3.9, where ast has no MatchAs.
+        import ast as ast_module
+
+        for name in ("MatchAs", "MatchStar", "MatchMapping"):
+            monkeypatch.delattr(ast_module, name, raising = False)
+        import importlib
+
+        import core.inference.tools as tools_module
+
+        reloaded = importlib.reload(tools_module)
+        try:
+            assert (
+                reloaded._check_code_safety('import requests\nrequests.get("https://hf.co")')
+                is None
+            )
+            assert "cloud-metadata host" in (
+                reloaded._check_code_safety(f'import requests as r\nr.get("{_METADATA_URL}")') or ""
+            )
+        finally:
+            monkeypatch.undo()
+            importlib.reload(reloaded)
+
+
+class TestNonlocalTargetsAndSessionMethods:
+    _NONLOCAL = """import requests
+def outer():
+    u = "{outer}"
+    def middle():
+        def inner():
+            nonlocal u
+            u = "{inner}"
+        inner()
+    middle()
+    requests.get(u)
+"""
+
+    def test_a_nonlocal_through_an_unbound_middle_scope_reaches_the_real_binding(self):
+        # The write lands on outer's u, so the name has two bindings and vouches for nothing. The
+        # stale outer literal must not answer for the call.
+        _ok(self._NONLOCAL.format(outer = _METADATA_URL, inner = "https://huggingface.co/"))
+
+    def test_an_untouched_outer_binding_still_resolves_blocked(self):
+        _blocked(
+            'import requests\ndef outer():\n    u = "%s"\n    requests.get(u)' % _METADATA_URL,
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import requests\ns = requests.Session()\n" 's.get_adapter("https://example.com/")',
+                id = "get_adapter",
+            ),
+            pytest.param(
+                'import requests\ns = requests.Session()\ns.mount("https://example.com/", None)',
+                id = "mount",
+            ),
+        ],
+    )
+    def test_a_session_method_that_sends_nothing_is_not_a_request_ok(self, code):
+        _ok(code)
+
+    def test_a_session_method_that_does_send_is_still_policed_blocked(self):
+        _blocked(
+            f'import requests\ns = requests.Session()\ns.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+
+class TestClassBodyOrder:
+    def test_a_use_above_the_class_attribute_reads_the_module_binding_ok(self):
+        # A class body executes in order, so the attribute assigned below has not happened yet.
+        _ok(
+            'import requests\nurl = "https://huggingface.co/"\nclass C:\n'
+            '    requests.get(url)\n    url = "https://example.com/"'
+        )
+
+    def test_a_use_below_the_class_attribute_reads_it_blocked(self):
+        _blocked(
+            f'import requests\nclass C:\n    url = "{_METADATA_URL}"\n    requests.get(url)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+
+class TestInlineAndLowercaseSessionFactories:
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\nrequests.Session().get("{_METADATA_URL}")', id = "inline_session"
+            ),
+            pytest.param(
+                f'import httpx\nhttpx.Client().get("{_METADATA_URL}")', id = "inline_client"
+            ),
+            pytest.param(
+                f'import requests\nrequests.session().get("{_METADATA_URL}")',
+                id = "inline_lowercase",
+            ),
+            pytest.param(
+                f'import requests\ns = requests.session()\ns.get("{_METADATA_URL}")',
+                id = "bound_lowercase",
+            ),
+        ],
+    )
+    def test_a_client_built_in_place_is_policed_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_an_inline_client_upload_is_still_refused(self):
+        _blocked(
+            "import requests\n"
+            'requests.Session().post("https://huggingface.co/u", files = {"f": open("a.bin", "rb")})',
+            expect_phrase = "Blocked: file upload disallowed in sandbox",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nrequests.Session().get("https://huggingface.co/api/models")',
+                id = "allowed_host",
+            ),
+            pytest.param(
+                'import requests\nrequests.Session().mount("https://example.com/", None)',
+                id = "sends_nothing",
+            ),
+        ],
+    )
+    def test_an_inline_client_that_is_fine_keeps_working_ok(self, code):
+        _ok(code)
+
+
+class TestScalarHostConnectMethods:
+    """`connect` with a plain host string still reaches a host: only the local-resource clients
+    are exempt, and their first argument is a path or a DSN rather than something to screen."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import ftplib\nftplib.FTP().connect("169.254.169.254", 80)',
+                id = "ftplib",
+            ),
+            pytest.param(
+                'import socketio\nsocketio.Client().connect("http://169.254.169.254/latest/")',
+                id = "socketio",
+            ),
+        ],
+    )
+    def test_a_scalar_host_connect_is_screened_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_an_untrusted_scalar_host_connect_is_refused(self):
+        _blocked(
+            'import smtplib\nsmtplib.SMTP().connect("evil.example", 25)',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param('import sqlite3\nsqlite3.connect("state.db")', id = "literal_path"),
+            pytest.param(
+                'import sqlite3\npath = "state.db"\nsqlite3.connect(path)',
+                id = "bound_path",
+            ),
+            pytest.param(
+                'import sqlite3\nwith sqlite3.connect("state.db") as db:\n    pass',
+                id = "context_manager",
+            ),
+            pytest.param(
+                'import psycopg2\npsycopg2.connect("dbname = app user = app")',
+                id = "dsn",
+            ),
+            pytest.param('import duckdb\nduckdb.connect("warehouse.duckdb")', id = "duckdb"),
+        ],
+    )
+    def test_a_local_resource_connect_is_left_alone_ok(self, code):
+        _ok(code)
+
+    def test_a_socket_receiver_is_still_screened(self):
+        _blocked(
+            'import socket\ns = socket.socket()\ns.connect(("169.254.169.254", 80))',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+
+class TestUrllib3Targets:
+    """urllib3 reaches the network through the prefix table, so its URL argument has to be read
+    like any other: `urllib3.request("GET", url)` takes the method first."""
+
+    def test_an_env_target_is_refused(self):
+        _blocked(
+            'import os, urllib3\nurllib3.request("GET", os.environ["TARGET"])',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_a_pool_manager_target_is_refused(self):
+        _blocked(
+            "import os, urllib3\n"
+            "pool = urllib3.PoolManager()\n"
+            'pool.request("GET", os.environ["TARGET"])',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_a_metadata_host_is_still_blocked(self):
+        _blocked(
+            f'import urllib3\nurllib3.request("GET", "{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_allowed_host_keeps_working_ok(self):
+        _ok('import urllib3\nurllib3.request("GET", "https://huggingface.co/api/models")')
+
+
+class TestAliasedExternalSources:
+    """Renaming os or sys on import does not make the target any less externally chosen."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import os as o\nimport requests\nrequests.get(o.environ["TARGET"])',
+                id = "module_alias_environ",
+            ),
+            pytest.param(
+                'import os as o\nimport requests\nrequests.get(o.getenv("TARGET"))',
+                id = "module_alias_getenv",
+            ),
+            pytest.param(
+                "from os import getenv as env\nimport requests\nrequests.get(env('TARGET'))",
+                id = "function_alias",
+            ),
+            pytest.param(
+                'from os import environ as e\nimport requests\nrequests.get(e["TARGET"])',
+                id = "mapping_alias",
+            ),
+            pytest.param(
+                "import sys as s\nimport requests\nrequests.get(s.argv[1])",
+                id = "argv_alias",
+            ),
+            pytest.param(
+                "import subprocess as sp\n"
+                "import requests\n"
+                'requests.get(sp.check_output(["printenv", "TARGET"]).decode())',
+                id = "subprocess_alias",
+            ),
+            pytest.param(
+                'import os as o\nimport requests\nu = o.environ["TARGET"]\nrequests.get(u)',
+                id = "through_a_binding",
+            ),
+        ],
+    )
+    def test_an_aliased_external_target_is_refused(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    def test_a_local_name_that_merely_looks_like_os_is_not_an_external_read_ok(self):
+        _ok(
+            "import requests\n"
+            "class o:\n"
+            '    environ = {"TARGET": "https://huggingface.co/api/models"}\n'
+            'requests.get(o.environ["TARGET"])'
+        )
+
+    def test_an_aliased_os_used_for_something_else_changes_nothing_ok(self):
+        _ok(
+            "import os as o\n"
+            "import requests\n"
+            'o.makedirs("d", exist_ok = True)\n'
+            'requests.get("https://huggingface.co/api/models")'
+        )
+
+
+class TestABindingHoldsUntilItIsRebound:
+    """A later rebind must not reach back and unpolice the calls above it: that is a one-line
+    bypass. Each binding answers for the calls between itself and the next one."""
+
+    def test_an_import_below_the_call_does_not_unpolice_it(self):
+        _blocked(
+            f'import requests as r\nr.get("{_METADATA_URL}")\nimport httpx as r',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_session_rebound_afterwards_is_still_a_session_at_the_call(self):
+        _blocked(
+            f'import requests\ns = requests.Session()\ns.get("{_METADATA_URL}")\ns = object()',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_session_upload_is_not_laundered_by_a_later_rebind(self):
+        _blocked(
+            "import requests\n"
+            "s = requests.Session()\n"
+            's.post("https://huggingface.co/u", files = {"f": open("a.bin", "rb")})\n'
+            "s = object()",
+            expect_phrase = "Blocked: file upload disallowed in sandbox",
+        )
+
+    def test_a_name_reassigned_before_the_call_is_not_the_session_ok(self):
+        _ok(f'import requests\ns = requests.Session()\ns = object()\ns.get("{_METADATA_URL}")')
+
+    def test_a_session_still_works_where_nothing_rebinds_it_ok(self):
+        _ok('import requests\ns = requests.Session()\ns.get("https://huggingface.co/api/models")')
+
+
+class TestLocalConnectorsAreJudgedByOrigin:
+    """The local-resource exemption reads where the receiver came from, never how it is spelled."""
+
+    def test_a_network_client_under_a_reserved_name_is_still_screened(self):
+        _blocked(
+            'import smtplib\nsqlite3 = smtplib.SMTP()\nsqlite3.connect("169.254.169.254", 80)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_second_reserved_name_does_not_help_either(self):
+        _blocked(
+            'import ftplib\nmysql = ftplib.FTP()\nmysql.connect("evil.example", 21)',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param('import sqlite3\nsqlite3.connect("state.db")', id = "module"),
+            pytest.param('import sqlite3 as db\ndb.connect("state.db")', id = "aliased_module"),
+            pytest.param(
+                'import sqlalchemy\nengine = sqlalchemy.create_engine("sqlite:///x.db")\n'
+                "engine.connect()",
+                id = "engine",
+            ),
+        ],
+    )
+    def test_a_real_local_client_is_left_alone_ok(self, code):
+        _ok(code)
+
+
+class TestSendingMethodsThatAreNotVerbs:
+    """A client method sends whether or not it is named after an HTTP verb."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import aiohttp\n"
+                "c = aiohttp.ClientSession()\n"
+                'c.ws_connect("ws://169.254.169.254/latest")',
+                id = "ws_connect",
+            ),
+            pytest.param(
+                f'import httpx\nc = httpx.Client()\nc.stream("GET", "{_METADATA_URL}")',
+                id = "stream",
+            ),
+            pytest.param(
+                f'import urllib3\np = urllib3.PoolManager()\np.urlopen("GET", "{_METADATA_URL}")',
+                id = "pool_urlopen",
+            ),
+        ],
+    )
+    def test_a_sending_method_is_policed_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_urlopen_on_the_stdlib_still_reads_its_first_argument(self):
+        # urllib.request.urlopen(url) and pool.urlopen(method, url) are different methods that
+        # share a name, so the owner decides which argument holds the URL.
+        _blocked(
+            f'import urllib.request\nurllib.request.urlopen("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import httpx\n"
+                "c = httpx.Client()\n"
+                'c.stream("GET", "https://huggingface.co/api/models")',
+                id = "allowed_host",
+            ),
+            pytest.param(
+                'import requests\ns = requests.Session()\ns.mount("https://example.com/", None)',
+                id = "sends_nothing",
+            ),
+        ],
+    )
+    def test_what_does_not_reach_a_blocked_host_keeps_working_ok(self, code):
+        _ok(code)
+
+
+class TestHostsConfiguredOnTheClient:
+    """A host handed to the constructor is the host the later relative request reaches."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import httpx\nc = httpx.Client(base_url = "http://169.254.169.254")\n'
+                'c.get("/latest")',
+                id = "httpx_base_url",
+            ),
+            pytest.param(
+                "import aiohttp\n"
+                'c = aiohttp.ClientSession(base_url = "http://169.254.169.254")\n'
+                'c.get("/latest")',
+                id = "aiohttp_base_url",
+            ),
+            pytest.param(
+                'import urllib3\np = urllib3.HTTPConnectionPool("169.254.169.254", 80)\n'
+                'p.request("GET", "/latest")',
+                id = "pool_positional_host",
+            ),
+        ],
+    )
+    def test_a_configured_metadata_host_is_blocked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_a_configured_untrusted_host_is_refused(self):
+        _blocked(
+            'import urllib3\np = urllib3.HTTPSConnectionPool(host = "evil.example")\n'
+            'p.request("GET", "/x")',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import httpx\nc = httpx.Client(base_url = "https://huggingface.co")\n'
+                'c.get("/api/models")',
+                id = "allowed_base_url",
+            ),
+            pytest.param(
+                'import urllib3\np = urllib3.HTTPSConnectionPool("huggingface.co")\n'
+                'p.request("GET", "/api/models")',
+                id = "allowed_pool_host",
+            ),
+            pytest.param(
+                "import httpx\nc = httpx.Client(timeout = 5)\n"
+                'c.get("https://huggingface.co/api/models")',
+                id = "no_host_configured",
+            ),
+        ],
+    )
+    def test_a_configured_allowed_host_keeps_working_ok(self, code):
+        _ok(code)
+
+
+class TestBindingsSeenFromInsideAFunction:
+    """A function body runs when it is called, so its line number says nothing about which outer
+    binding it observes. The last binding in the source is the conservative answer."""
+
+    def test_a_body_written_above_its_import_is_still_policed(self):
+        _blocked(
+            f'import requests\nr = object()\ndef f():\n    r.get("{_METADATA_URL}")\n'
+            "import requests as r\nf()",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_body_written_above_its_session_is_still_policed(self):
+        _blocked(
+            f'import requests\ndef f():\n    s.get("{_METADATA_URL}")\n'
+            "s = requests.Session()\nf()",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_ordinary_closure_over_a_client_keeps_working_ok(self):
+        _ok(
+            "import requests as r\n"
+            "def f():\n"
+            '    return r.get("https://huggingface.co/api/models")\n'
+            "f()"
+        )
+
+
+class TestConfiguredHostsChosenOffSource:
+    """A host handed to a constructor is refused when it is read from outside the source, for the
+    same reason a request target is."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import os, httpx\nhttpx.Client(base_url = os.environ["TARGET"]).get("/latest")',
+                id = "base_url_from_env",
+            ),
+            pytest.param(
+                "import os, urllib3\n"
+                'urllib3.HTTPConnectionPool(os.environ["TARGET"], 80).request("GET", "/x")',
+                id = "pool_host_from_env",
+            ),
+            pytest.param(
+                'import httpx\nc = httpx.Client(base_url = input())\nc.get("/latest")',
+                id = "base_url_from_input",
+            ),
+        ],
+    )
+    def test_an_external_configured_host_is_refused(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+
+class TestDatabaseConnectionStrings:
+    """A database client is exempt while it opens a file. Its connection string can name a remote
+    host just as plainly as a URL does."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import psycopg2\npsycopg2.connect("postgresql://user:pass@evil.example/db")',
+                id = "libpq_url",
+            ),
+            pytest.param(
+                'import pyodbc\npyodbc.connect("DRIVER={x};SERVER=evil.example;UID=u")',
+                id = "odbc_server",
+            ),
+            pytest.param(
+                'import mysql.connector\nmysql.connector.connect(host = "evil.example")',
+                id = "host_keyword",
+            ),
+        ],
+    )
+    def test_a_remote_database_host_is_screened(self, code):
+        _blocked(code, expect_phrase = "Blocked: host not in sandbox allowlist")
+
+    def test_a_metadata_host_in_a_dsn_is_blocked(self):
+        _blocked(
+            'import psycopg2\npsycopg2.connect("postgresql://u@169.254.169.254/db")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import psycopg2\npsycopg2.connect("dbname = app user = app")', id = "no_host"
+            ),
+            pytest.param('import sqlite3\nsqlite3.connect("state.db")', id = "sqlite_path"),
+            pytest.param('import duckdb\nduckdb.connect("warehouse.duckdb")', id = "duckdb_path"),
+            pytest.param(
+                'import sqlalchemy\nsqlalchemy.create_engine("sqlite:///x.db").connect()',
+                id = "sqlite_url_scheme",
+            ),
+        ],
+    )
+    def test_a_connection_that_opens_a_file_is_left_alone_ok(self, code):
+        _ok(code)
+
+
+class TestTheWorkBudgetIsNotAWayThrough:
+    """Giving up has to mean refusing. A guard that answers "not external" when it runs out of
+    budget would make a long chain of assignments the whole bypass."""
+
+    def test_a_long_chain_does_not_launder_an_environment_target(self):
+        chain = "".join(f"v{i} = v{i - 1}\n" for i in range(1, 300))
+        _blocked(
+            'import os, requests\nv0 = os.environ["TARGET"]\n' + chain + "requests.get(v299)",
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_a_long_chain_of_literals_still_costs_nothing_ok(self):
+        chain = "".join(f"a{i} = a{i - 1}\n" for i in range(1, 5000))
+        _ok('import requests\na0 = "https://huggingface.co"\n' + chain + "requests.get(a4999)")
+
+
+class TestTheExemptionNeedsARealImport:
+    """A reserved name only exempts a call when it is the module that was imported."""
+
+    def test_a_module_assigned_to_a_reserved_name_is_not_exempt(self):
+        _blocked(
+            'import smtplib\nsqlite3 = smtplib\nsqlite3.SMTP().connect("169.254.169.254", 80)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_second_reserved_module_name_does_not_help_either(self):
+        _blocked(
+            'import ftplib\nduckdb = ftplib\nduckdb.FTP().connect("evil.example", 21)',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    def test_the_imported_module_itself_is_still_exempt_ok(self):
+        _ok('import sqlite3 as db\ndb.connect("state.db")')
+
+
+class TestExpandedConnectionKeywords:
+    """A `**` mapping overrides the DSN, so it is read rather than skipped."""
+
+    def test_a_literal_expansion_naming_a_metadata_host_is_blocked(self):
+        _blocked(
+            'import psycopg2\npsycopg2.connect("dbname=app", **{"host": "169.254.169.254"})',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_literal_expansion_naming_an_untrusted_host_is_refused(self):
+        _blocked(
+            'import psycopg2\npsycopg2.connect("dbname=app", **{"host": "evil.example"})',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    def test_an_expansion_read_from_the_environment_is_refused(self):
+        _blocked(
+            'import os, psycopg2\npsycopg2.connect("dbname=app", **os.environ)',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_an_ordinary_expansion_keeps_working_ok(self):
+        _ok('import psycopg2\nopts = {"dbname": "app"}\npsycopg2.connect("dbname=app", **opts)')
+
+
+class TestLongChainsResolveRatherThanLapse:
+    """A chain of plain assignments is not nesting, so it must not reach the nesting limit."""
+
+    @pytest.mark.parametrize("links", [24, 500])
+    def test_a_blocked_literal_survives_a_long_chain(self, links):
+        chain = "".join(f"a{i} = a{i - 1}\n" for i in range(1, links + 1))
+        _blocked(
+            f'import requests\na0 = "{_METADATA_URL}"\n' + chain + f"requests.get(a{links})",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_long_session_alias_chain_is_still_a_session(self):
+        chain = "".join(f"s{i} = s{i - 1}\n" for i in range(1, 26))
+        _blocked(
+            "import requests\ns0 = requests.Session()\n" + chain + f's25.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_long_chain_of_allowed_literals_keeps_working_ok(self):
+        chain = "".join(f"a{i} = a{i - 1}\n" for i in range(1, 500))
+        _ok(
+            'import requests\na0 = "https://huggingface.co/api/models"\n'
+            + chain
+            + "requests.get(a499)"
+        )
+
+
+class TestAuthoritiesThatReachTwoHosts:
+    r"""Clients disagree about a backslash in the authority: requests percent-encodes it into the
+    path, httpx keeps it in the userinfo. Reading it one way alone is a bypass on the other."""
+
+    def test_a_host_before_the_backslash_is_screened(self):
+        _blocked(
+            'import requests\nrequests.get("http://169.254.169.254\\\\@huggingface.co/latest/")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_host_after_the_backslash_is_screened_too(self):
+        _blocked(
+            'import httpx\nhttpx.get("http://huggingface.co\\\\@evil.example/x")',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    def test_a_metadata_host_either_side_is_blocked(self):
+        _blocked(
+            'import httpx\nhttpx.get("http://169.254.169.254\\\\@huggingface.co/x")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nrequests.get("http://huggingface.co\\\\@huggingface.co/x")',
+                id = "allowed_either_way",
+            ),
+            pytest.param(
+                'import requests\nrequests.get("https://user:pw@huggingface.co/api/models")',
+                id = "ordinary_userinfo",
+            ),
+            pytest.param(
+                'import requests\nrequests.get("https://huggingface.co:443/api/models")',
+                id = "explicit_port",
+            ),
+        ],
+    )
+    def test_an_authority_that_is_allowed_whichever_way_it_reads_is_fine_ok(self, code):
+        _ok(code)
+
+
+class TestAiohttpPositionalBaseUrl:
+    """aiohttp takes its base URL positionally, so argument zero is where its host is set."""
+
+    def test_a_positional_base_url_from_the_environment_is_refused(self):
+        _blocked(
+            'import os, aiohttp\nc = aiohttp.ClientSession(os.environ["TARGET"])\nc.get("/latest")',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_a_positional_metadata_base_url_is_blocked(self):
+        _blocked(
+            'import aiohttp\nc = aiohttp.ClientSession("http://169.254.169.254")\nc.get("/latest")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_positional_allowed_base_url_keeps_working_ok(self):
+        _ok(
+            'import aiohttp\nc = aiohttp.ClientSession("https://huggingface.co")\n'
+            'c.get("/api/models")'
+        )
+
+
+class TestMultiHostConnectionStrings:
+    """A libpq DSN may list failover hosts and the client tries each, so screening the first
+    alone would let the rest through."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import psycopg2\npsycopg2.connect("host=huggingface.co,evil.example dbname=app")',
+                id = "keyword_list",
+            ),
+            pytest.param(
+                'import psycopg2\npsycopg2.connect("postgresql://u@huggingface.co,evil.example/db")',
+                id = "url_authority_list",
+            ),
+            pytest.param(
+                'import pyodbc\npyodbc.connect("DRIVER={x};SERVER=huggingface.co,evil.example;")',
+                id = "odbc_list",
+            ),
+            pytest.param(
+                'import psycopg2\npsycopg2.connect(host = "huggingface.co,evil.example")',
+                id = "host_keyword_list",
+            ),
+        ],
+    )
+    def test_a_second_host_behind_an_allowed_one_is_still_screened(self, code):
+        _blocked(code, expect_phrase = "Blocked: host not in sandbox allowlist")
+
+    def test_a_metadata_host_later_in_the_list_is_blocked(self):
+        _blocked(
+            'import psycopg2\npsycopg2.connect("host=huggingface.co,169.254.169.254 dbname=app")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_single_allowed_host_keeps_working_ok(self):
+        _ok('import psycopg2\npsycopg2.connect("host=huggingface.co dbname=app")')
+
+
+class TestReplacedConnectCallables:
+    """The exemption is for the client that was imported, not for the name it left behind."""
+
+    def test_a_connect_replaced_on_a_local_module_is_screened(self):
+        _blocked(
+            "import sqlite3, smtplib\n"
+            "sqlite3.connect = smtplib.SMTP().connect\n"
+            'sqlite3.connect("evil.example", 25)',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    def test_the_same_trick_at_a_metadata_host_is_blocked(self):
+        _blocked(
+            "import sqlite3, smtplib\n"
+            "sqlite3.connect = smtplib.SMTP().connect\n"
+            'sqlite3.connect("169.254.169.254", 80)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_untouched_local_client_keeps_working_ok(self):
+        _ok('import sqlite3\nsqlite3.connect("state.db")\nsqlite3.connect("other.db")')
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import sqlite3, smtplib\n"
+                "sqlite3.x = smtplib.SMTP()\n"
+                'sqlite3.x.connect("169.254.169.254", 80)',
+                id = "attribute_below_the_module",
+            ),
+            pytest.param(
+                "import sqlite3, smtplib\n"
+                "sqlite3.a.b = smtplib.SMTP()\n"
+                'sqlite3.a.b.connect("169.254.169.254", 80)',
+                id = "deeper_attribute",
+            ),
+        ],
+    )
+    def test_a_rebound_prefix_is_not_the_module_either(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+
+class TestTupleHostsChosenAtRuntime:
+    """A host the tuple computes is no more readable than one a URL computes."""
+
+    def test_a_socket_target_read_from_input_is_refused(self):
+        _blocked(
+            "import socket\nsocket.create_connection((input(), 80))",
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_a_socket_target_read_from_the_environment_is_refused(self):
+        _blocked(
+            'import os, socket\ns = socket.socket()\ns.connect((os.environ["H"], 80))',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_a_literal_metadata_tuple_is_still_blocked(self):
+        _blocked(
+            'import socket\ns = socket.socket()\ns.connect(("169.254.169.254", 80))',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_allowed_tuple_host_keeps_working_ok(self):
+        _ok('import socket\ns = socket.socket()\ns.connect(("huggingface.co", 443))')
+
+
+class TestDestructuredRebinds:
+    """`(sqlite3.connect,) = (...)` replaces the callable as plainly as a bare assignment."""
+
+    def test_a_tuple_target_counts_as_a_rebind(self):
+        _blocked(
+            "import sqlite3, smtplib\n"
+            "(sqlite3.connect,) = (smtplib.SMTP().connect,)\n"
+            'sqlite3.connect("169.254.169.254", 80)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_list_target_counts_too(self):
+        _blocked(
+            "import sqlite3, smtplib\n"
+            "[sqlite3.connect] = [smtplib.SMTP().connect]\n"
+            'sqlite3.connect("evil.example", 25)',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+
+class TestTargetsReadFromAFile:
+    """A URL in a workspace file was chosen wherever that file came from, which is the same hole
+    as reading the environment."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nrequests.get(open("target.txt").read())', id = "open_read"
+            ),
+            pytest.param(
+                "from pathlib import Path\nimport requests\n"
+                'requests.get(Path("t.txt").read_text())',
+                id = "path_read_text",
+            ),
+            pytest.param(
+                'import requests\nu = open("target.txt").readline()\nrequests.get(u)',
+                id = "through_a_binding",
+            ),
+        ],
+    )
+    def test_a_target_read_from_a_file_is_refused(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    def test_reading_a_response_afterwards_is_not_a_target_ok(self):
+        _ok(
+            "import requests\n"
+            'r = requests.get("https://huggingface.co/api/models")\n'
+            "print(r.text)"
+        )
+
+
+class TestDirectlyImportedConnectors:
+    """`from psycopg2 import connect` spells the call as a bare name, and the resolved name is
+    what says what it is."""
+
+    def test_a_directly_imported_connect_is_screened(self):
+        _blocked(
+            'from psycopg2 import connect\nconnect("postgresql://u@169.254.169.254/db")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_aliased_direct_import_is_screened_too(self):
+        _blocked(
+            "from psycopg2 import connect as pgconnect\n"
+            'pgconnect("postgresql://u@evil.example/db")',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+
+class TestDatabaseTargetsChosenOffSource:
+    """A DSN read from the environment picks the host at runtime, which is the same hole a
+    request target read from the environment is."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import os, psycopg2\npsycopg2.connect(host = os.environ["H"])', id = "host_keyword"
+            ),
+            pytest.param(
+                'import os, pyodbc\npyodbc.connect(os.environ["DSN"])', id = "positional_dsn"
+            ),
+        ],
+    )
+    def test_an_external_database_target_is_refused(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    def test_a_file_only_client_is_not_a_target_at_all_ok(self):
+        # sqlite3 opens a file whatever the string says, so an environment-chosen path is not a
+        # host the allowlist could police.
+        _ok('import os, sqlite3\nsqlite3.connect(os.environ["DB"])')
+
+
+class TestFileOnlyClientsKeepTheirPaths:
+    """A file-only client's argument is a path however it is spelled."""
+
+    def test_a_path_that_reads_like_a_dsn_is_still_a_path(self):
+        _ok('import sqlite3\nsqlite3.connect("host=cache.db")')
+
+    def test_a_duckdb_path_is_unaffected_ok(self):
+        _ok('import duckdb\nduckdb.connect("host=warehouse.duckdb")')
+
+
+class TestPoolManagerTakesAPoolCount:
+    """`urllib3.PoolManager(10)` configures pools; only the connection pools take a host."""
+
+    def test_a_pool_count_from_the_environment_is_not_a_target(self):
+        _ok(
+            "import os, urllib3\n"
+            'p = urllib3.PoolManager(int(os.environ["N"]))\n'
+            'p.request("GET", "https://huggingface.co/api/models")'
+        )
+
+    def test_a_connection_pool_host_from_the_environment_is_still_refused(self):
+        _blocked(
+            'import os, urllib3\np = urllib3.HTTPSConnectionPool(os.environ["H"])\n'
+            'p.request("GET", "/x")',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+
+class TestAStringBindingHoldsUntilItIsReplaced:
+    """A later assignment does not reach back and unpolice the request above it."""
+
+    def test_a_value_replaced_after_the_call_is_still_what_the_call_saw(self):
+        _blocked(
+            f'import requests\nu = "{_METADATA_URL}"\nrequests.get(u)\n'
+            'u = "https://huggingface.co"',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_value_replaced_before_the_call_is_the_one_that_counts_ok(self):
+        _ok(
+            f'import requests\nu = "{_METADATA_URL}"\n'
+            'u = "https://huggingface.co/api/models"\nrequests.get(u)'
+        )
+
+
+class TestPartiallyDynamicAuthorities:
+    """A URL with a dynamic tail still names its host once the authority is closed."""
+
+    def test_a_base_url_with_a_dynamic_path_is_screened(self):
+        _blocked(
+            "import httpx\n"
+            "def fetch(path):\n"
+            f'    httpx.Client(base_url = f"http://169.254.169.254/{{path}}").get("/x")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_database_url_with_a_dynamic_name_is_screened(self):
+        _blocked(
+            "import psycopg2\n"
+            "def go(db):\n"
+            '    psycopg2.connect(f"postgresql://u@169.254.169.254/{db}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import httpx\n"
+                "def fetch(h):\n"
+                '    httpx.Client(base_url = f"https://huggingface.co{h}").get("/x")',
+                id = "base_url_authority_not_closed",
+            ),
+            pytest.param(
+                "import psycopg2\n"
+                "def go(h):\n"
+                '    psycopg2.connect(f"postgresql://u@huggingface.co{h}/db")',
+                id = "dsn_authority_not_closed",
+            ),
+        ],
+    )
+    def test_an_unterminated_authority_vouches_for_nothing_ok(self, code):
+        # "https://huggingface.co" + suffix may really be huggingface.co.evil.org, so a prefix
+        # that has not passed the delimiter names no host either way.
+        _ok(code)
+
+
+class TestTargetsHandedOverInAMapping:
+    """`requests.get(**{"url": ...})` names its target as plainly as a positional one."""
+
+    def test_a_metadata_url_in_an_expansion_is_blocked(self):
+        _blocked(
+            f'import requests\nrequests.get(**{{"url": "{_METADATA_URL}"}})',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_untrusted_url_in_an_expansion_is_refused(self):
+        _blocked(
+            'import requests\nrequests.get(**{"url": "https://evil.example/x"})',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import os, requests\nrequests.get(**{"url": os.environ["T"]})', id = "literal_map"
+            ),
+            pytest.param("import os, requests\nrequests.get(**os.environ)", id = "opaque_map"),
+        ],
+    )
+    def test_an_external_target_in_an_expansion_is_refused(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nrequests.get(**{"url": "https://huggingface.co/api/models"})',
+                id = "allowed_url",
+            ),
+            pytest.param(
+                "import requests\n"
+                'opts = {"timeout": 5}\n'
+                'requests.get("https://huggingface.co/api/models", **opts)',
+                id = "ordinary_options",
+            ),
+        ],
+    )
+    def test_an_expansion_that_reaches_an_allowed_host_keeps_working_ok(self, code):
+        _ok(code)
+
+    def test_an_expanded_database_host_from_the_environment_is_refused(self):
+        _blocked(
+            'import os, psycopg2\npsycopg2.connect(**{"host": os.environ["H"]})',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_an_expanded_database_host_that_is_allowed_keeps_working_ok(self):
+        _ok('import psycopg2\npsycopg2.connect(**{"host": "huggingface.co"})')
+
+
+class TestOnlyRealFileReadsAreExternal:
+    """A read method is a file read when its receiver is a file. An in-memory reader holds a
+    string the source itself wrote."""
+
+    def test_an_in_memory_reader_is_not_an_external_source_ok(self):
+        _ok('import io, requests\nrequests.get(io.StringIO("https://huggingface.co/x").read())')
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nrequests.get(open("target.txt").read())', id = "inline_open"
+            ),
+            pytest.param(
+                'import requests\nf = open("target.txt")\nrequests.get(f.read())',
+                id = "bound_handle",
+            ),
+            pytest.param(
+                "from pathlib import Path\nimport requests\n"
+                'requests.get(Path("t.txt").read_text())',
+                id = "pathlib",
+            ),
+        ],
+    )
+    def test_a_real_file_read_is_still_external(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+
+class TestConditionalAssignments:
+    """Source position says a conditional assignment came before the call, not that it ran, so
+    it is a value the call may see rather than the value it does see."""
+
+    def test_a_conditional_assignment_does_not_displace_the_value_below_it(self):
+        _blocked(
+            f'import requests\nurl = "{_METADATA_URL}"\nif False:\n'
+            '    url = "https://huggingface.co"\nrequests.get(url)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_either_branch_reaching_a_blocked_host_is_enough(self):
+        _blocked(
+            'import requests\nurl = "https://huggingface.co/a"\nif flag:\n'
+            '    url = "https://evil.example/b"\nrequests.get(url)',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    def test_both_branches_on_an_allowed_host_keep_working_ok(self):
+        _ok(
+            'import requests\nurl = "https://huggingface.co/a"\nif flag:\n'
+            '    url = "https://huggingface.co/b"\nrequests.get(url)'
+        )
+
+    def test_an_unconditional_reassignment_still_replaces_the_value_ok(self):
+        _ok(
+            'import requests\nurl = "https://evil.example/a"\n'
+            'url = "https://huggingface.co/api/models"\nrequests.get(url)'
+        )
+
+
+class TestRequestObjectsHandedToSend:
+    """`httpx.Client.send` takes a request object, and that object carries the URL."""
+
+    def test_a_request_object_built_inline_is_screened(self):
+        _blocked(
+            f'import httpx\nc = httpx.Client()\nc.send(httpx.Request("GET", "{_METADATA_URL}"))',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_the_same_request_on_an_allowed_host_keeps_working_ok(self):
+        _ok(
+            "import httpx\n"
+            "c = httpx.Client()\n"
+            'c.send(httpx.Request("GET", "https://huggingface.co/api/models"))'
+        )
+
+
+class TestFileReceiverChainsAreBounded:
+    """Following a chain of handles must return a verdict, never raise out of the tool call."""
+
+    def test_a_long_handle_chain_returns_a_verdict(self):
+        chain = "".join(f"f{i} = f{i - 1}\n" for i in range(1, 1500))
+        message = _check_code_safety(
+            'import requests\nf0 = open("target")\n' + chain + "requests.get(f1499.read())"
+        )
+        assert message is not None and "request target is read" in message
+
+
+class TestKnownHostsAmongUnknownOnes:
+    """A host that is known has to be screened even when a sibling value is not."""
+
+    def test_a_known_blocked_host_beside_an_unresolvable_one_is_refused(self):
+        _blocked(
+            f'import requests\nurl = make_url()\nif flag:\n    url = "{_METADATA_URL}"\n'
+            "requests.get(url)",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_known_allowed_host_beside_an_unresolvable_one_is_fine_ok(self):
+        _ok(
+            "import requests\nurl = make_url()\nif flag:\n"
+            '    url = "https://huggingface.co/x"\nrequests.get(url)'
+        )
+
+
+class TestAliasesAcrossConditionalRebinds:
+    """A rebind that only runs when a branch is taken does not remove the alias above it."""
+
+    def test_a_conditional_rebind_keeps_the_alias_policed(self):
+        _blocked(
+            f'import requests as r\nif flag:\n    r = stub\nr.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_unconditional_rebind_still_ends_the_alias_ok(self):
+        _ok(f'import requests as r\nr = stub\nr.get("{_METADATA_URL}")')
+
+
+class TestOtherWaysOfOpeningAFile:
+    """`open` hands back a file whatever spells it."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import io, requests\nrequests.get(io.open("target.txt").read())', id = "io_open"
+            ),
+            pytest.param(
+                "from pathlib import Path\nimport requests\n"
+                'requests.get(Path("t.txt").open().read())',
+                id = "path_open",
+            ),
+        ],
+    )
+    def test_a_handle_from_an_open_method_is_a_file_read(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    def test_an_in_memory_reader_is_still_not_one_ok(self):
+        _ok('import io, requests\nrequests.get(io.StringIO("https://huggingface.co/x").read())')
+
+
+class TestShadowedInputHelpers:
+    """Only the builtin reads a terminal."""
+
+    def test_a_locally_defined_input_is_not_an_external_source_ok(self):
+        _ok(
+            "import requests\n"
+            "def input():\n"
+            '    return "https://huggingface.co/x"\n'
+            "requests.get(input())"
+        )
+
+    def test_the_real_input_is_still_refused(self):
+        _blocked(
+            "import requests\nrequests.get(input())",
+            expect_phrase = "Blocked: request target is read",
+        )
+
+
+class TestAssignmentsThatReadTheirOwnTarget:
+    """Python evaluates the right side before rebinding, so the old value is what it sees."""
+
+    def test_an_alias_survives_the_call_that_replaces_it(self):
+        _blocked(
+            f'import requests as r\nr = r.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_session_survives_the_call_that_replaces_it(self):
+        _blocked(
+            f'import requests\ns = requests.Session()\ns = s.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_building_on_a_name_from_itself_still_resolves_ok(self):
+        _ok(
+            'import requests\nu = "https://huggingface.co"\nu = u + "/api/models"\n'
+            "requests.get(u)"
+        )
+
+
+class TestManyPossibleValues:
+    """Every value a name can hold is screened, however many branches there are."""
+
+    def test_a_blocked_host_in_the_last_of_many_branches_is_found(self):
+        branches = "".join(
+            f'if flag{i}:\n    url = "https://huggingface.co/{i}"\n' for i in range(24)
+        )
+        _blocked(
+            'import requests\nurl = "https://huggingface.co/a"\n'
+            + branches
+            + f'if last:\n    url = "{_METADATA_URL}"\nrequests.get(url)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+
+class TestResolutionThatGivesUp:
+    """Abandoning an expression is not the same as reading it and finding it dynamic."""
+
+    def test_a_target_nested_beyond_the_limit_is_refused(self):
+        _blocked(
+            f'import requests\nrequests.get("{_METADATA_URL}"' + ' + ""' * 26 + ")",
+            expect_phrase = "Blocked: request target is nested too deeply",
+        )
+
+    def test_an_ordinary_concatenation_still_resolves_ok(self):
+        _ok('import requests\nrequests.get("https://huggingface.co" + "/api/models")')
+
+
+class TestAliasesOfTheExternalReaders:
+    """`reader = input` is the same reader under another name."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param("import requests\nreader = input\nrequests.get(reader())", id = "input"),
+            pytest.param(
+                'import os, requests\nreader = os.getenv\nrequests.get(reader("T"))',
+                id = "getenv",
+            ),
+            pytest.param(
+                'import os, requests\ngetter = os.environ.get\nrequests.get(getter("T"))',
+                id = "environ_get",
+            ),
+        ],
+    )
+    def test_an_aliased_reader_is_still_external(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    def test_a_local_function_of_the_same_shape_is_not_ok(self):
+        _ok(
+            "import requests\n"
+            "def reader():\n"
+            '    return "https://huggingface.co/x"\n'
+            "requests.get(reader())"
+        )
+
+
+class TestLibpqHostaddr:
+    """libpq takes a literal address in `hostaddr`, which reaches a host without naming one."""
+
+    def test_a_hostaddr_in_a_dsn_is_screened(self):
+        _blocked(
+            'import psycopg\npsycopg.connect("hostaddr=169.254.169.254 dbname=x")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_hostaddr_keyword_is_screened(self):
+        _blocked(
+            'import psycopg\npsycopg.connect(hostaddr = "169.254.169.254")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_connection_with_no_host_at_all_keeps_working_ok(self):
+        _ok('import psycopg2\npsycopg2.connect("dbname = app")')
+
+
+class TestFilesHeldByAContextManager:
+    """`with open(...) as f` hands back the file, so the name still holds it."""
+
+    def test_a_target_read_through_a_with_block_is_external(self):
+        _blocked(
+            'import requests\nwith open("target.txt") as f:\n    requests.get(f.read())',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_writing_a_file_next_to_a_request_changes_nothing_ok(self):
+        _ok(
+            'import requests\nwith open("out.txt", "w") as f:\n    f.write("x")\n'
+            'requests.get("https://huggingface.co/api/models")'
+        )
+
+
+class TestConditionalClientBaseUrls:
+    """A constructor host gets the same possible-value screening a request target gets."""
+
+    def test_a_metadata_base_url_in_one_branch_is_refused(self):
+        _blocked(
+            'import httpx\nu = "https://huggingface.co"\nif flag:\n'
+            '    u = "http://169.254.169.254"\nhttpx.Client(base_url = u).get("/x")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_both_branches_allowed_keeps_working_ok(self):
+        _ok(
+            'import httpx\nu = "https://huggingface.co"\nif flag:\n'
+            '    u = "https://huggingface.co"\nhttpx.Client(base_url = u).get("/api/models")'
+        )
+
+
+class TestPreparedAndBuiltRequests:
+    """A request object built from a URL still carries it."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import requests\ns = requests.Session()\n"
+                f's.send(requests.Request("GET", "{_METADATA_URL}").prepare())',
+                id = "prepared_request",
+            ),
+            pytest.param(
+                "import httpx\nc = httpx.Client()\n"
+                f'c.send(c.build_request("GET", "{_METADATA_URL}"))',
+                id = "built_request",
+            ),
+        ],
+    )
+    def test_a_built_request_is_screened_at_send(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_the_same_shape_on_an_allowed_host_keeps_working_ok(self):
+        _ok(
+            "import requests\ns = requests.Session()\n"
+            's.send(requests.Request("GET", "https://huggingface.co/api/models").prepare())'
+        )
+
+
+class TestEveryAddressKeyword:
+    """libpq uses `hostaddr` as the destination, so the order the keywords are written in cannot
+    decide whether it is screened."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import psycopg\n"
+                'psycopg.connect(host = "huggingface.co", hostaddr = "169.254.169.254")',
+                id = "host_first",
+            ),
+            pytest.param(
+                "import psycopg\n"
+                'psycopg.connect(hostaddr = "169.254.169.254", host = "huggingface.co")',
+                id = "hostaddr_first",
+            ),
+        ],
+    )
+    def test_both_orders_are_screened(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+
+class TestConditionalBareHosts:
+    """A pool takes a bare host, so its branches are screened as hosts rather than as URLs."""
+
+    def test_a_metadata_host_in_one_branch_is_refused(self):
+        _blocked(
+            'import urllib3\nh = "huggingface.co"\nif flag:\n    h = "169.254.169.254"\n'
+            'urllib3.HTTPConnectionPool(h).request("GET", "/latest")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_both_branches_allowed_keeps_working_ok(self):
+        _ok(
+            'import urllib3\nh = "huggingface.co"\nif flag:\n    h = "huggingface.co"\n'
+            'urllib3.HTTPConnectionPool(h).request("GET", "/x")'
+        )
+
+
+class TestShadowedModules:
+    """A name the source defines is not the module it spells."""
+
+    def test_a_local_class_named_os_is_not_the_environment_ok(self):
+        _ok(
+            "import requests\n"
+            "class os:\n"
+            '    environ = {"URL": "https://huggingface.co/x"}\n'
+            'requests.get(os.environ["URL"])'
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param('import os, requests\nrequests.get(os.environ["URL"])', id = "environ"),
+            pytest.param('import os, requests\nrequests.get(os.getenv("URL"))', id = "getenv"),
+            pytest.param(
+                'import os as o\nimport requests\nrequests.get(o.environ["URL"])',
+                id = "aliased_import",
+            ),
+        ],
+    )
+    def test_the_imported_module_is_still_the_environment(self, code):
+        # An import of the name is how you get the real module, so it is not a shadow.
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+
+class TestDuckTypedReadersAndReaders:
+    """A method name is not a guarantee. The receiver settles what it is."""
+
+    def test_a_local_class_with_a_getenv_is_not_the_environment_ok(self):
+        _ok(
+            "import requests\n"
+            "class os:\n"
+            "    @staticmethod\n"
+            "    def getenv(key):\n"
+            '        return "https://huggingface.co/x"\n'
+            'requests.get(os.getenv("K"))'
+        )
+
+    def test_the_imported_getenv_is_still_the_environment(self):
+        _blocked(
+            'import os, requests\nrequests.get(os.getenv("K"))',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_a_custom_read_text_is_not_a_file_read_ok(self):
+        _ok(
+            "import requests\n"
+            "class Blob:\n"
+            "    def read_text(self):\n"
+            '        return "https://huggingface.co/x"\n'
+            "requests.get(Blob().read_text())"
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "from pathlib import Path\nimport requests\n"
+                'requests.get(Path("t.txt").read_text())',
+                id = "inline_path",
+            ),
+            pytest.param(
+                "from pathlib import Path\nimport requests\n"
+                'p = Path("t.txt")\nrequests.get(p.read_text())',
+                id = "bound_path",
+            ),
+        ],
+    )
+    def test_a_real_path_read_is_still_a_file_read(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+
+class TestEveryValueABindingCanHold:
+    """The rule is deliberately simple: a call is answered by every value assigned to the name
+    that can reach it, and a value is only superseded by a later assignment the call is certain
+    to have run past. Deciding which branch runs is not something this analysis tries to do, so
+    where the answer would depend on that it over-blocks rather than under-blocks."""
+
+    def test_a_straight_line_reassignment_supersedes_what_came_before_ok(self):
+        _ok(
+            'import requests\nu = "https://evil.example/a"\n'
+            'u = "https://huggingface.co/api/models"\nrequests.get(u)'
+        )
+
+    def test_a_reassignment_in_the_same_block_as_the_call_supersedes_too_ok(self):
+        _ok(
+            'import requests\nif __name__ == "__main__":\n'
+            f'    u = "{_METADATA_URL}"\n'
+            '    u = "https://huggingface.co/api/models"\n'
+            "    requests.get(u)"
+        )
+
+    def test_building_a_value_out_of_itself_still_resolves_ok(self):
+        _ok(
+            'import requests\nu = "https://huggingface.co"\nu = u + "/api/models"\n'
+            "requests.get(u)"
+        )
+
+    def test_a_value_assigned_in_a_branch_the_call_is_outside_of_is_screened(self):
+        _blocked(
+            'import requests\nu = "https://huggingface.co/a"\nif flag:\n'
+            f'    u = "{_METADATA_URL}"\n'
+            "requests.get(u)",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_value_both_arms_replace_is_screened_anyway(self):
+        # Deliberate over-block. Proving that no path leaves the original value behind takes
+        # branch analysis, and getting that wrong fails open. This costs a refusal on a rare
+        # shape; the other way round costs a metadata request.
+        _blocked(
+            f'import requests\nu = "{_METADATA_URL}"\nif flag:\n'
+            '    u = "https://huggingface.co/a"\nelse:\n'
+            '    u = "https://huggingface.co/b"\nrequests.get(u)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_value_assigned_below_the_call_in_a_loop_is_screened(self):
+        # The next turn round the loop reads it, so position alone does not rule it out.
+        _blocked(
+            'import requests\nu = "https://huggingface.co/a"\nfor x in items:\n'
+            "    requests.get(u)\n"
+            f'    u = "{_METADATA_URL}"',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_a_value_assigned_below_the_call_outside_a_loop_is_not_ok(self):
+        _ok(
+            'import requests\nu = "https://huggingface.co/api/models"\nrequests.get(u)\n'
+            f'u = "{_METADATA_URL}"'
+        )
+
+
+class TestShadowsHappenWhereTheyAreWritten:
+    """A shadow below the call has not happened yet, so the call still reads the builtin."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nrequests.get(input())\ninput = lambda: "https://huggingface.co"',
+                id = "input_rebound_after",
+            ),
+            pytest.param(
+                'import os, requests\nrequests.get(os.getenv("URL"))\nos = object()',
+                id = "os_rebound_after",
+            ),
+        ],
+    )
+    def test_a_shadow_written_below_the_call_does_not_excuse_it(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    def test_a_shadow_written_above_the_call_still_counts_ok(self):
+        _ok(
+            "import requests\n"
+            "def input():\n"
+            '    return "https://huggingface.co/x"\n'
+            "requests.get(input())"
+        )
+
+    def test_a_local_class_named_sys_is_not_process_input_ok(self):
+        _ok(
+            "import requests\n"
+            "class sys:\n"
+            '    argv = ["https://huggingface.co/x"]\n'
+            "requests.get(sys.argv[0])"
+        )
+
+    def test_the_imported_sys_is_still_process_input(self):
+        _blocked(
+            "import sys, requests\nrequests.get(sys.argv[1])",
+            expect_phrase = "Blocked: request target is read",
+        )
+
+
+class TestConnectorNamesMustBeImports:
+    """A reserved connector name only exempts a call when it is the module that was imported."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\ndef go(sqlite3):\n    sqlite3.connect("169.254.169.254", 80)',
+                id = "parameter",
+            ),
+            pytest.param(
+                'class sqlite3:\n    pass\nsqlite3.connect("evil.example", 25)', id = "class"
+            ),
+            pytest.param(
+                'def sqlite3():\n    pass\nsqlite3.connect("evil.example", 25)', id = "function"
+            ),
+        ],
+    )
+    def test_a_name_bound_without_a_value_is_not_the_module(self, code):
+        # A parameter, a class and a def all bind the name without recording a value, so asking
+        # what it holds is not enough: the question is whether the source bound it at all.
+        assert _check_code_safety(code) is not None, code
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param('import sqlite3\nsqlite3.connect("state.db")', id = "import"),
+            pytest.param('import sqlite3 as db\ndb.connect("state.db")', id = "aliased_import"),
+            pytest.param('import duckdb\nduckdb.connect("warehouse.duckdb")', id = "duckdb"),
+        ],
+    )
+    def test_the_imported_connector_is_still_exempt_ok(self, code):
+        _ok(code)
+
+
+class TestConnectorNamesAcrossScopes:
+    """Losing an exemption costs a refusal; keeping one wrongly costs a request to any host, so a
+    connector name bound anywhere the call can see is not the module."""
+
+    def test_a_name_bound_in_an_enclosing_scope_is_not_the_module(self):
+        _blocked(
+            "import requests\n"
+            "def outer(sqlite3):\n"
+            "    def inner():\n"
+            '        sqlite3.connect("169.254.169.254", 80)\n'
+            "    inner()",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_imported_connector_used_inside_a_function_is_still_exempt_ok(self):
+        _ok('import sqlite3\ndef go():\n    sqlite3.connect("state.db")')
+
+
+class TestReaderChainsFailClosed:
+    """Giving up on a chain of aliases cannot mean the call is fine."""
+
+    def test_a_long_alias_chain_to_input_is_still_refused(self):
+        chain = "".join(f"r{i} = r{i - 1}\n" for i in range(1, 25))
+        _blocked(
+            "import requests\nr0 = input\n" + chain + "requests.get(r24())",
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_a_local_function_of_the_same_shape_is_still_fine_ok(self):
+        _ok(
+            "import requests\n"
+            "def reader():\n"
+            '    return "https://huggingface.co/x"\n'
+            "requests.get(reader())"
+        )
+
+
+class TestInlineWalrusTargets:
+    """`requests.get(u := "...")` evaluates to the value it binds, so that value is the target."""
+
+    def test_a_metadata_host_bound_inline_is_blocked(self):
+        _blocked(
+            f'import requests\nrequests.get(u := "{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_untrusted_host_bound_inline_is_refused(self):
+        _blocked(
+            'import requests\nrequests.get(u := "https://evil.example/x")',
+            expect_phrase = "Blocked: host not in sandbox allowlist",
+        )
+
+    def test_an_allowed_host_bound_inline_keeps_working_ok(self):
+        _ok('import requests\nrequests.get(u := "https://huggingface.co/api/models")')
+
+
+class TestAugmentedAssignments:
+    """`u += x` builds on what u held rather than replacing it, and x is somewhere the value came
+    from."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param('import requests\nu = ""\nu += input()\nrequests.get(u)', id = "input"),
+            pytest.param(
+                'import os, requests\nu = ""\nu += os.environ["TARGET"]\nrequests.get(u)',
+                id = "environment",
+            ),
+        ],
+    )
+    def test_an_external_value_added_to_a_name_is_refused(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    def test_the_value_added_to_does_not_disappear(self):
+        _blocked(
+            f'import requests\nu = "{_METADATA_URL}"\nu += "x"\nrequests.get(u)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_building_an_allowed_url_this_way_keeps_working_ok(self):
+        _ok('import requests\nu = "https://huggingface.co"\nu += "/api/models"\nrequests.get(u)')
+
+
+class TestCallablesHeldInNames:
+    """`fetch = requests.get` is the assignment spelling of an import alias, and the call answers
+    to the same name either way."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\nfetch = requests.get\nfetch("{_METADATA_URL}")',
+                id = "module_function",
+            ),
+            pytest.param(
+                "import requests\ns = requests.Session()\n"
+                f'fetch = s.get\nfetch("{_METADATA_URL}")',
+                id = "session_method",
+            ),
+        ],
+    )
+    def test_a_call_through_an_assigned_callable_is_policed(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_the_upload_check_follows_it_too(self):
+        _blocked(
+            "import requests\npost = requests.post\n"
+            'post("https://huggingface.co/u", files = {"f": open("a.bin", "rb")})',
+            expect_phrase = "Blocked: file upload disallowed in sandbox",
+        )
+
+    def test_an_allowed_host_through_an_assigned_callable_keeps_working_ok(self):
+        _ok('import requests\nfetch = requests.get\nfetch("https://huggingface.co/api/models")')
+
+    def test_a_name_holding_something_else_is_not_a_network_call_ok(self):
+        _ok(
+            'import requests\nfetch = len\nfetch("abc")\n'
+            'requests.get("https://huggingface.co/api/models")'
+        )
+
+
+class TestConditionalExpressionTargets:
+    """Both arms of `a if flag else b` are written down, so both are answered for."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import requests\nrequests.get("{_METADATA_URL}" if flag else "https://huggingface.co")',
+                id = "first_arm",
+            ),
+            pytest.param(
+                f'import requests\nrequests.get("https://huggingface.co" if flag else "{_METADATA_URL}")',
+                id = "second_arm",
+            ),
+            pytest.param(
+                f'import requests\na = "{_METADATA_URL}"\nb = "https://huggingface.co"\n'
+                "requests.get(a if flag else b)",
+                id = "through_bindings",
+            ),
+        ],
+    )
+    def test_a_blocked_host_in_either_arm_is_refused(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_two_allowed_arms_keep_working_ok(self):
+        _ok(
+            "import requests\n"
+            'requests.get("https://huggingface.co/a" if flag else "https://huggingface.co/b")'
+        )
+
+
+class TestDynamicallyReplacedConnectors:
+    """An attribute written at runtime cannot be proven unchanged, so the exemption is withheld
+    for everything under that name."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import sqlite3, smtplib\n"
+                'setattr(sqlite3, "connect", smtplib.SMTP().connect)\n'
+                'sqlite3.connect("evil.example", 25)',
+                id = "setattr",
+            ),
+            pytest.param(
+                "import sqlite3, smtplib\n"
+                "setattr(sqlite3, name, smtplib.SMTP().connect)\n"
+                'sqlite3.connect("evil.example", 25)',
+                id = "setattr_with_a_computed_name",
+            ),
+            pytest.param(
+                "import sqlite3, smtplib\n"
+                'vars(sqlite3)["connect"] = smtplib.SMTP().connect\n'
+                'sqlite3.connect("evil.example", 25)',
+                id = "vars_mapping",
+            ),
+            pytest.param(
+                "import sqlite3, smtplib\n"
+                'sqlite3.__dict__["connect"] = smtplib.SMTP().connect\n'
+                'sqlite3.connect("evil.example", 25)',
+                id = "dunder_dict",
+            ),
+            pytest.param(
+                'import sqlite3\ndelattr(sqlite3, "connect")\nsqlite3.connect("evil.example", 25)',
+                id = "delattr",
+            ),
+        ],
+    )
+    def test_a_namespace_written_at_runtime_loses_the_exemption(self, code):
+        _blocked(code, expect_phrase = "Blocked: host not in sandbox allowlist")
+
+    def test_the_metadata_host_through_the_same_trick_is_blocked(self):
+        _blocked(
+            "import sqlite3, smtplib\n"
+            'setattr(sqlite3, "connect", smtplib.SMTP().connect)\n'
+            'sqlite3.connect("169.254.169.254", 80)',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param('import sqlite3\nsqlite3.connect("state.db")', id = "untouched"),
+            pytest.param('import sqlite3 as db\ndb.connect("state.db")', id = "aliased"),
+            pytest.param(
+                'import sqlite3\nclass C:\n    pass\nsetattr(C, "x", 1)\n'
+                'sqlite3.connect("state.db")',
+                id = "setattr_on_something_else",
+            ),
+        ],
+    )
+    def test_an_untouched_connector_keeps_its_exemption_ok(self, code):
+        _ok(code)
+
+
+class TestNamespaceWritesByAnyName:
+    """The name at the end of the call says it writes a namespace; the owner in front can be
+    anything."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                "import builtins, sqlite3, smtplib\n"
+                'builtins.setattr(sqlite3, "connect", smtplib.SMTP().connect)\n'
+                'sqlite3.connect("evil.example", 25)',
+                id = "through_builtins",
+            ),
+            pytest.param(
+                "import sqlite3, smtplib\nsetter = setattr\n"
+                'setter(sqlite3, "connect", smtplib.SMTP().connect)\n'
+                'sqlite3.connect("evil.example", 25)',
+                id = "aliased_setattr",
+            ),
+            pytest.param(
+                "import sqlite3, smtplib\nfrom unittest import mock\n"
+                'mock.patch.object(sqlite3, "connect", smtplib.SMTP().connect)\n'
+                'sqlite3.connect("evil.example", 25)',
+                id = "patch_object",
+            ),
+            pytest.param(
+                "import sqlite3\nfrom unittest import mock\n"
+                'mock.patch("sqlite3.connect")\nsqlite3.connect("evil.example", 25)',
+                id = "patch_by_name",
+            ),
+        ],
+    )
+    def test_every_spelling_withholds_the_exemption(self, code):
+        _blocked(code, expect_phrase = "Blocked: host not in sandbox allowlist")
+
+    def test_an_untouched_connector_still_keeps_it_ok(self):
+        _ok('import sqlite3\nsqlite3.connect("state.db")')
+
+
+class TestShadowedReaderBuiltins:
+    """A bare `open` or `getenv` the source defines is not the builtin either."""
+
+    def test_a_local_getenv_is_not_an_environment_read_ok(self):
+        _ok(
+            "import requests\n"
+            "def getenv():\n"
+            '    return "https://huggingface.co/x"\n'
+            "requests.get(getenv())"
+        )
+
+    def test_a_local_open_is_not_a_file_read_ok(self):
+        _ok(
+            "import requests\n"
+            "def open(name):\n"
+            '    return "https://huggingface.co/x"\n'
+            'requests.get(open("t.txt"))'
+        )
+
+    def test_the_builtin_open_is_still_a_file_read(self):
+        _blocked(
+            'import requests\nrequests.get(open("t.txt").read())',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+    def test_the_imported_getenv_is_still_an_environment_read(self):
+        _blocked(
+            'from os import getenv\nimport requests\nrequests.get(getenv("T"))',
+            expect_phrase = "Blocked: request target is read",
+        )
+
+
+class TestConditionalsBehindABinding:
+    """A name holding `a if flag else b` still holds two targets."""
+
+    def test_a_blocked_arm_behind_a_binding_is_refused(self):
+        _blocked(
+            f'import requests\nu = "{_METADATA_URL}" if flag else "https://huggingface.co"\n'
+            "requests.get(u)",
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_two_allowed_arms_behind_a_binding_keep_working_ok(self):
+        _ok(
+            "import requests\n"
+            'u = "https://huggingface.co/a" if flag else "https://huggingface.co/b"\n'
+            "requests.get(u)"
+        )
+
+
+class TestApiSubmodules:
+    """`requests.api` holds the public API of `requests`, so a call resolved into it is the same
+    call the prefixes already know about."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(f'from requests import api as r\nr.get("{_METADATA_URL}")', id = "aliased"),
+            pytest.param(
+                f'import requests.api\nrequests.api.get("{_METADATA_URL}")', id = "written_out"
+            ),
+            pytest.param(
+                f'from requests import api as requests\nrequests.get("{_METADATA_URL}")',
+                id = "aliased_to_the_package_name",
+            ),
+            pytest.param(
+                f'from requests import sessions\nsessions.Session().get("{_METADATA_URL}")',
+                id = "sessions_submodule",
+            ),
+        ],
+    )
+    def test_a_call_through_an_api_submodule_is_policed(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_an_allowed_host_through_a_submodule_keeps_working_ok(self):
+        _ok('from requests import api as r\nr.get("https://huggingface.co/api/models")')
+
+
+class TestApiSubmoduleImports:
+    """Canonicalising a submodule call only helps once the import that named it is tracked."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(f'import requests.api as r\nr.get("{_METADATA_URL}")', id = "import_as"),
+            pytest.param(
+                f'from requests.api import get as fetch\nfetch("{_METADATA_URL}")',
+                id = "from_import_aliased",
+            ),
+            pytest.param(f'from requests.api import get\nget("{_METADATA_URL}")', id = "from_import"),
+        ],
+    )
+    def test_an_import_of_the_submodule_is_tracked(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_an_allowed_host_through_the_submodule_keeps_working_ok(self):
+        _ok('import requests.api as r\nr.get("https://huggingface.co/api/models")')
+
+
+class TestSelfPreservingRebindings:
+    """`os = os` hands the name back what it already held, so the module is still the module."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import os, requests\nos = os\nrequests.get(os.environ["TARGET"])',
+                id = "self_assignment",
+            ),
+            pytest.param(
+                'import os, requests\ntmp = os\nos = tmp\nrequests.get(os.getenv("TARGET"))',
+                id = "round_trip_through_a_name",
+            ),
+            pytest.param(
+                "import sys, requests\nsys = sys\nrequests.get(sys.argv[1])",
+                id = "sys_self_assignment",
+            ),
+        ],
+    )
+    def test_a_self_rebinding_still_reads_as_the_module(self, code):
+        _blocked(code, expect_phrase = "Blocked: request target is read")
+
+    def test_the_hf_upload_guard_survives_a_self_rebinding(self):
+        _blocked(
+            "import os\nfrom huggingface_hub import HfApi\nos = os\n"
+            "HfApi().upload_folder(folder_path = '.', repo_id = 'a/b', "
+            "commit_message = os.getenv('SECRET'))",
+            expect_phrase = "Blocked: HF upload",
+        )
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                'import requests\nos = object()\nrequests.get(os.environ["TARGET"])',
+                id = "replaced_by_a_call",
+            ),
+            pytest.param(
+                "import requests\nclass os:\n"
+                '    environ = {"TARGET": "https://huggingface.co/api/models"}\n'
+                'requests.get(os.environ["TARGET"])',
+                id = "replaced_by_a_class",
+            ),
+            pytest.param(
+                'import requests\nfake = object()\nos = fake\nrequests.get(os.environ["T"])',
+                id = "round_trip_through_a_stand_in",
+            ),
+        ],
+    )
+    def test_a_genuine_shadow_is_still_a_shadow_ok(self, code):
+        _ok(code)
+
+
+class TestCallableAliasArms:
+    """A callable held behind a conditional expression can be either arm, so both are policed."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f"import requests\nflag = True\nfetch = requests.get if flag else print\n"
+                f'fetch("{_METADATA_URL}")',
+                id = "network_on_the_true_arm",
+            ),
+            pytest.param(
+                f"import requests\nfetch = print if flag else requests.get\n"
+                f'fetch("{_METADATA_URL}")',
+                id = "network_on_the_false_arm",
+            ),
+            pytest.param(
+                f"import requests\nfetch = print if a else (len if b else requests.get)\n"
+                f'fetch("{_METADATA_URL}")',
+                id = "nested_conditional",
+            ),
+            pytest.param(
+                f"import requests\ns = requests.Session()\nfetch = s.get if flag else print\n"
+                f'fetch("{_METADATA_URL}")',
+                id = "session_method_arm",
+            ),
+        ],
+    )
+    def test_either_arm_is_policed(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_an_allowed_host_through_an_arm_keeps_working_ok(self):
+        _ok(
+            "import requests\nfetch = requests.get if flag else print\n"
+            'fetch("https://huggingface.co/api/models")'
+        )
+
+    def test_a_conditional_between_two_builtins_is_left_alone_ok(self):
+        _ok("fetch = str if flag else repr\nprint(fetch(5))")
+
+
+class TestModuleAssignedToAName:
+    """`r = requests` is the assignment spelling of `import requests as r`."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(f'import requests\nr = requests\nr.get("{_METADATA_URL}")', id = "one_step"),
+            pytest.param(
+                f'import requests\na = requests\nb = a\nb.get("{_METADATA_URL}")', id = "chained"
+            ),
+        ],
+    )
+    def test_a_module_held_in_a_name_is_policed(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_an_allowed_host_through_the_name_keeps_working_ok(self):
+        _ok('import requests\nr = requests\nr.get("https://huggingface.co/api/models")')
+
+
+class TestConditionalSessionFactories:
+    """A session behind a conditional is still a session on the arm that makes one."""
+
+    def test_a_conditional_session_is_policed(self):
+        _blocked(
+            f"import requests\nenabled = True\n"
+            f"s = requests.Session() if enabled else object()\n"
+            f's.get("{_METADATA_URL}")',
+            expect_phrase = "Blocked: cloud-metadata host",
+        )
+
+    def test_an_allowed_host_through_a_conditional_session_keeps_working_ok(self):
+        _ok(
+            "import requests\ns = requests.Session() if enabled else object()\n"
+            's.get("https://huggingface.co/api/models")'
+        )
+
+
+class TestExpandedConstructorHosts:
+    """A host handed to a client through `**` is the host the later relative call reaches."""
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param(
+                f'import httpx\nc = httpx.Client(**{{"base_url": "{_METADATA_URL}"}})\nc.get("/")',
+                id = "dict_literal",
+            ),
+            pytest.param(
+                f'import httpx\nopts = {{"base_url": "{_METADATA_URL}"}}\n'
+                'c = httpx.Client(**opts)\nc.get("/")',
+                id = "dict_bound_to_a_name",
+            ),
+            pytest.param(
+                'import urllib3\np = urllib3.HTTPConnectionPool(**{"host": "169.254.169.254"})\n'
+                'p.request("GET", "/")',
+                id = "pool_host",
+            ),
+        ],
+    )
+    def test_an_expanded_host_is_read(self, code):
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")
+
+    def test_an_allowed_expanded_host_keeps_working_ok(self):
+        _ok(
+            'import httpx\nc = httpx.Client(**{"base_url": "https://huggingface.co"})\n'
+            'c.get("/api/models")'
+        )
+
+    def test_an_unknown_expansion_is_left_as_it_was_ok(self):
+        _ok('import httpx\nc = httpx.Client(**opts)\nc.get("/")')
+
+
+class TestModuleAliasChainsAreBounded:
+    """Following a name to the module behind it must stop, whatever the source hands it."""
+
+    def test_a_long_module_alias_chain_returns_a_verdict(self):
+        links = "\n".join(f"n{i + 1} = n{i}" for i in range(2000))
+        code = f'import requests\nn0 = requests\n{links}\nn2000.get("{_METADATA_URL}")'
+        assert _check_code_safety(code) is None or "Blocked" in _check_code_safety(code)
+
+    def test_a_chain_within_the_bound_still_resolves(self):
+        links = "\n".join(f"n{i + 1} = n{i}" for i in range(5))
+        code = f'import requests\nn0 = requests\n{links}\nn5.get("{_METADATA_URL}")'
+        _blocked(code, expect_phrase = "Blocked: cloud-metadata host")

@@ -15825,6 +15825,27 @@ def _check_signal_escape_patterns(code: str):
         "httpx.request",
         "urllib.request.urlopen",
         "urllib.request.Request",
+        # Session-bound equivalents, synthesised for `s = requests.Session(); s.post(...)`.
+        "requests.Session.post",
+        "requests.Session.put",
+        "requests.Session.patch",
+        "requests.Session.delete",
+        "requests.Session.request",
+        "httpx.Client.post",
+        "httpx.Client.put",
+        "httpx.Client.patch",
+        "httpx.Client.delete",
+        "httpx.Client.request",
+        "httpx.AsyncClient.post",
+        "httpx.AsyncClient.put",
+        "httpx.AsyncClient.patch",
+        "httpx.AsyncClient.delete",
+        "httpx.AsyncClient.request",
+        "aiohttp.ClientSession.post",
+        "aiohttp.ClientSession.put",
+        "aiohttp.ClientSession.patch",
+        "aiohttp.ClientSession.delete",
+        "aiohttp.ClientSession.request",
     )
     _UPLOAD_HF_FQ = (
         "huggingface_hub.upload_file",
@@ -15982,10 +16003,8 @@ def _check_signal_escape_patterns(code: str):
     )
     _SENSITIVE_FILE_RE = re.compile(r"^/proc/(?:self|\d+)/(?:environ|cmdline|task/\d+/environ)$")
 
-    def _normalize_host(host: str) -> str:
-        if not host:
-            return ""
-        h = host.strip().lower().rstrip(".")
+    def _strip_userinfo_and_port(host: str) -> str:
+        h = host
         if "@" in h:
             h = h.split("@", 1)[1]
         if h.startswith("[") and "]" in h:
@@ -15994,23 +16013,1537 @@ def _check_signal_escape_patterns(code: str):
             h = h.split(":", 1)[0]
         return h
 
+    def _host_candidates(host: str) -> "list[str]":
+        r"""Every host this authority can reach. The clients disagree about a backslash:
+        requests percent-encodes it into the path, so "169.254.169.254\@huggingface.co" reaches
+        the metadata IP, while httpx keeps it in the userinfo and reaches huggingface.co. Reading
+        it either way alone is a bypass on the other client, so both are answered for."""
+        if not host:
+            return []
+        h = host.strip().lower().rstrip(".")
+        variants = [h]
+        if "\\" in h:
+            variants.append(h.split("\\", 1)[0].rstrip("."))
+        out = []
+        for variant in variants:
+            cleaned = _strip_userinfo_and_port(variant)
+            if cleaned and cleaned not in out:
+                out.append(cleaned)
+        return out
+
+    def _normalize_host(host: str) -> str:
+        candidates = _host_candidates(host)
+        return candidates[0] if candidates else ""
+
     def _is_metadata_host(host: str) -> bool:
-        h = _normalize_host(host)
-        if not h:
-            return False
-        if h in _METADATA_HOST_LITERALS:
-            return True
-        if any(h.startswith(p) for p in _METADATA_HOST_PREFIXES):
-            return True
+        # Any host it can reach being a metadata host is enough to refuse it.
+        for h in _host_candidates(host):
+            if h in _METADATA_HOST_LITERALS:
+                return True
+            if any(h.startswith(p) for p in _METADATA_HOST_PREFIXES):
+                return True
         return False
 
     def _is_trusted_host(host: str) -> bool:
-        h = _normalize_host(host)
-        if not h:
+        candidates = _host_candidates(host)
+        if not candidates:
             return False
-        if h in _TRUSTED_PUBLIC_HOST_LITERALS:
+        # Every host it can reach has to be allowed, not just the one this client would pick.
+        for h in candidates:
+            if h in _TRUSTED_PUBLIC_HOST_LITERALS:
+                continue
+            if any(h.endswith(suffix) for suffix in _TRUSTED_PUBLIC_HOST_SUFFIXES):
+                continue
+            return False
+        return True
+
+    # The FQ name the visitor builds from the call site is only canonical when the call is written
+    # out in full. `import requests as r; r.get(...)`, `from requests import get as fetch;
+    # fetch(...)` and `s = requests.Session(); s.get(...)` all produce a name no prefix in
+    # _NETWORK_FQ_PREFIXES matches, so the host allowlist never ran on them. These tables let an
+    # aliased or session-bound call be rewritten to its canonical name before any policy check.
+    _NET_MODULES = frozenset(
+        {
+            "requests",
+            "requests.sessions",
+            "httpx",
+            "urllib",
+            "urllib.request",
+            "urllib3",
+            "socket",
+            "http",
+            "http.client",
+            "aiohttp",
+            # The submodules that hold those packages' public API. Tracking their aliases is what
+            # lets a call through one of them be canonicalised back to the package.
+            "requests.api",
+            "httpx._api",
+            "httpx._client",
+            "urllib3._request_methods",
+        }
+    )
+    # Modules whose aliases are tracked. The network ones so a renamed import is still policed, and
+    # the process-state ones so `import os as o` cannot hide where a target came from.
+    _EXTERNAL_SOURCE_MODULES = frozenset({"os", "sys", "subprocess", "getpass"})
+    # A `connect` that opens a local resource rather than a host. Everything else spelling
+    # `connect` is treated as a network client, which is what ftplib, smtplib, imaplib, socketio
+    # and friends are. Their aliases are tracked too, so `import sqlite3 as db` is the same client.
+    _LOCAL_CONNECT_OWNERS = frozenset(
+        {
+            "sqlite3",
+            "apsw",
+            "duckdb",
+            "psycopg",
+            "psycopg2",
+            "pyodbc",
+            "sqlalchemy",
+            "mysql",
+        }
+    )
+    _ALIASED_MODULES = _NET_MODULES | _EXTERNAL_SOURCE_MODULES | _LOCAL_CONNECT_OWNERS
+    # Constructor FQ -> the canonical prefix its instance methods are attributed to. The synthesised
+    # name ("requests.Session.get") is already covered by the "requests.Session" entry in
+    # _NETWORK_FQ_PREFIXES, since that test is a startswith.
+    _SESSION_FACTORY_FQ = {
+        "requests.Session": "requests.Session",
+        "requests.session": "requests.Session",
+        "requests.sessions.Session": "requests.Session",
+        "requests.sessions.session": "requests.Session",
+        "httpx.Client": "httpx.Client",
+        "httpx.AsyncClient": "httpx.AsyncClient",
+        "aiohttp.ClientSession": "aiohttp.ClientSession",
+        "urllib3.PoolManager": "urllib3.PoolManager",
+        "urllib3.HTTPConnectionPool": "urllib3.HTTPConnectionPool",
+        "urllib3.HTTPSConnectionPool": "urllib3.HTTPSConnectionPool",
+    }
+    _URL_KWARGS = ("url", "fullurl")
+    _HTTP_METHOD_NAMES = frozenset(
+        {"get", "post", "put", "patch", "delete", "head", "options", "request"}
+    )
+    # Client methods that send without being named after a verb, and which positional argument
+    # holds the URL. A urllib3 pool's `urlopen("GET", url)` takes the verb first, which is not the
+    # same method as `urllib.request.urlopen(url)`, so the owner decides.
+    _SENDING_METHODS = {
+        "ws_connect": 0,
+        "stream": 1,
+        "send": 0,
+    }
+    _POOL_SENDING_METHODS = {"urlopen": 1}
+
+    def _sending_url_index(fq: str) -> "int | None":
+        """Which argument holds the URL for a client method that is not named after a verb, or
+        None when this is not one."""
+        owner, _, method = fq.rpartition(".")
+        if method in _SENDING_METHODS:
+            return _SENDING_METHODS[method]
+        if method in _POOL_SENDING_METHODS and owner.split(".")[0] == "urllib3":
+            return _POOL_SENDING_METHODS[method]
+        return None
+
+    _SESSION_PREFIXES = (
+        "requests.Session",
+        "httpx.Client",
+        "httpx.AsyncClient",
+        "aiohttp.ClientSession",
+        "urllib3.PoolManager",
+        "urllib3.HTTPConnectionPool",
+        "urllib3.HTTPSConnectionPool",
+    )
+    _URL_OWNERS = frozenset(
+        {
+            "requests",
+            "httpx",
+            # urllib3.request("GET", url) and pool.request(...) are network calls by the prefix
+            # table already; without an owner entry the target checks would skip their URL.
+            "urllib3",
+            "urllib3.PoolManager",
+            "urllib3.HTTPConnectionPool",
+            "urllib3.HTTPSConnectionPool",
+            "requests.Session",
+            "httpx.Client",
+            "httpx.AsyncClient",
+            "aiohttp.ClientSession",
+        }
+    )
+    _URL_HOST_RE = re.compile(r"^\w+://([^/?#]+)(?:[/?#]|$)")
+    # For a string only known up to a prefix, the authority counts as read only when the prefix
+    # already passed it: "https://huggingface.co" + suffix really targets huggingface.co.evil.org,
+    # so an unterminated authority must never vouch for the call.
+    _URL_HOST_TERMINATED_RE = re.compile(r"^\w+://([^/?#]+)[/?#]")
+    # Resolution follows name bindings, so a chain of them is a chain of recursive calls. Valid
+    # source can be thousands deep; the budget keeps that a "cannot resolve" answer rather than a
+    # RecursionError out of a tool call.
+    _MAX_RESOLVE_DEPTH = 24
+    # Depth alone does not bound the work: `s2 = s1 + s1` doubles the graph per level, so a shallow
+    # file can still cost seconds. One budget per top-level resolution, spent by every step.
+    _MAX_RESOLVE_STEPS = 4000
+    # Name-to-name links are followed iteratively and cost one dictionary lookup each, so they are
+    # bounded well above any plausible source file rather than by the nesting limit.
+    _MAX_BINDING_LINKS = 100_000
+    # match was added in 3.10 and the project floor is 3.9, where these classes do not exist.
+    # An empty tuple makes the isinstance below simply False.
+    _MATCH_CAPTURES = tuple(
+        node
+        for node in (getattr(ast, "MatchAs", None), getattr(ast, "MatchStar", None))
+        if node is not None
+    )
+    _MATCH_MAPPINGS = tuple(
+        node for node in (getattr(ast, "MatchMapping", None),) if node is not None
+    )
+    _resolve_budget = [_MAX_RESOLVE_STEPS]
+    # Set when a resolution gave up rather than finished. An expression the analysis abandoned is
+    # not the same as one it read and found dynamic: it may be a blocked literal under 30 layers
+    # of concatenation, so the caller refuses rather than letting the limit decide.
+    _resolve_exhausted = [False]
+    # "no answer", as distinct from "bound to something this analysis cannot name".
+    _NOTHING_HELD = object()
+
+    def _takes_a_url_argument(fq: str) -> bool:
+        """True when the call takes the target URL as an argument. Constructors that take no URL
+        (`requests.Session()`, `socket.socket(...)`) are excluded, so an unresolvable argument there
+        is never mistaken for a hidden target."""
+        if fq in ("urllib.request.urlopen", "urllib.request.urlretrieve", "urllib.request.Request"):
             return True
-        return any(h.endswith(s) for s in _TRUSTED_PUBLIC_HOST_SUFFIXES)
+        if fq in _SOCKET_TARGET_FQ:
+            # socket.create_connection((host, port)) names its host as plainly as a URL does.
+            return True
+        owner, _, method = fq.rpartition(".")
+        if not owner or owner not in _URL_OWNERS:
+            return False
+        return method in _HTTP_METHOD_NAMES or _sending_url_index(fq) is not None
+
+    def _is_a_network_call(fq: str) -> bool:
+        """Whether this name reaches the network. A session instance has plenty of methods that do
+        not: s.mount(...) and s.get_adapter(...) take a URL and send nothing."""
+        if not fq or not any(fq.startswith(prefix) for prefix in _NETWORK_FQ_PREFIXES):
+            return False
+        for prefix in _SESSION_PREFIXES:
+            if fq.startswith(prefix + "."):
+                method = fq.rpartition(".")[2]
+                return method in _HTTP_METHOD_NAMES or _sending_url_index(fq) is not None
+        return True
+
+    def _url_arg_index(fq: str) -> int:
+        """Which positional argument holds the URL. `requests.request(method, url)` and the session
+        and client `.request` methods take the method first, so reading argument zero there polices
+        the verb and lets the real target through."""
+        sending = _sending_url_index(fq)
+        if sending is not None:
+            return sending
+        return 1 if fq.rpartition(".")[2] == "request" else 0
+
+    # Wrappers whose own first argument is the URL the request will use, so a Request object is
+    # policed like the url string it was built from.
+    _URL_WRAPPER_FQ = {
+        "urllib.request.Request": 0,
+        "httpx.Request": 1,
+        "requests.Request": 1,
+        "requests.models.Request": 1,
+    }
+    # Methods that hand back a request object built from a URL, with the argument that holds it.
+    _REQUEST_BUILDER_METHODS = {"build_request": 1, "prepare_request": 0, "prepare": 0}
+
+    def _written_fq(func_node) -> str:
+        """The dotted call name exactly as the source spells it."""
+        parts: list[str] = []
+        cur = func_node
+        while isinstance(cur, ast.Attribute):
+            parts.insert(0, cur.attr)
+            cur = cur.value
+        if isinstance(cur, ast.Name):
+            parts.insert(0, cur.id)
+        return ".".join(parts) if parts else ""
+
+    def _receiver_factory(node, bindings) -> "str | None":
+        """The canonical session a call-valued receiver produces, for `requests.Session().get()`."""
+        if not isinstance(node, ast.Call):
+            return None
+        return _SESSION_FACTORY_FQ.get(_canonical_fq(node.func, bindings))
+
+    def _callable_arms(values) -> "list":
+        """The callables a set of bound values can amount to, with a conditional expression split
+        into its arms. `fetch = requests.get if flag else print` can hold either one, and the
+        policy has to answer for both."""
+        arms = []
+        pending = list(values)
+        while pending and len(arms) < _MAX_RESOLVE_DEPTH:
+            value = pending.pop(0)
+            if isinstance(value, ast.IfExp):
+                pending[:0] = [value.body, value.orelse]
+                continue
+            arms.append(value)
+        return arms
+
+    def _factory_behind(value, bindings) -> "str | None":
+        """The session factory a bound value amounts to. A conditional holds one of two values
+        and `s = requests.Session() if enabled else object()` is a session down either path that
+        has a `get`, so both arms are read."""
+        for arm in _callable_arms([value] if value is not None else []):
+            if not isinstance(arm, ast.Call):
+                continue
+            factory = _SESSION_FACTORY_FQ.get(_canonical_fq(arm.func, bindings))
+            if factory is not None:
+                return factory
+        return None
+
+    # How deep a chain of name-held callables resolution will follow. Each link asks the same
+    # question of the value behind it, so the chain, not the tree, is what has to be bounded.
+    _fq_depth = [0]
+
+    def _held_callables(name: str, node, bindings) -> "list":
+        """The callables a name can hold, with conditional arms split out. Resolution asks the
+        same question of each value, and the depth that chain is followed to is bounded where
+        that question is asked, in _canonical_fq."""
+        return _callable_arms(bindings.possible_values(name, node))
+
+    def _call_fq_names(func_node, bindings) -> "list[str]":
+        """Every name this call answers to: as written, and with aliases and session variables
+        resolved. Both are policed, because resolving is only ever allowed to ADD a match. A rewrite
+        that replaced the written name could lose one: `from requests import api as requests` turns
+        `requests.get` into `requests.api.get`, which no network prefix matches even though the
+        call is exactly requests.get."""
+        written = _written_fq(func_node)
+        if not written:
+            return []
+        # `requests.Session().get(...)` bottoms out at a Call, so the written name is just "get".
+        if isinstance(func_node, ast.Attribute):
+            receiver = func_node.value
+            attrs = [func_node.attr]
+            while isinstance(receiver, ast.Attribute):
+                attrs.insert(0, receiver.attr)
+                receiver = receiver.value
+            factory = _receiver_factory(receiver, bindings)
+            if factory is not None:
+                return [".".join([factory] + attrs)]
+        parts = written.split(".")
+        head = parts[0]
+        resolved = None
+        if len(parts) == 1:
+            resolved = bindings.alias_for(bindings.funcs, head, func_node)
+            if resolved is None:
+                # `fetch = requests.get` is the assignment spelling of `from requests import get
+                # as fetch`, and the call has to answer to the same name either way. Every value
+                # the name can hold is offered, because resolving only ever adds a name that is
+                # checked.
+                from_values = []
+                for value in _held_callables(head, func_node, bindings):
+                    if not isinstance(value, (ast.Attribute, ast.Name)):
+                        continue
+                    candidate = _canonical_fq(value, bindings)
+                    if candidate and candidate != written and candidate not in from_values:
+                        from_values.append(candidate)
+                if from_values:
+                    return from_values + [written]
+        else:
+            for table in (bindings.sessions, bindings.modules, bindings.funcs):
+                target = bindings.alias_for(table, head, func_node)
+                if target is not None:
+                    resolved = ".".join([target] + parts[1:])
+                    break
+            else:
+                # `r = requests` is the assignment spelling of `import requests as r`, and
+                # `r.get(...)` has to answer to the same name either way.
+                for value in _held_callables(head, func_node, bindings):
+                    if not isinstance(value, (ast.Attribute, ast.Name)):
+                        continue
+                    target = _canonical_fq(value, bindings)
+                    if target and target != head:
+                        resolved = ".".join([target] + parts[1:])
+                        break
+        names = [written] if resolved is None or resolved == written else [resolved, written]
+        for name in list(names):
+            names.extend(
+                variant for variant in _api_submodule_variants(name) if variant not in names
+            )
+        return names
+
+    # Submodules that hold the public API of a network package. A call resolved into one of them
+    # is the same call as the one spelled on the package, which is what the prefixes know about.
+    _API_SUBMODULES = {
+        "requests.api": "requests",
+        "requests.sessions": "requests",
+        "httpx._api": "httpx",
+        "httpx._client": "httpx",
+        "urllib3._request_methods": "urllib3",
+    }
+
+    def _api_submodule_variants(name: str) -> "list[str]":
+        """The same call spelled on the package the submodule belongs to, if it is one."""
+        for submodule, package in _API_SUBMODULES.items():
+            if name.startswith(submodule + "."):
+                return [package + name[len(submodule) :]]
+        return []
+
+    def _canonical_fq(func_node, bindings) -> str:
+        """The resolved name when there is one, else the name as written. A name held in a name
+        asks the same question again, so the chain is followed to the depth every other resolver
+        stops at rather than until the interpreter runs out of stack."""
+        if _fq_depth[0] >= _MAX_RESOLVE_DEPTH:
+            return _written_fq(func_node)
+        _fq_depth[0] += 1
+        try:
+            names = _call_fq_names(func_node, bindings)
+        finally:
+            _fq_depth[0] -= 1
+        return names[0] if names else ""
+
+    class _NameBindings(ast.NodeVisitor):
+        """Import aliases and single-assignment string / session bindings, per scope.
+
+        Imports are collected first so an alias is known before the assignment that uses it. A name
+        bound more than once, or bound by a loop / with / except / comprehension / match target, a
+        parameter, a def or a del, resolves to nothing: sandboxed code must not be able to launder
+        a blocked URL through a rebind. Bindings are keyed by the scope that made them, so an
+        assignment inside a function never answers for a name used outside it.
+
+        The alias and session tables stay flat. Resolving one of those only ever adds a name the
+        policy checks, so reading a function-local import at module level costs nothing but an
+        extra check; a wrong string binding, by contrast, would vouch for a host."""
+
+        def __init__(self):
+            self.modules: dict[tuple, str] = {}
+            self.funcs: dict[tuple, str] = {}
+            self.strings: dict[tuple, ast.AST] = {}
+            # Every value ever assigned to a name, single-assignment or not. Resolution only trusts
+            # a name bound once, but "where did this value come from" has to see them all: a rebind
+            # must not be able to hide that one of them reads the environment.
+            self.all_values: dict[tuple, list] = {}
+            self.sessions: dict[tuple, str] = {}
+            self._counts: dict[tuple, int] = {}
+            self._candidates: dict[tuple, ast.AST] = {}
+            self._scope_of: dict[int, object] = {}
+            self._scope_parent: dict[object, object] = {}
+            self._class_scopes: set = set()
+            self._comprehension_scopes: set = set()
+            # (scope, name) seen in a first, redirect-free pass, so a nonlocal can be pointed at
+            # the scope that really binds its name rather than at the lexical parent.
+            self._raw_bound: set = set()
+            self._raw_mode = False
+            # (scope, name) -> the scope that name really binds in, for global / nonlocal.
+            self._redirect: dict = {}
+            # (scope, name) -> [(position, is_alias)], so a call before a rebind still resolves.
+            self._bind_positions: dict = {}
+            # Aliases dropped for a later rebind, kept for the calls that precede it.
+            self._dropped_aliases: dict = {}
+            # Every binding that gives a name a resolvable target, with the position that made it.
+            # A name bound twice is not unresolvable everywhere: it holds the first target until
+            # the second binding, which is where the source says it changes.
+            self._alias_history: dict = {}
+            self._value_positions: dict = {}
+            self._conditional_suites: list = []
+            self._loop_suites: list = []
+            self._augmented_positions: set = set()
+            self._value_spans: dict = {}
+            # Names imported twice: no order-independent answer, so no alias at all.
+            self._ambiguous_aliases: set = set()
+
+        @staticmethod
+        def _parameters(args) -> list:
+            return [
+                a
+                for a in (
+                    list(getattr(args, "posonlyargs", []))
+                    + list(args.args)
+                    + list(args.kwonlyargs)
+                    + [args.vararg, args.kwarg]
+                )
+                if a is not None
+            ]
+
+        def _children_with_scope(self, node, scope, inner) -> list:
+            """Children paired with the scope each is EVALUATED in. Defaults, decorators, bases and
+            annotations run in the enclosing scope, before the function body exists, so a local of
+            the same name must not answer for them."""
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                args = node.args
+                outer = list(getattr(node, "decorator_list", []))
+                outer += [d for d in args.defaults if d is not None]
+                outer += [d for d in (args.kw_defaults or []) if d is not None]
+                if getattr(node, "returns", None) is not None:
+                    outer.append(node.returns)
+                body = node.body if isinstance(node.body, list) else [node.body]
+                pairs = [(child, scope) for child in outer]
+                pairs += [(child, inner) for child in body]
+                pairs += [(param, inner) for param in self._parameters(args)]
+                return pairs
+            if isinstance(node, ast.ClassDef):
+                outer = list(node.decorator_list) + list(node.bases)
+                outer += [kw.value for kw in node.keywords]
+                return [(child, scope) for child in outer] + [(child, inner) for child in node.body]
+            if isinstance(node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                # The leftmost iterable is evaluated before the comprehension scope exists.
+                pairs = []
+                for index, gen in enumerate(node.generators):
+                    pairs.append((gen.iter, scope if index == 0 else inner))
+                    pairs.append((gen.target, inner))
+                    pairs += [(cond, inner) for cond in gen.ifs]
+                parts = [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
+                pairs += [(part, inner) for part in parts if part is not None]
+                return pairs
+            if isinstance(node, ast.arg):
+                # The parameter name belongs to the function; its annotation is evaluated outside.
+                if node.annotation is None:
+                    return []
+                return [(node.annotation, self._scope_parent.get(scope, None))]
+            return [(child, inner) for child in ast.iter_child_nodes(node)]
+
+        def _walk_scoped(self, root):
+            """Every node with the scope it sits in: None for module level, else id(def node).
+
+            A comprehension carries its own scope in Python 3, so its target rebinds nothing
+            outside it."""
+            stack = [(root, None)]
+            while stack:
+                node, scope = stack.pop()
+                self._scope_of[id(node)] = scope
+                inner = scope
+                if isinstance(
+                    node,
+                    (
+                        ast.FunctionDef,
+                        ast.AsyncFunctionDef,
+                        ast.Lambda,
+                        ast.ClassDef,
+                        ast.ListComp,
+                        ast.SetComp,
+                        ast.DictComp,
+                        ast.GeneratorExp,
+                    ),
+                ):
+                    inner = id(node)
+                    self._scope_parent[inner] = scope
+                    if isinstance(node, ast.ClassDef):
+                        self._class_scopes.add(inner)
+                    elif isinstance(
+                        node, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+                    ):
+                        self._comprehension_scopes.add(inner)
+                for child, child_scope in self._children_with_scope(node, scope, inner):
+                    stack.append((child, child_scope))
+                yield node, scope
+
+        def _chain(self, node) -> list:
+            """Scopes that can answer for a name used at *node*, innermost first.
+
+            A class body is skipped once it is no longer the innermost scope: a bare name in a
+            method resolves to the enclosing function or module, never to a class attribute."""
+            scope = self._scope_of.get(id(node))
+            chain = []
+            first = True
+            while scope is not None:
+                if first or scope not in self._class_scopes:
+                    chain.append(scope)
+                first = False
+                scope = self._scope_parent.get(scope)
+            chain.append(None)
+            return chain
+
+        def alias_for(self, table: dict, name: str, node):
+            """An import alias or session binding visible from *node*, or None. Stops at the first
+            scope that binds the name, since a nearer binding shadows the alias."""
+            for scope in self._chain(node):
+                key = (scope, name)
+                if not self._class_binding_applies(scope, key, node):
+                    continue
+                if key in table:
+                    return table[key]
+                held = self._target_held_here(table, key, node)
+                if held is not None:
+                    return held
+                if key in self._counts:
+                    # Bound nearer than the alias, so the alias is not what this name holds.
+                    return None
+            return None
+
+        def _target_held_here(self, table: dict, key, node):
+            """What a name bound more than once holds at *node*: the target recorded by the last
+            binding at or before this point, and nothing when that binding recorded none.
+
+            Dropping such a name everywhere would let a later rebind retrospectively unpolice the
+            calls above it, which is a one-line bypass: `import requests as r`, the call, then
+            `import httpx as r`."""
+            history = [
+                (position, target)
+                for position, target, table_id in self._alias_history.get(key, ())
+                if table_id == id(table)
+            ]
+            if not history:
+                return None
+            history = sorted(history, key = lambda entry: entry[0])
+            if self._scope_of.get(id(node)) != key[0]:
+                # A function body runs when it is called, not where it is written, so its line
+                # number says nothing about which outer binding it will see. `def f(): r.get(...)`
+                # above `import requests as r` reads the import, because f() runs after it. The
+                # last binding in the source is the conservative answer: it keeps the call
+                # policed instead of letting a body placed above an import escape the check.
+                return history[-1][1]
+            where = self._position(node)
+            before = [
+                position
+                for position, _alias in self._bind_positions.get(key, [])
+                if position <= where and self._binding_applies_at(key, position, where)
+            ]
+            if not before:
+                # The use precedes every binding we can place. Only an unambiguous name answers:
+                # a call above two different imports of its own name resolves to neither.
+                targets = {target for _position, target in history}
+                return targets.pop() if len(targets) == 1 else None
+            last = max(before)
+            for position, target in history:
+                if position == last:
+                    return target
+            # The nearest binding is not an alias. If it only runs when a branch is taken, the
+            # alias above it is still a value this call can see, and resolving to it only ever
+            # adds a name the policy checks.
+            unconditional = [
+                position for position in before if not self._is_conditional_for(position, where)
+            ]
+            newest_alias = max((position for position, _target in history), default = None)
+            if newest_alias is not None and newest_alias <= last:
+                if not unconditional or max(unconditional) <= newest_alias:
+                    for position, target in history:
+                        if position == newest_alias:
+                            return target
+            return None
+
+        def _class_binding_applies(self, scope, key, node) -> bool:
+            """A class body is read in order: an attribute assigned further down is not what a use
+            above it reads, so that use falls through to the enclosing scope."""
+            if scope not in self._class_scopes:
+                return True
+            positions = self._bind_positions.get(key, [])
+            return any(position <= self._position(node) for position, _alias in positions)
+
+        def string_for(self, name: str, node):
+            """The value bound to *name* where *node* uses it, or None when nothing is trusted."""
+            for scope in self._chain(node):
+                key = (scope, name)
+                if not self._class_binding_applies(scope, key, node):
+                    continue
+                if key in self.strings:
+                    return self.strings[key]
+                held = self._value_held_here(key, node)
+                if held is not _NOTHING_HELD:
+                    return held
+                if key in self._counts:
+                    # Bound in this scope but not trusted: it shadows anything further out.
+                    return None
+            return None
+
+        def _mark_loop_suites(self, tree) -> None:
+            """Loop bodies. A binding written below a call inside one still reaches that call on
+            the next turn round, so position alone does not rule it out there."""
+            for statement in _tree_nodes(tree):
+                if not isinstance(statement, (ast.While, ast.For, ast.AsyncFor)):
+                    continue
+                if statement.body:
+                    self._loop_suites.append(
+                        (self._position(statement.body[0]), self._span_of(statement.body[-1])[1])
+                    )
+
+        def _shares_a_loop(self, position, where) -> bool:
+            for start, end in self._loop_suites:
+                if start <= position <= end and start <= where <= end:
+                    return True
+            return False
+
+        def _mark_conditional_bindings(self, tree) -> None:
+            """The suites that only run when a branch is taken. Whether a binding inside one is
+            conditional depends on where it is read: two assignments inside the same guarded block
+            run in order for a call in that same block, while one of them seen from outside the
+            block may not have run at all."""
+            branching = (ast.If, ast.While, ast.For, ast.AsyncFor, ast.Try)
+            match_statement = getattr(ast, "Match", None)
+            if match_statement is not None:
+                branching = branching + (match_statement,)
+            for statement in _tree_nodes(tree):
+                if not isinstance(statement, branching):
+                    continue
+                for suite in (
+                    getattr(statement, "body", None),
+                    getattr(statement, "orelse", None),
+                    getattr(statement, "finalbody", None),
+                    *[handler.body for handler in getattr(statement, "handlers", [])],
+                    *[case.body for case in getattr(statement, "cases", [])],
+                ):
+                    if not suite:
+                        continue
+                    if isinstance(statement, ast.Try) and suite is statement.finalbody:
+                        continue  # finally always runs
+                    self._conditional_suites.append(
+                        (self._position(suite[0]), self._span_of(suite[-1])[1])
+                    )
+
+        def _is_conditional_for(self, position, where) -> bool:
+            """Whether the binding at *position* sits in a suite that a use at *where* is not
+            inside, which is what makes it "may not have run" rather than "ran before this"."""
+            for start, end in self._conditional_suites:
+                if start <= position <= end and not start <= where <= end:
+                    return True
+            return False
+
+        def is_bound(self, name: str, node) -> bool:
+            """Whether the source has given this name a meaning of its own by the time *node*
+            runs, which is what says a builtin or a module has been shadowed.
+
+            An import of the same name is not a shadow: `import os` is how you get the real `os`.
+            A `def`, a `class` or an assignment is. Position matters: a shadow written below the
+            call has not happened yet, so the call still reads the builtin, and answering
+            otherwise would take the call out of the policy."""
+            where = self._position(node)
+            for scope in self._chain(node):
+                key = (scope, name)
+                positions = self._bind_positions.get(key)
+                if key not in self._counts or not positions:
+                    continue
+                if self._scope_of.get(id(node)) != scope:
+                    # A body runs when it is called, so any shadow in an enclosing scope may
+                    # already have happened. Reading it as the real module is the safe answer.
+                    return False
+                before = [entry for entry in positions if entry[0] <= where]
+                while before:
+                    position, is_alias = max(before)
+                    if is_alias:
+                        return False
+                    if not self._preserves_the_name(key, position):
+                        return True
+                    # `os = os` gives the name back what it already held, so the import above it
+                    # is still the meaning in force. Keep looking further up.
+                    before = [entry for entry in before if entry[0] != position]
+                return False
+            return False
+
+        def _preserves_the_name(self, key, position) -> bool:
+            """Whether the binding recorded at *position* rebinds the name to what it already
+            held. Python evaluates the right side first, so `os = os` leaves `os` denoting the
+            imported module, and so does a round trip through another name."""
+            values = [
+                value for where, value in self._value_positions.get(key, ()) if where == position
+            ]
+            if not values:
+                return False
+            return all(self._reads_back_as(value, key, position, 0) for value in values)
+
+        def _reads_back_as(self, value, key, position, depth: int) -> bool:
+            if depth > _MAX_RESOLVE_DEPTH or not isinstance(value, ast.Name):
+                return False
+            scope, name = key
+            if value.id == name:
+                return True
+            earlier = [
+                entry
+                for entry in self._value_positions.get((scope, value.id), ())
+                if entry[0] < position
+            ]
+            if not earlier:
+                return False
+            return all(
+                self._reads_back_as(held, key, held_at, depth + 1) for held_at, held in earlier
+            )
+
+        def may_be_bound(self, name: str, node) -> bool:
+            """Whether the source could have given this name a meaning of its own by the time
+            *node* runs, counting bindings in enclosing scopes and below the use.
+
+            The sibling question, `is_bound`, asks whether it definitely has. The two are asked
+            by callers whose safe answers point in opposite directions: an unrecognised external
+            reader keeps being policed, while an unrecognised connector loses its exemption."""
+            for scope in self._chain(node):
+                key = (scope, name)
+                if any(
+                    not is_alias and not self._preserves_the_name(key, position)
+                    for position, is_alias in self._bind_positions.get(key, [])
+                ):
+                    return True
+            return False
+
+        def possible_values(self, name: str, node) -> list:
+            """Every value the name can hold at *node*: the last unconditional assignment that
+            precedes it, plus any conditional ones since. One value means the call sees that
+            value; more than one means each of them has to be answered for."""
+            for scope in self._chain(node):
+                key = (scope, name)
+                if not self._class_binding_applies(scope, key, node):
+                    continue
+                candidates = self._candidates_held_here(key, node)
+                if candidates:
+                    return [value for _position, value in candidates]
+                if key in self._counts:
+                    return []
+            return []
+
+        def _candidates_held_here(self, key, node) -> list:
+            positioned = sorted(self._value_positions.get(key, ()), key = lambda entry: entry[0])
+            if not positioned:
+                return []
+            if self._scope_of.get(id(node)) != key[0]:
+                # A body runs when it is called, so every value it could see is possible.
+                return positioned
+            where = self._position(node)
+            before = [
+                entry
+                for entry in positioned
+                if (entry[0] <= where or self._shares_a_loop(entry[0], where))
+                and self._binding_applies_at(key, entry[0], where)
+            ]
+            if not before:
+                return []
+            start = 0
+            for index, (position, _value) in enumerate(before):
+                # `u += x` builds on what u already held, so it does not replace it: the old
+                # value is still one the call can reach through the new one.
+                if position in self._augmented_positions:
+                    continue
+                if not self._is_conditional_for(position, where):
+                    start = index
+            # An if / else that assigns the name on both paths replaces whatever came before it.
+            return before[start:]
+
+        def _value_held_here(self, key, node):
+            """The value a name bound more than once holds at *node*, or ``_NOTHING_HELD``.
+
+            Same reasoning as the import aliases: dropping the name everywhere would let a later
+            assignment unpolice the calls above it, so `u = metadata`, the request, `u = allowed`
+            would pass on the strength of a value the request never sees."""
+            candidates = self._candidates_held_here(key, node)
+            if len(candidates) != 1:
+                # Nothing to resolve, or more than one value could hold and no single one of them
+                # may vouch for the call. The caller screens them all instead.
+                return _NOTHING_HELD
+            return candidates[0][1]
+
+        def values_for(self, name: str, node) -> list:
+            """Where the name's value can have come from, stopping at the scope that binds it: a
+            parameter shadowing a global is the parameter, and the global is never read."""
+            for scope in self._chain(node):
+                key = (scope, name)
+                if not self._class_binding_applies(scope, key, node):
+                    continue
+                if key in self._counts:
+                    return list(self.all_values.get(key, ()))
+            return []
+
+        def _nonlocal_target(self, scope, name):
+            """The scope a `nonlocal` really writes to: the nearest enclosing function scope that
+            binds the name, skipping class bodies and scopes that never bind it at all."""
+            candidate = self._scope_parent.get(scope)
+            while candidate is not None:
+                if candidate not in self._class_scopes and (candidate, name) in self._raw_bound:
+                    return candidate
+                candidate = self._scope_parent.get(candidate)
+            return self._scope_parent.get(scope)
+
+        def _record_alias(
+            self,
+            table: dict,
+            key: tuple,
+            target: str,
+            node = None,
+        ) -> None:
+            if key in table and table[key] != target:
+                self._ambiguous_aliases.add(key)
+            table[key] = target
+            if node is not None:
+                self._alias_history.setdefault(key, []).append(
+                    (self._position(node), target, id(table))
+                )
+
+        @staticmethod
+        def _position(node) -> tuple:
+            return (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+
+        @staticmethod
+        def _span_of(node) -> tuple:
+            start = (getattr(node, "lineno", 0), getattr(node, "col_offset", 0))
+            end = (
+                getattr(node, "end_lineno", None) or start[0],
+                getattr(node, "end_col_offset", None) or start[1],
+            )
+            return (start, end)
+
+        def _binding_applies_at(self, key, position, where) -> bool:
+            """Whether the binding made at *position* is in force at *where*. It is not inside
+            the expression that produces its own value: that runs first."""
+            for bound_position, (start, end) in self._value_spans.get(key, ()):
+                if bound_position == position and start <= where <= end:
+                    return False
+            return True
+
+        def _mark(
+            self,
+            name: "str | None",
+            scope,
+            node = None,
+            is_alias = False,
+        ) -> None:
+            if name and self._raw_mode:
+                self._raw_bound.add((scope, name))
+                return
+            if name:
+                scope = self._redirect.get((scope, name), scope)
+                key = (scope, name)
+                self._counts[key] = self._counts.get(key, 0) + 1
+                if node is not None:
+                    self._bind_positions.setdefault(key, []).append(
+                        (self._position(node), is_alias)
+                    )
+
+        def _bind(
+            self,
+            target,
+            value,
+            scope,
+            came_from = None,
+        ) -> None:
+            if isinstance(target, ast.Name) and self._raw_mode:
+                self._raw_bound.add((scope, target.id))
+                return
+            if isinstance(target, ast.Name):
+                # `global u` makes an assignment here a write to the module's u, not a local one.
+                scope = self._redirect.get((scope, target.id), scope)
+                if value is not None:
+                    # Python evaluates the right side first, so `r = r.get(...)` still reads the
+                    # old r inside that call. Recording where that expression is keeps a use
+                    # within it answered by what the name held before this statement.
+                    self._value_spans.setdefault((scope, target.id), []).append(
+                        (self._position(target), self._span_of(value))
+                    )
+                self._mark(target.id, scope, target)
+                self._candidates.setdefault((scope, target.id), value)
+                self._value_positions.setdefault((scope, target.id), []).append(
+                    (self._position(target), value)
+                )
+                for source in (value, came_from):
+                    if source is not None:
+                        self.all_values.setdefault((scope, target.id), []).append(source)
+                return
+            # Only a Name, or a Name inside a tuple / list / star target, is rebound. `d[u] = 1` and
+            # `obj.u = 1` read `u` and `obj`, they do not rebind them, so counting those names would
+            # discard a binding that is still good.
+            if isinstance(target, ast.Starred):
+                self._bind(target.value, None, scope)
+            elif isinstance(target, (ast.Tuple, ast.List)):
+                for element in target.elts:
+                    self._bind(element, None, scope)
+
+        def _scan_bindings(self, scoped) -> None:
+            """Record every binding in the tree. Run once in raw mode, to learn which
+            scope binds which name, then again for real once declarations are resolved."""
+            for node, scope in scoped:
+                if _MATCH_CAPTURES and isinstance(node, _MATCH_CAPTURES):
+                    self._mark(node.name, scope, node)
+                elif _MATCH_MAPPINGS and isinstance(node, _MATCH_MAPPINGS):
+                    self._mark(node.rest, scope, node)
+                elif type(node).__name__ == "TypeAlias":  # 3.12+, absent on the floor
+                    self._mark(getattr(getattr(node, "name", None), "id", None), scope)
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        self._bind(target, node.value, scope)
+                elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)):
+                    if node.value is not None:
+                        target_scope = scope
+                        if isinstance(node, ast.NamedExpr):
+                            # An assignment expression inside a comprehension binds outside it.
+                            while target_scope in self._comprehension_scopes:
+                                target_scope = self._scope_parent.get(target_scope)
+                        self._bind(node.target, node.value, target_scope)
+                elif isinstance(node, ast.AugAssign):
+                    # The value is the old one combined with this expression, which is not a
+                    # string this analysis can name. It stays unresolvable, so nothing here
+                    # vouches for a host, but the right side is still somewhere the value came
+                    # from: `u += input()` reads the outside as plainly as `u = input()` does.
+                    self._bind(node.target, None, scope, came_from = node.value)
+                    self._augmented_positions.add(self._position(node.target))
+                elif isinstance(node, (ast.For, ast.AsyncFor)):
+                    self._bind(node.target, None, scope)
+                elif isinstance(node, ast.comprehension):
+                    self._bind(node.target, None, scope)
+                elif isinstance(node, ast.withitem):
+                    if node.optional_vars is not None:
+                        # `with socket.socket() as s` hands back the socket itself, so the name is
+                        # still a socket receiver; anything else binds a value we cannot name.
+                        held = node.context_expr
+                        # requests.Session, httpx.Client, aiohttp.ClientSession, socket and
+                        # open all hand back the object itself, so the name still holds it.
+                        opened = (
+                            _canonical_fq(held.func, self) if isinstance(held, ast.Call) else ""
+                        )
+                        keeps_itself = isinstance(held, ast.Call) and (
+                            opened in _SOCKET_FACTORY_FQ
+                            or opened in _SESSION_FACTORY_FQ
+                            or opened.rpartition(".")[2] in ("open", "fdopen")
+                        )
+                        self._bind(node.optional_vars, held if keeps_itself else None, scope)
+                elif isinstance(node, ast.Delete):
+                    # The name is gone at runtime; whatever a later lookup finds is not this value.
+                    for target in node.targets:
+                        self._bind(target, None, scope)
+                elif isinstance(node, ast.ExceptHandler):
+                    self._mark(node.name, scope, node)
+                elif isinstance(node, ast.arg):
+                    self._mark(node.arg, scope, node)
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    self._mark(node.name, scope, node)
+                elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                    pass  # a declaration, not a binding; collected in the first pass
+
+        def collect(self, tree) -> "_NameBindings":
+            self._mark_conditional_bindings(tree)
+            self._mark_loop_suites(tree)
+            scoped = list(self._walk_scoped(tree))
+            self._raw_mode = True
+            self._scan_bindings(scoped)
+            self._raw_mode = False
+            for node, scope in scoped:
+                if isinstance(node, ast.Global):
+                    for name in node.names:
+                        self._redirect[(scope, name)] = None
+                elif isinstance(node, ast.Nonlocal):
+                    for name in node.names:
+                        self._redirect[(scope, name)] = self._nonlocal_target(scope, name)
+            for node, scope in scoped:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        self._mark(
+                            alias.asname or alias.name.split(".")[0],
+                            scope,
+                            node,
+                            is_alias = True,
+                        )
+                        # Without `as`, the bound name is already the canonical head of the FQ name.
+                        if alias.asname and alias.name in _ALIASED_MODULES:
+                            self._record_alias(
+                                self.modules, (scope, alias.asname), alias.name, node
+                            )
+                elif isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        local = alias.asname or alias.name
+                        self._mark(local, scope, node, is_alias = True)
+                        if node.level or node.module is None:
+                            continue
+                        fq = f"{node.module}.{alias.name}"
+                        if fq in _ALIASED_MODULES:
+                            self._record_alias(self.modules, (scope, local), fq, node)
+                        elif node.module in _ALIASED_MODULES:
+                            self._record_alias(self.funcs, (scope, local), fq, node)
+            self._scan_bindings(scoped)
+            # An alias entry is only good while the name means one thing in its own scope. `import
+            # requests as r` followed by `import socket as r`, or by an assignment to `r`, leaves
+            # whichever the walk reached last, and ast.walk order is not specified, so drop both.
+            for table in (self.modules, self.funcs):
+                for key in [k for k in table if self._counts.get(k, 0) != 1]:
+                    self._dropped_aliases[key] = table[key]
+                    del table[key]
+            # Sessions are resolved in their own pass: classifying them while the table fills would
+            # let one binding's result change how the next one is read.
+            factories = {}
+            for (scope, name), value in self._candidates.items():
+                if value is None or self._counts.get((scope, name), 0) != 1:
+                    continue
+                factory = _factory_behind(value, self)
+                if factory is not None:
+                    factories[(scope, name)] = factory
+                    continue
+                # A call resolves to no text, but it is still where the name's value came from, so
+                # `u = input()` has to stay followable.
+                self.strings[(scope, name)] = value
+            # `client = s` holds the same session, and a one-line alias must not take the call out
+            # of the policy. Repeat until the chain stops growing.
+            # To a fixed point, not a fixed number of passes: each pass either classifies at
+            # least one more name or stops, so the candidate count bounds the work and a chain of
+            # twenty-five aliases resolves the same as a chain of two.
+            for _ in range(len(self._candidates) + 1):
+                grew = False
+                for (scope, name), value in self._candidates.items():
+                    key = (scope, name)
+                    if key in factories or not isinstance(value, ast.Name):
+                        continue
+                    if self._counts.get(key, 0) != 1:
+                        continue
+                    target = self.alias_for(factories, value.id, value)
+                    if target is not None:
+                        factories[key] = target
+                        grew = True
+                if not grew:
+                    break
+            # A rebind ends a session, it does not unmake the calls above it. Every assignment of
+            # a session factory is recorded at its own position, so `s = requests.Session()`,
+            # `s.get(...)`, `s = object()` still polices the call in the middle.
+            for key, positioned in self._value_positions.items():
+                for position, value in positioned:
+                    factory = _factory_behind(value, self)
+                    if factory is not None:
+                        self._alias_history.setdefault(key, []).append(
+                            (position, factory, id(self.sessions))
+                        )
+            self.sessions.update(factories)
+            return self
+
+    def _static_str_prefix(
+        node,
+        bindings,
+        seen = frozenset(),
+        depth = 0,
+    ) -> "tuple[str, bool]":
+        """``(text, is_complete)``: the longest statically known leading part of *node* as a string,
+        and whether the whole value is known. An f-string keeps its literal prefix so
+        ``f"https://duckduckgo.com/?q={q}"`` still resolves to a host.
+
+        ``seen`` is the names on the current resolution path, not the names met anywhere: shared
+        across siblings it would make ``x + x`` unresolvable. ``depth`` bounds a binding chain."""
+        if depth > _MAX_RESOLVE_DEPTH:
+            _resolve_exhausted[0] = True
+            return "", False
+        if depth == 0:
+            _resolve_budget[0] = _MAX_RESOLVE_STEPS
+            _resolve_exhausted[0] = False
+        elif _resolve_budget[0] <= 0:
+            _resolve_exhausted[0] = True
+            return "", False
+        _resolve_budget[0] -= 1
+        if isinstance(node, ast.NamedExpr):
+            # `requests.get(u := "...")` evaluates to the value it binds.
+            return _static_str_prefix(node.value, bindings, seen, depth + 1)
+        if isinstance(node, ast.Constant):
+            return (node.value, True) if isinstance(node.value, str) else ("", False)
+        if isinstance(node, ast.JoinedStr):
+            out = ""
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    out += part.value
+                    continue
+                if (
+                    isinstance(part, ast.FormattedValue)
+                    and part.format_spec is None
+                    and part.conversion in (-1, None)
+                ):
+                    inner, complete = _static_str_prefix(part.value, bindings, seen, depth + 1)
+                    if complete:
+                        out += inner
+                        continue
+                return out, False
+            return out, True
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left, left_complete = _static_str_prefix(node.left, bindings, seen, depth + 1)
+            right, right_complete = _static_str_prefix(node.right, bindings, seen, depth + 1)
+            if left_complete and right_complete:
+                return left + right, True
+            # A literal on the left does not make the result start with it: str.__add__ returns
+            # NotImplemented for a non-str right operand and Python then calls its __radd__, which
+            # may return anything at all. Unlike an f-string, a half-known sum knows nothing.
+            return "", False
+        if isinstance(node, ast.Call):
+            # urllib.request.Request("...") carries the URL the later urlopen will use.
+            builder = (
+                _REQUEST_BUILDER_METHODS.get(node.func.attr)
+                if isinstance(node.func, ast.Attribute)
+                else None
+            )
+            if builder is not None:
+                # `Request(...).prepare()` and `client.build_request(...)` hand back an object
+                # that still carries the URL it was built from.
+                inner = node.args[builder] if len(node.args) > builder else None
+                if inner is None and builder == 0 and isinstance(node.func, ast.Attribute):
+                    inner = node.func.value
+                if inner is not None:
+                    return _static_str_prefix(inner, bindings, seen, depth + 1)
+            wrapper = _URL_WRAPPER_FQ.get(_canonical_fq(node.func, bindings))
+            if wrapper is not None:
+                # httpx.Request("GET", url) puts the verb first, urllib's Request the URL.
+                inner = node.args[wrapper] if len(node.args) > wrapper else None
+                for kw in node.keywords or []:
+                    if kw.arg in _URL_KWARGS:
+                        inner = kw.value
+                        break
+                if inner is not None:
+                    return _static_str_prefix(inner, bindings, seen, depth + 1)
+            return "", False
+        if isinstance(node, ast.Name):
+            # `a1 = a0` repeated is a chain, not nesting, so following it iteratively keeps the
+            # depth limit measuring real structure (sums, f-strings). Spending depth here would
+            # make the limit itself the way past the policy: a blocked literal handed along
+            # twenty-five assignments would simply stop resolving.
+            names = set(seen)
+            current = node
+            links = 0
+            while isinstance(current, ast.Name):
+                links += 1
+                if current.id in names or links > _MAX_BINDING_LINKS:
+                    if links > _MAX_BINDING_LINKS:
+                        _resolve_exhausted[0] = True
+                    return "", False
+                names.add(current.id)
+                bound = bindings.string_for(current.id, current)
+                if bound is None:
+                    return "", False
+                current = bound
+            return _static_str_prefix(current, bindings, frozenset(names), depth + 1)
+        return "", False
+
+    def _resolution_gave_up(node) -> bool:
+        """Whether reading *node* as a string ran out of depth or budget rather than finishing."""
+        _static_str_prefix(node, _bindings)
+        return _resolve_exhausted[0]
+
+    def _host_from_url_node(node, bindings) -> "tuple[str | None, bool]":
+        """``(host, resolved)`` for a URL argument. ``resolved`` is False only when the target
+        cannot be pinned down at all, which is what makes the allowlist unenforceable."""
+        text, complete = _static_str_prefix(node, bindings)
+        if text:
+            # Only a complete string may end at its authority; a prefix has to show the delimiter
+            # that closed it, or what follows could still be part of the host.
+            m = (_URL_HOST_RE if complete else _URL_HOST_TERMINATED_RE).match(text)
+            if m:
+                return m.group(1), True
+        if complete:
+            # A fully known string with no scheme is not a URL the host policy can act on.
+            return None, True
+        return None, False
+
+    _SOCKET_FACTORY_FQ = ("socket.socket", "socket.create_connection", "socket.socketpair")
+    _SOCKET_TARGET_FQ = ("socket.create_connection",)
+
+    def _is_a_socket_receiver(node) -> bool:
+        """Whether *node* evaluates to a socket: `socket.socket(...)` inline, or a name bound to
+        one. A tuple argument looks socket-shaped too, but the receiver is what settles it."""
+        if isinstance(node, ast.Call):
+            return _canonical_fq(node.func, _bindings) in _SOCKET_FACTORY_FQ
+        if isinstance(node, ast.Name):
+            bound = _bindings.string_for(node.id, node)
+            if isinstance(bound, ast.Call):
+                return _canonical_fq(bound.func, _bindings) in _SOCKET_FACTORY_FQ
+        return False
+
+    # `host = ` in a libpq DSN, `SERVER = ` in an ODBC one.
+    # The value runs to the next separator and may be a comma separated failover list, which the
+    # caller splits: libpq tries each host in turn, so every one of them has to be screened.
+    _DSN_HOST_RE = re.compile(r"(?:^|[;\s])(?:hostaddr|host|server)\s*=\s*([^;\s]+)", re.IGNORECASE)
+    # Schemes that name a file rather than a host, so `sqlite:///state.db` opens nothing remote.
+    _LOCAL_DSN_SCHEMES = ("sqlite", "duckdb", "file", "shm", "memory")
+    # These open a file and nothing else, so their argument is a path however it is spelled:
+    # `sqlite3.connect("host=cache.db")` is a file called host=cache.db.
+    _FILE_ONLY_CONNECT_OWNERS = frozenset({"sqlite3", "apsw", "duckdb"})
+    # libpq takes a literal address in hostaddr, which reaches a host without naming one in host.
+    _DATABASE_HOST_KEYWORDS = frozenset({"host", "hostaddr", "server"})
+
+    def _dsn_hosts(text: str, complete: bool = True) -> "list[str]":
+        """Every host a database connection string names. A libpq DSN may list failover hosts,
+        `host = primary,standby`, and the client tries each, so screening the first alone would
+        let the second through. A SQLite path and a bare `dbname = app` name none."""
+        if "://" in text:
+            scheme = text.split("://", 1)[0].split("+")[0].lower()
+            if scheme in _LOCAL_DSN_SCHEMES:
+                return []
+            match = (_URL_HOST_RE if complete else _URL_HOST_TERMINATED_RE).match(text)
+            if match is None:
+                if not complete:
+                    # The authority has not been closed yet, so what follows could still be part
+                    # of it and no host is known.
+                    return []
+                authority = text.split("://", 1)[1].split("/")[0]
+            else:
+                authority = match.group(1)
+            # A libpq URL carries its failover list in the authority: user@a,b/db.
+            userinfo, _, hosts = authority.rpartition("@")
+            prefix = f"{userinfo}@" if userinfo else ""
+            return [f"{prefix}{host}" for host in hosts.split(",") if host]
+        out: list = []
+        for match in _DSN_HOST_RE.finditer(text):
+            out.extend(host for host in match.group(1).split(",") if host)
+        return out
+
+    def _expanded_host_arguments(node: ast.Call) -> "tuple[list, bool]":
+        """Host values hidden in a `**` expansion, and whether any expansion could not be read.
+        `connect("dbname = app", **{"host": metadata})` overrides the DSN, so the mapping has to
+        be looked at rather than skipped."""
+        found = []
+        opaque = False
+        for kw in node.keywords or []:
+            if kw.arg is not None:
+                continue
+            if isinstance(kw.value, ast.Dict):
+                for key, value in zip(kw.value.keys, kw.value.values):
+                    if (
+                        isinstance(key, ast.Constant)
+                        and isinstance(key.value, str)
+                        and key.value.lower() in _DATABASE_HOST_KEYWORDS
+                    ):
+                        found.append(value)
+                continue
+            opaque = True
+        return found, opaque
+
+    def _remote_database_hosts(node: ast.Call) -> "list[str]":
+        """Every host a `connect` on a database client names, across the DSN and the keywords."""
+        expanded, _opaque = _expanded_host_arguments(node)
+        positional = node.args[0] if node.args else None
+        candidates = [kw.value for kw in node.keywords or [] if kw.arg in _DATABASE_HOST_KEYWORDS]
+        candidates += expanded
+        candidates += list(node.args[:1])
+        found: list = []
+        for candidate in candidates:
+            text, complete = _static_str_prefix(candidate, _bindings)
+            if not text or not (complete or "://" in text):
+                continue
+            hosts = _dsn_hosts(text, complete) if ("://" in text or "=" in text) else []
+            if not hosts and complete and candidate is not positional:
+                # A bare `host = ` keyword is the host itself, not a connection string, and it
+                # may still list failover hosts.
+                hosts = [host for host in text.split(",") if host]
+            for host in hosts:
+                if host not in found:
+                    found.append(host)
+        return found
+
+    def _assigned_attributes(target, out: set) -> None:
+        """Every attribute a target assigns, through tuple, list and starred destructuring.
+        `(sqlite3.connect,) = (...)` replaces the callable just as plainly as a bare assignment."""
+        if isinstance(target, ast.Attribute):
+            written = _written_fq(target)
+            if written:
+                out.add(written)
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            for element in target.elts:
+                _assigned_attributes(element, out)
+        elif isinstance(target, ast.Starred):
+            _assigned_attributes(target.value, out)
+
+    _rebound_attributes: set = set()
+    for _statement in _tree_nodes(tree):
+        for _target in list(getattr(_statement, "targets", [])) + (
+            [_statement.target] if isinstance(_statement, (ast.AnnAssign, ast.AugAssign)) else []
+        ):
+            _assigned_attributes(_target, _rebound_attributes)
+
+    def _dynamically_mutated_owners(tree) -> set:
+        """Names whose attributes the source replaces without writing an assignment target:
+        `setattr(sqlite3, "connect", ...)`, `vars(sqlite3)["connect"] = ...` and the `__dict__`
+        spelling of the same thing. The attribute cannot be proven unchanged after that, so the
+        exemption is withheld for everything under that name."""
+        out: set = set()
+
+        def root_of(node) -> str:
+            while isinstance(node, (ast.Attribute, ast.Subscript)):
+                node = node.value
+            if isinstance(node, ast.Call) and node.args:
+                # vars(sqlite3)[...]
+                node = node.args[0]
+            return node.id if isinstance(node, ast.Name) else ""
+
+        def writes_a_namespace(func) -> bool:
+            """`setattr`, however it is reached: bare, through `builtins`, under an alias, or as
+            `mock.patch.object`. The name at the end is what says so, because the owner in front
+            of it can be anything."""
+            if isinstance(func, ast.Attribute):
+                if func.attr in ("setattr", "delattr"):
+                    return True
+                # mock.patch.object(sqlite3, "connect", ...)
+                return func.attr == "object" and _written_fq(func).endswith("patch.object")
+            if not isinstance(func, ast.Name):
+                return False
+            if func.id in ("setattr", "delattr"):
+                return True
+            # `setter = setattr` holds the same function.
+            for value in _bindings.possible_values(func.id, func):
+                if isinstance(value, ast.Name) and value.id in ("setattr", "delattr"):
+                    return True
+                if isinstance(value, ast.Attribute) and value.attr in ("setattr", "delattr"):
+                    return True
+            return False
+
+        for node in _tree_nodes(tree):
+            if isinstance(node, ast.Call) and node.args and writes_a_namespace(node.func):
+                owner = root_of(node.args[0])
+                if owner:
+                    out.add(owner)
+            if isinstance(node, ast.Call) and node.args:
+                # mock.patch("sqlite3.connect") names its target as a dotted string.
+                target = node.args[0]
+                patches = (isinstance(node.func, ast.Attribute) and node.func.attr == "patch") or (
+                    isinstance(node.func, ast.Name) and node.func.id == "patch"
+                )
+                if patches and isinstance(target, ast.Constant) and isinstance(target.value, str):
+                    out.add(target.value.split(".")[0])
+            targets = list(getattr(node, "targets", []))
+            if isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.target:
+                targets.append(node.target)
+            if isinstance(node, ast.Delete):
+                targets += node.targets
+            for target in targets:
+                if not isinstance(target, ast.Subscript):
+                    continue
+                owner = root_of(target.value)
+                mapping = target.value
+                is_namespace = (
+                    isinstance(mapping, ast.Attribute) and mapping.attr == "__dict__"
+                ) or (
+                    isinstance(mapping, ast.Call)
+                    and isinstance(mapping.func, ast.Name)
+                    and mapping.func.id == "vars"
+                )
+                if owner and is_namespace:
+                    out.add(owner)
+        return out
+
+    # Computed on first use: it resolves names, and the binding table is built further down.
+    _mutated_owners_cache: list = []
+
+    def _mutated_owners() -> set:
+        if not _mutated_owners_cache:
+            _mutated_owners_cache.append(_dynamically_mutated_owners(tree))
+        return _mutated_owners_cache[0]
+
+    def _any_prefix_was_rebound(node) -> bool:
+        """Whether the source assigned this attribute or anything it hangs off. `sqlite3.x` being
+        replaced makes `sqlite3.x.connect` someone else's callable even though the root is still
+        the module that was imported."""
+        written = _written_fq(node)
+        if not written:
+            return False
+        parts = written.split(".")
+        if parts[0] in _mutated_owners():
+            # Its namespace was written to at runtime, so nothing under it is what it was.
+            return True
+        return any(
+            ".".join(parts[: index + 1]) in _rebound_attributes for index in range(len(parts))
+        )
+
+    def _is_a_connect_call(node: ast.Call) -> bool:
+        """Whether this call is a `connect`, however it was imported. `from psycopg2 import
+        connect` spells it as a bare name, and the resolved name is what says what it is."""
+        if isinstance(node.func, ast.Attribute):
+            return node.func.attr == "connect"
+        return any(
+            name.rpartition(".")[2] == "connect" for name in _call_fq_names(node.func, _bindings)
+        )
+
+    def _connect_owner_root(node: ast.Call) -> str:
+        """The module a `connect` call belongs to, resolved rather than as written."""
+        for name in _call_fq_names(node.func, _bindings):
+            if name.rpartition(".")[2] == "connect" and "." in name:
+                return name.split(".")[0]
+        return ""
+
+    def _database_target_is_external(node: ast.Call) -> bool:
+        """Whether the DSN or host of a database `connect` is read from outside the source."""
+        expanded, _opaque = _expanded_host_arguments(node)
+        candidates = [kw.value for kw in node.keywords or [] if kw.arg in _DATABASE_HOST_KEYWORDS]
+        candidates += expanded
+        candidates += list(node.args[:1])
+        return any(_externally_sourced(candidate, _bindings) for candidate in candidates)
+
+    def _connect_is_exempt(node: ast.Call) -> bool:
+        """Whether a `connect` call is one of the local-resource clients, still spelling what it
+        was imported as. Replacing the callable, `sqlite3.connect = smtplib.SMTP().connect`,
+        leaves the receiver looking like the module while the call opens a socket."""
+        if not isinstance(node.func, ast.Attribute):
+            return _connect_owner_root(node) in _LOCAL_CONNECT_OWNERS
+        return _opens_a_local_resource(node.func.value) and not _any_prefix_was_rebound(node.func)
+
+    def _names_a_local_client_module(node) -> bool:
+        """Whether *node* is a reference to one of the local-client modules as imported. A name
+        that was assigned rather than imported answers for its value, not for its spelling:
+        `sqlite3 = smtplib` is the smtplib module wearing a reserved name."""
+        root = node
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        if not isinstance(root, ast.Name):
+            return False
+        if _bindings.may_be_bound(root.id, root):
+            # The source may have given this name a meaning of its own, so the import is not what
+            # it holds. A parameter and a class both bind it without ever recording a value, which
+            # is why this asks the binding table rather than the values, and a binding in an
+            # enclosing scope counts: losing an exemption costs a refusal, keeping one wrongly
+            # costs a request to any host.
+            return False
+        if _any_prefix_was_rebound(node):
+            # An attribute below the module was replaced, so what hangs off it is not the module's.
+            return False
+        imported = _bindings.alias_for(_bindings.modules, root.id, root)
+        return (imported or root.id).split(".")[0] in _LOCAL_CONNECT_OWNERS
+
+    def _opens_a_local_resource(receiver) -> bool:
+        """Whether a `connect` receiver is one of the local-resource clients. Judged on where the
+        value came from, never on the name: `sqlite3 = smtplib.SMTP()` spells a reserved head and
+        still opens a socket, so a name that holds a value is answered by that value."""
+        if isinstance(receiver, ast.Call):
+            return _names_a_local_client_module(receiver.func)
+        if isinstance(receiver, ast.Name):
+            values = _bindings.values_for(receiver.id, receiver)
+            if values:
+                # Every value it can hold has to be local, and a value we cannot name is not.
+                return all(_opens_a_local_resource(value) for value in values)
+            return _names_a_local_client_module(receiver)
+        if isinstance(receiver, ast.Attribute):
+            return _names_a_local_client_module(receiver)
+        return False
+
+    _external_memo: set = set()
+
+    # Following bindings is bounded by the tree itself once visited nodes are remembered, so this
+    # budget is a backstop against a pathological file rather than the real limit. Exhausting it
+    # answers "externally sourced": a guard that answers "no" when it gives up is a bypass, since
+    # laundering a value through enough assignments would be all it takes.
+    _MAX_EXTERNAL_STEPS = 200_000
+
+    def _externally_sourced(node, bindings) -> bool:
+        """Whether *node* takes its value from outside the program: env, stdin, argv, a file read.
+        Bindings are followed, so `u = os.environ["T"]` reads the same as the expression inline.
+
+        This is what separates a target the allowlist cannot police from one it merely cannot
+        read. An ordinary loop variable or function parameter is unresolvable too, but its value
+        came from the same source file; only an external one lets the host be chosen off-source.
+
+        Iterative on purpose. A recursive walk has to stop at some depth, and a chain of plain
+        assignments is exactly the shape that reaches it, so the depth limit itself would become
+        the way through."""
+        if node is None:
+            return False
+        stack = [node]
+        seen_nodes: set = set()
+        seen_names: set = set()
+        steps = 0
+        while stack:
+            current = stack.pop()
+            if current is None or id(current) in seen_nodes:
+                continue
+            seen_nodes.add(id(current))
+            steps += 1
+            if steps > _MAX_EXTERNAL_STEPS:
+                return True
+            for sub in ast.walk(current):
+                steps += 1
+                if steps > _MAX_EXTERNAL_STEPS:
+                    return True
+                if isinstance(sub, ast.Call) and _calls_an_external_reader(sub, bindings):
+                    return True
+                if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                    if sub.func.id in ("input", "getpass") and not bindings.is_bound(
+                        sub.func.id, sub.func
+                    ):
+                        # Only the builtin reads a terminal. A local def by that name returns
+                        # whatever the source says it returns.
+                        return True
+                if isinstance(sub, ast.Attribute) and isinstance(sub.value, ast.Name):
+                    if sub.attr in ("argv", "stdin") and _names_the_real_module(
+                        sub.value, "sys", bindings
+                    ):
+                        return True
+                if _reads_a_file(sub):
+                    return True
+                if _reads_env_or_secret(sub, bindings):
+                    return True
+                if _reads_an_external_source_through_an_alias(sub, bindings):
+                    return True
+                if isinstance(sub, ast.Name):
+                    key = (sub.id, id(sub))
+                    if key in seen_names:
+                        continue
+                    seen_names.add(key)
+                    stack.extend(bindings.values_for(sub.id, sub))
+        return False
+
+    _bindings = _NameBindings().collect(tree)
 
     def _call_is_upload_shape(node: ast.Call, fq: str) -> bool:
         """True for statically obvious upload shapes (files=, data=open(), bytes literal)."""
@@ -16107,15 +17640,141 @@ def _check_signal_escape_patterns(code: str):
         "preupload_lfs_files": "additions",
     }
 
-    def _is_os_environ(node: ast.AST) -> bool:
-        return (
-            isinstance(node, ast.Attribute)
-            and node.attr == "environ"
-            and isinstance(node.value, ast.Name)
-            and node.value.id == "os"
+    # The names an aliased import can still be reading. Spelled as full names because that is what
+    # the alias resolves to: `import os as o` makes `o.environ` the name `os.environ`.
+    _EXTERNAL_SOURCE_FQ = frozenset(
+        {
+            "os.environ",
+            "os.environb",
+            "os.getenv",
+            "os.getenvb",
+            "sys.argv",
+            "sys.stdin",
+            "getpass.getpass",
+            "subprocess.run",
+            "subprocess.Popen",
+            "subprocess.check_output",
+            "subprocess.getoutput",
+            "subprocess.getstatusoutput",
+        }
+    )
+
+    # Reading a file is reading something the source does not show: a URL in a workspace file is
+    # chosen wherever that file came from, which is the same hole as reading the environment.
+    _FILE_READ_METHODS = frozenset({"read", "readline", "readlines", "read_text", "read_bytes"})
+
+    _PATHLIB_FQ = ("pathlib.Path", "Path")
+
+    def _is_a_file_receiver(node: ast.AST) -> bool:
+        """Whether *node* evaluates to something backed by a file. An in-memory reader is not:
+        `io.StringIO("...")` holds a string the source itself wrote."""
+        if isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id == "open":
+                return not _bindings.is_bound(func.id, func)
+            fq = _canonical_fq(func, _bindings)
+            if fq in _PATHLIB_FQ or fq.endswith(".Path"):
+                return True
+            # io.open, os.fdopen, Path(...).open(): whatever the owner, `open` hands back a file.
+            return fq.rpartition(".")[2] in ("open", "fdopen")
+        if isinstance(node, ast.Name):
+            # `f1 = f0` repeated is a chain, so it is followed rather than recursed through.
+            seen: set = set()
+            current = node
+            links = 0
+            while isinstance(current, ast.Name):
+                links += 1
+                if current.id in seen or links > _MAX_BINDING_LINKS:
+                    return False
+                seen.add(current.id)
+                bound = _bindings.string_for(current.id, current)
+                if bound is None:
+                    return False
+                current = bound
+            return _is_a_file_receiver(current)
+        return False
+
+    def _reads_a_file(node: ast.AST) -> bool:
+        """Whether *node* opens or reads a file."""
+        if not isinstance(node, ast.Call):
+            return False
+        func = node.func
+        if isinstance(func, ast.Name) and func.id == "open":
+            return not _bindings.is_bound(func.id, func)
+        if not isinstance(func, ast.Attribute) or func.attr not in _FILE_READ_METHODS:
+            return False
+        # `read_text` reads like pathlib, but Python is duck typed and the name is not reserved,
+        # so the receiver settles it here as it does for `read`.
+        return _is_a_file_receiver(func.value)
+
+    def _calls_an_external_reader(call: ast.Call, bindings) -> bool:
+        """Whether a call reaches one of the external readers through a name that holds it.
+        `reader = input` and `reader = os.getenv` are the same readers under another name, and
+        following the binding loses the call, so the invocation is checked here."""
+        func = call.func
+        seen: set = set()
+        links = 0
+        while isinstance(func, ast.Name):
+            links += 1
+            if func.id in seen or links > _MAX_RESOLVE_DEPTH:
+                # Giving up cannot mean "not a reader": a chain of aliases would be the whole
+                # bypass. The same rule the string resolver follows when it runs out.
+                return True
+            seen.add(func.id)
+            if _reads_an_external_source_through_an_alias(func, bindings):
+                return True
+            if func.id in ("input", "getpass") and not bindings.is_bound(func.id, func):
+                return True
+            values = bindings.possible_values(func.id, func)
+            if len(values) != 1 or values[0] is None:
+                return False
+            func = values[0]
+        if not isinstance(func, ast.Attribute):
+            return False
+        if _reads_an_external_source_through_an_alias(func, bindings):
+            return True
+        written = _written_fq(func)
+        if written not in _EXTERNAL_SOURCE_FQ:
+            return False
+        # The written name only means the module while the source has not defined one of its own.
+        root = func
+        while isinstance(root, ast.Attribute):
+            root = root.value
+        return isinstance(root, ast.Name) and _names_the_real_module(
+            root, written.split(".")[0], bindings
         )
 
-    def _reads_env_or_secret(node: ast.AST | None) -> bool:
+    def _reads_an_external_source_through_an_alias(node: ast.AST, bindings) -> bool:
+        """The alias-aware half of external-source detection. `_reads_env_or_secret` matches the
+        names as written, which misses `import os as o` and `from os import getenv as env`: the
+        target is just as externally chosen when the module was renamed on import."""
+        if isinstance(node, ast.Call):
+            node = node.func
+        if isinstance(node, ast.Name):
+            resolved = bindings.alias_for(bindings.funcs, node.id, node)
+            return bool(resolved) and resolved in _EXTERNAL_SOURCE_FQ
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            owner = bindings.alias_for(bindings.modules, node.value.id, node)
+            return bool(owner) and f"{owner}.{node.attr}" in _EXTERNAL_SOURCE_FQ
+        return False
+
+    def _names_the_real_module(node: ast.Name, module: str, bindings) -> bool:
+        """Whether this name is the module it spells rather than something the source defined.
+        `class os: environ = {...}` is a local class, and reading it is not reading the process
+        environment. A shadowed name is judged the same way `input` and `getpass` already are."""
+        if node.id != module:
+            return False
+        return bindings is None or not bindings.is_bound(node.id, node)
+
+    def _is_os_environ(node: ast.AST, bindings = None) -> bool:
+        return (
+            isinstance(node, ast.Attribute)
+            and node.attr in ("environ", "environb")
+            and isinstance(node.value, ast.Name)
+            and _names_the_real_module(node.value, "os", bindings)
+        )
+
+    def _reads_env_or_secret(node: "ast.AST | None", bindings = None) -> bool:
         """True if any node in the subtree resolves to an env/process read. Walks the whole subtree
         (not just the root) to catch wrappers like `str(os.environ)`. Covers
         os.environ[/.get]/os.getenv, bare getenv, and subprocess.{run,check_output,...} that
@@ -16123,7 +17782,7 @@ def _check_signal_escape_patterns(code: str):
         if node is None:
             return False
         for sub in ast.walk(node):
-            if _is_os_environ(sub):
+            if _is_os_environ(sub, bindings):
                 return True
             if isinstance(sub, ast.Call):
                 f = sub.func
@@ -16131,7 +17790,7 @@ def _check_signal_escape_patterns(code: str):
                     if (
                         f.attr in {"getenv", "getenvb"}
                         and isinstance(f.value, ast.Name)
-                        and f.value.id == "os"
+                        and _names_the_real_module(f.value, "os", bindings)
                     ):
                         return True
                     if (
@@ -16148,7 +17807,8 @@ def _check_signal_escape_patterns(code: str):
                     ):
                         return True
                 if isinstance(f, ast.Name) and f.id in {"getenv", "getenvb"}:
-                    return True
+                    if bindings is None or not bindings.is_bound(f.id, f):
+                        return True
         return False
 
     def _is_safe_relative_path(path: str) -> bool:
@@ -16198,7 +17858,7 @@ def _check_signal_escape_patterns(code: str):
                 )
         all_values = list(node.args or []) + [kw.value for kw in (node.keywords or [])]
         for v in all_values:
-            if _reads_env_or_secret(v):
+            if _reads_env_or_secret(v, _bindings):
                 return (
                     "HF upload cannot include os.environ / os.getenv / subprocess "
                     "env reads; secrets and tokens must not be exfiltrated"
@@ -16255,16 +17915,126 @@ def _check_signal_escape_patterns(code: str):
             return _HF_UPLOAD_PATH_VIOLATION
         return None
 
+    # Clients that can be handed their host once, at construction, after which a request needs
+    # only a path. `urllib3` pools take a bare host, the others a whole base URL.
+    # Only the connection pools take a host positionally. `urllib3.PoolManager(10)` takes a pool
+    # count, so reading argument zero there would refuse an ordinary configuration.
+    _POSITIONAL_HOST_FQ = ("urllib3.HTTPConnectionPool", "urllib3.HTTPSConnectionPool")
+    _POOL_FACTORY_FQ = (
+        "urllib3.PoolManager",
+        "urllib3.HTTPConnectionPool",
+        "urllib3.HTTPSConnectionPool",
+    )
+
+    def _screen_host(host: str, node) -> None:
+        """Record what the policy says about a host that a call will reach."""
+        if _is_metadata_host(host):
+            network_calls.append(
+                {
+                    "type": "metadata_host_blocked",
+                    "line": getattr(node, "lineno", -1),
+                    "description": "Blocked: cloud-metadata host",
+                }
+            )
+        elif not _is_trusted_host(host):
+            network_calls.append(
+                {
+                    "type": "untrusted_host_blocked",
+                    "line": getattr(node, "lineno", -1),
+                    "description": (
+                        "Blocked: host not in sandbox allowlist; "
+                        "use an allowed informational source"
+                    ),
+                }
+            )
+
+    def _other_possible_hosts(url_node, bare_hosts: bool = False) -> "list[str]":
+        """Hosts a target could reach besides the one it resolves to, because more than one
+        assignment can hold at the call."""
+        if isinstance(url_node, ast.IfExp):
+            # Both arms are written down, so both are answered for.
+            out: list = []
+            for arm in (url_node.body, url_node.orelse):
+                host, _resolved = _host_from_url_node(arm, _bindings)
+                if host and host not in out:
+                    out.append(host)
+                out.extend(
+                    host for host in _other_possible_hosts(arm, bare_hosts) if host not in out
+                )
+            return out
+        if not isinstance(url_node, ast.Name):
+            return []
+        values = _bindings.possible_values(url_node.id, url_node)
+        if len(values) < 2 and not any(isinstance(value, ast.IfExp) for value in values):
+            # One value can hold and it names one target, so the ordinary resolution answered it.
+            return []
+        out: list = []
+        for value in values:
+            if isinstance(value, ast.IfExp):
+                # The name holds a conditional, so both of its arms are targets.
+                out.extend(
+                    host for host in _other_possible_hosts(value, bare_hosts) if host not in out
+                )
+                continue
+            host, _resolved = _host_from_url_node(value, _bindings)
+            if host is None and bare_hosts:
+                # A pool takes a bare host rather than a URL, so a fully known string is one.
+                text, complete = _static_str_prefix(value, _bindings)
+                if complete and text and "://" not in text:
+                    host = text
+            if host and host not in out:
+                out.append(host)
+        return out
+
+    def _expanded_host_node(value, wanted):
+        """The host a `**` expansion carries, when the mapping is written out. A dict bound to a
+        name first is the same expansion one line later."""
+        held = [value]
+        if isinstance(value, ast.Name):
+            held += _bindings.possible_values(value.id, value)
+        for candidate in held:
+            if not isinstance(candidate, ast.Dict):
+                continue
+            for key, item in zip(candidate.keys, candidate.values):
+                if isinstance(key, ast.Constant) and key.value in wanted:
+                    return item
+        return None
+
+    def _configured_host_node(node: ast.Call, fq: str):
+        """Where a client is handed its host. `httpx.Client(base_url = ...)` followed by
+        `c.get("/latest")` reaches a host the request itself never names, so the constructor is
+        where that host has to be read."""
+        is_pool = fq in _POOL_FACTORY_FQ
+        if fq not in _SESSION_FACTORY_FQ and not is_pool:
+            return None
+        for kw in node.keywords or []:
+            if kw.arg in ("base_url", "host"):
+                return kw.value
+            if kw.arg is None:
+                # `**{"base_url": ...}` hands over the host as surely as the keyword does.
+                expanded = _expanded_host_node(kw.value, ("base_url", "host"))
+                if expanded is not None:
+                    return expanded
+        takes_positional = fq in _POSITIONAL_HOST_FQ or fq == "aiohttp.ClientSession"
+        return node.args[0] if (takes_positional and node.args) else None
+
+    def _configured_host(host_node) -> "str | None":
+        """The host that constructor argument names, when it is known. A base URL with a dynamic
+        path still names its host: `f"http://169.254.169.254/{path}"` passed the authority
+        delimiter before the unknown part began."""
+        host, _resolved = _host_from_url_node(host_node, _bindings)
+        if host:
+            return host
+        text, complete = _static_str_prefix(host_node, _bindings)
+        # A bare host rather than a URL, which only a fully known string can be.
+        return text if (complete and text and "://" not in text) else None
+
     class NetworkAndIoVisitor(ast.NodeVisitor):
         def visit_Call(self, node):
-            parts: list[str] = []
-            cur = node.func
-            while isinstance(cur, ast.Attribute):
-                parts.insert(0, cur.attr)
-                cur = cur.value
-            if isinstance(cur, ast.Name):
-                parts.insert(0, cur.id)
-            fq = ".".join(parts) if parts else ""
+            fq_names = _call_fq_names(node.func, _bindings)
+            fq = fq_names[0] if fq_names else ""
+            # The name the network policy answers on: whichever spelling a prefix matches.
+            network_fq = next((f for f in fq_names if _is_a_network_call(f)), "")
 
             hf_upload_name = _method_call_hf_upload_name(node)
             if hf_upload_name is not None:
@@ -16278,16 +18048,77 @@ def _check_signal_escape_patterns(code: str):
                         }
                     )
 
-            # Direct sock.connect((host, port)) bypasses the FQ-prefix branch.
-            if isinstance(node.func, ast.Attribute) and node.func.attr == "connect" and node.args:
+            # Direct sock.connect((host, port)) bypasses the FQ-prefix branch, and so do the
+            # scalar-host clients (ftplib, smtplib, socketio). Only the APIs whose `connect` opens
+            # a local resource are left alone: reading a database path as a host refuses it.
+            # Even then the exemption is only from screening the argument as a bare host. A
+            # connection string can name a remote host as plainly as a URL does, and
+            # `postgresql://user:pass@host/db` is the usual way to write one.
+            if _is_a_connect_call(node) and _connect_is_exempt(node):
+                database_hosts = (
+                    []
+                    if _connect_owner_root(node) in _FILE_ONLY_CONNECT_OWNERS
+                    else _remote_database_hosts(node)
+                )
+                if database_hosts:
+                    for database_host in database_hosts:
+                        _screen_host(database_host, node)
+                else:
+                    _expanded, opaque = _expanded_host_arguments(node)
+                    if _connect_owner_root(node) not in _FILE_ONLY_CONNECT_OWNERS and (
+                        _database_target_is_external(node)
+                        or (
+                            opaque
+                            and any(
+                                _externally_sourced(kw.value, _bindings)
+                                for kw in node.keywords or []
+                                if kw.arg is None
+                            )
+                        )
+                    ):
+                        network_calls.append(
+                            {
+                                "type": "opaque_url_blocked",
+                                "line": getattr(node, "lineno", -1),
+                                "description": (
+                                    "Blocked: request target is read from the environment or "
+                                    "input; use a literal URL on an allowed informational source"
+                                ),
+                            }
+                        )
+
+            if (
+                _is_a_connect_call(node)
+                and isinstance(node.func, ast.Attribute)
+                and node.args
+                and (
+                    isinstance(node.args[0], ast.Tuple)
+                    or _is_a_socket_receiver(node.func.value)
+                    or not _connect_is_exempt(node)
+                )
+            ):
                 a0 = node.args[0]
                 host_lit = None
-                if isinstance(a0, ast.Tuple) and a0.elts:
-                    e0 = a0.elts[0]
-                    if isinstance(e0, ast.Constant) and isinstance(e0.value, str):
-                        host_lit = e0.value
-                elif isinstance(a0, ast.Constant) and isinstance(a0.value, str):
-                    host_lit = a0.value
+                host_node = a0.elts[0] if isinstance(a0, ast.Tuple) and a0.elts else a0
+                text, complete = _static_str_prefix(host_node, _bindings)
+                if complete and text:
+                    # socketio and friends take a whole URL where a socket takes a bare host, so a
+                    # target that carries a scheme is read as one rather than screened as a name.
+                    if "://" in text:
+                        host_lit = _host_from_url_node(host_node, _bindings)[0]
+                    else:
+                        host_lit = text
+                if not host_lit and _externally_sourced(host_node, _bindings):
+                    network_calls.append(
+                        {
+                            "type": "opaque_url_blocked",
+                            "line": getattr(node, "lineno", -1),
+                            "description": (
+                                "Blocked: request target is read from the environment or input; "
+                                "use a literal URL on an allowed informational source"
+                            ),
+                        }
+                    )
                 if host_lit:
                     if _is_metadata_host(host_lit):
                         network_calls.append(
@@ -16309,9 +18140,33 @@ def _check_signal_escape_patterns(code: str):
                             }
                         )
 
-            if fq and any(fq.startswith(p) for p in _NETWORK_FQ_PREFIXES):
+            for name in fq_names:
+                host_node = _configured_host_node(node, name)
+                if host_node is None:
+                    continue
+                for possible in _other_possible_hosts(host_node, bare_hosts = True):
+                    _screen_host(possible, node)
+                configured = _configured_host(host_node)
+                if configured:
+                    _screen_host(configured, node)
+                elif _externally_sourced(host_node, _bindings):
+                    # The client is handed a host chosen off-source, which is the same hole as a
+                    # request target read from the environment and is refused for the same reason.
+                    network_calls.append(
+                        {
+                            "type": "opaque_url_blocked",
+                            "line": getattr(node, "lineno", -1),
+                            "description": (
+                                "Blocked: request target is read from the environment or input; "
+                                "use a literal URL on an allowed informational source"
+                            ),
+                        }
+                    )
+                break
+
+            if network_fq:
                 # 1) Upload-shape check (host-independent).
-                if _call_is_upload_shape(node, fq):
+                if _call_is_upload_shape(node, network_fq):
                     network_calls.append(
                         {
                             "type": "upload_blocked",
@@ -16320,23 +18175,90 @@ def _check_signal_escape_patterns(code: str):
                         }
                     )
 
-                # 2) Extract literal host (URL string or (host, port) tuple).
+                # 2) Resolve the host (URL string, bound variable, or (host, port) tuple).
                 host_arg = None
-                url_arg = None
-                if node.args:
-                    a0 = node.args[0]
-                    if isinstance(a0, ast.Constant) and isinstance(a0.value, str):
-                        url_arg = a0.value
-                    elif isinstance(a0, ast.Tuple) and a0.elts:
-                        e0 = a0.elts[0]
-                        if isinstance(e0, ast.Constant) and isinstance(e0.value, str):
-                            host_arg = e0.value
-                if url_arg and host_arg is None:
-                    m = re.match(r"^\w+://([^/?#]+)", url_arg)
-                    if m:
-                        host_arg = m.group(1)
+                target_resolved = True
+                url_index = _url_arg_index(network_fq)
+                url_node = node.args[url_index] if len(node.args) > url_index else None
+                expansion_is_opaque = False
+                for kw in node.keywords or []:
+                    if kw.arg in _URL_KWARGS:
+                        url_node = kw.value
+                        break
+                    if kw.arg is not None:
+                        continue
+                    # `requests.get(**{"url": ...})` hands the target over in a mapping.
+                    if isinstance(kw.value, ast.Dict):
+                        for key, value in zip(kw.value.keys, kw.value.values):
+                            if (
+                                isinstance(key, ast.Constant)
+                                and isinstance(key.value, str)
+                                and key.value in _URL_KWARGS
+                            ):
+                                url_node = value
+                                break
+                    else:
+                        expansion_is_opaque = True
+                    if url_node is not None:
+                        break
+                if expansion_is_opaque and url_node is None:
+                    target_resolved = False
+                    url_node = next(
+                        (kw.value for kw in node.keywords or [] if kw.arg is None), None
+                    )
+                for possible in _other_possible_hosts(url_node):
+                    # More than one value can hold here, so each is answered for: a conditional
+                    # assignment is a value the call may see, not the value it does see.
+                    _screen_host(possible, node)
+                if isinstance(url_node, ast.Tuple) and url_node.elts:
+                    text, complete = _static_str_prefix(url_node.elts[0], _bindings)
+                    host_arg = text if (complete and text) else None
+                    # A host the tuple computes is no more readable than one a URL computes.
+                    target_resolved = bool(complete)
+                    url_node = url_node.elts[0]
+                elif url_node is not None:
+                    host_arg, target_resolved = _host_from_url_node(url_node, _bindings)
 
-                if host_arg:
+                if (
+                    host_arg is None
+                    and url_node is not None
+                    and _takes_a_url_argument(network_fq)
+                    and _resolution_gave_up(url_node)
+                ):
+                    # The analysis abandoned the expression rather than reading it, so it cannot
+                    # say this is not a blocked host.
+                    network_calls.append(
+                        {
+                            "type": "opaque_url_blocked",
+                            "line": getattr(node, "lineno", -1),
+                            "description": (
+                                "Blocked: request target is nested too deeply to check; "
+                                "use a literal URL on an allowed informational source"
+                            ),
+                        }
+                    )
+                elif (
+                    host_arg is None
+                    and not target_resolved
+                    and _takes_a_url_argument(network_fq)
+                    and _externally_sourced(url_node, _bindings)
+                ):
+                    # A target read from the environment, stdin or argv is chosen outside the source
+                    # the allowlist was applied to, which is the one unresolvable shape that makes
+                    # the allowlist unenforceable rather than merely unread. Every other
+                    # unresolvable target (a loop variable, a parameter, a response field) keeps its
+                    # prior treatment: ordinary code fetching ordinary URLs must keep working.
+                    network_calls.append(
+                        {
+                            "type": "opaque_url_blocked",
+                            "line": getattr(node, "lineno", -1),
+                            "description": (
+                                "Blocked: request target is read from the environment or input; "
+                                "use a literal URL on an allowed informational source"
+                            ),
+                        }
+                    )
+                elif host_arg:
                     if _is_metadata_host(host_arg):
                         network_calls.append(
                             {
@@ -16357,10 +18279,8 @@ def _check_signal_escape_patterns(code: str):
                             }
                         )
 
-            is_open_call = (
-                (isinstance(node.func, ast.Name) and node.func.id == "open")
-                or fq in ("io.open", "pathlib.Path.open")
-                or fq.endswith(".open")
+            is_open_call = (isinstance(node.func, ast.Name) and node.func.id == "open") or any(
+                f in ("io.open", "pathlib.Path.open") or f.endswith(".open") for f in fq_names
             )
             if is_open_call and node.args:
                 a0 = node.args[0]
