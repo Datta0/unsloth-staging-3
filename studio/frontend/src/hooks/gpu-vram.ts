@@ -14,6 +14,9 @@ export interface MemoryTotalDevice {
   shared_memory?: boolean;
   /** host-backed portion of the shared pool; the rest is reserved GPU memory. */
   shared_memory_host_backed_gb?: number | null;
+  /** `hardware.py` sets `shared_memory` only on Windows, so a Linux ROCm APU arrives
+   *  as `unified_memory: true, shared_memory: false` (as `MemoryCapacityDevice`). */
+  unified_memory?: boolean;
 }
 
 export interface GpuMemoryTotalsGb {
@@ -27,6 +30,15 @@ export interface VramReportingGpu {
   /** Used VRAM across the visible GPUs when no single device's usage could be
    * attributed. Windows ROCm only; null everywhere else. See #7452. */
   vram_used_gb_aggregate?: number | null;
+}
+
+/** `sharesHostMemory` in the wire shape, so the totals and the capacity resolver
+ *  cannot drift apart. */
+function sharesHostMemoryDevice(device: MemoryTotalDevice): boolean {
+  return sharesHostMemory({
+    sharedMemory: device.shared_memory === true,
+    unifiedMemory: device.unified_memory === true,
+  });
 }
 
 /** Sum dedicated VRAM while counting a shared host-memory pool only once. Devices arrive rounded to 2dp, so
@@ -45,13 +57,15 @@ export function gpuMemoryTotalsGb(
     const total = device.memory_total_gb ?? 0;
     return Number.isFinite(total) && total > 0 ? total : 0;
   };
+  // Folding the two flags here fixes the callers that never learned to, and is a
+  // no-op for the ones that fold on their way in (use-gpu-info, memory-fit).
   const dedicatedDevices = roundToDevicePrecision(
     devices
-      .filter((device) => !device.shared_memory)
+      .filter((device) => !sharesHostMemoryDevice(device))
       .reduce((sum, device) => sum + size(device), 0),
   );
   const sharedPool = devices
-    .filter((device) => device.shared_memory)
+    .filter(sharesHostMemoryDevice)
     .reduce(
       (totals, device) => {
         const total = size(device);
@@ -63,14 +77,27 @@ export function gpuMemoryTotalsGb(
           ? Math.min(total, hostBackedReported as number)
           : total;
         return {
-          hostBacked: Math.max(totals.hostBacked, hostBacked),
+          // `shared_memory` means "this budget IS the host pool", so several are views
+          // of one thing and the largest is it. `unified_memory` alone means only that
+          // a device shares memory with its OWN cpu, which on a multi-socket node
+          // (MI300A) is a pool per socket: collapsing those reports it as one card.
+          hostBacked:
+            device.shared_memory === true
+              ? Math.max(totals.hostBacked, hostBacked)
+              : totals.hostBacked,
+          perDevice:
+            device.shared_memory === true
+              ? totals.perDevice
+              : totals.perDevice + hostBacked,
           reserved:
             totals.reserved + (hostBackedKnown ? total - hostBacked : 0),
         };
       },
-      { hostBacked: 0, reserved: 0 },
+      { hostBacked: 0, perDevice: 0, reserved: 0 },
     );
-  const shared = roundToDevicePrecision(sharedPool.hostBacked);
+  const shared = roundToDevicePrecision(
+    sharedPool.hostBacked + sharedPool.perDevice,
+  );
   const dedicated = roundToDevicePrecision(
     dedicatedDevices + sharedPool.reserved,
   );
