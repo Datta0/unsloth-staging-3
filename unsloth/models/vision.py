@@ -102,7 +102,6 @@ from unsloth_zoo.patching_utils import patch_model_and_tokenizer
 from unsloth_zoo.training_utils import prepare_model_for_training
 
 from unsloth_zoo.utils import Version
-from transformers import __version__ as transformers_version
 
 import types
 import functools
@@ -139,6 +138,209 @@ _NORM_MODULE_TYPES = tuple(
 __all__ = [
     "FastBaseModel",
 ]
+
+
+# bnb-quantized Linear class names, split by the width they actually produce
+# (see unslothai/unsloth#5344 guardrail). Kept apart because a 4-bit request that
+# came back as Linear8bitLt is a dropped request, not a satisfied one: the user
+# asked for ~0.5 bytes/param and got ~1, so the load can still OOM where they
+# expected it to fit.
+_BNB_4BIT_CLASS_NAMES = ("Linear4bit", "LinearNF4", "LinearFP4")
+_BNB_8BIT_CLASS_NAMES = ("Linear8bitLt",)
+
+# Substrings the guardrail treats as intentionally-not-quantized: embeddings,
+# norms, biases, routers/gates that need fp16/fp32 precision, vision/audio
+# towers, classification heads, rotary tables.
+_GUARDRAIL_SKIP_PATTERNS = (
+    "embed",
+    "embedding",
+    "norm",
+    "ln_",
+    "rms",
+    ".bias",
+    "lm_head",
+    "multi_modal_projector",
+    "merger",
+    "modality_projection",
+    "router",
+    "block_sparse_moe.gate",
+    "mamba",
+    "audio_tower",
+    "vision_tower",
+    "score",
+    "classifier",
+    "qa_outputs",
+    "rotary",
+)
+
+# A floating Parameter larger than this, found outside the skip list, counts
+# as bulk weight that should have been 4-bit. Tuned so head dims and small
+# projections do not false-fire but MoE fused expert tensors do.
+_GUARDRAIL_BULK_WEIGHT_NUMEL = 8 * 1024 * 1024
+
+
+def _configured_skip_modules(*configs):
+    """Module-name fragments bnb was TOLD to leave alone, lowercased.
+
+    `llm_int8_skip_modules` names modules that are unquantized on purpose, so
+    their weights are not evidence of a dropped request. Without this, a load
+    that behaved exactly as configured warns anyway: Falcon-H1 and Nemotron-H
+    skip `out_proj` because the mamba kernels cannot take a 4-bit one
+    (tiiuae/Falcon-H1#13), and those tensors are easily large enough to clear
+    the bulk-weight floor on their own.
+    """
+    names = []
+    for config in configs:
+        if config is None:
+            continue
+        if isinstance(config, dict):
+            configured = config.get("llm_int8_skip_modules")
+        else:
+            configured = getattr(config, "llm_int8_skip_modules", None)
+        for entry in configured or ():
+            if isinstance(entry, str) and entry:
+                names.append(entry.lower())
+    return tuple(dict.fromkeys(names))
+
+
+def _declares_width(config, key):
+    """True when a quantization config asserts `key` (load_in_4bit / load_in_8bit)."""
+    if config is None:
+        return False
+    if isinstance(config, dict):
+        return bool(config.get(key))
+    return bool(getattr(config, key, False))
+
+
+def _warn_if_quantization_silently_dropped(
+    model,
+    load_in_4bit,
+    load_in_8bit,
+    full_finetuning,
+    quantization_config = None,
+):
+    """Guardrail for unslothai/unsloth#5344.
+
+    Two failure modes covered:
+
+    1. TOTAL bypass: load_in_4bit was requested but the model contains zero
+       bnb Linear4bit / Linear8bitLt modules. transformers / bnb / a backend
+       incompatibility dropped kwargs.quantization_config.
+
+    2. PARTIAL bypass: bnb quantized the nn.Linear modules but a large fraction
+       of weight bytes live in non-nn.Linear Parameters (e.g. Gemma-4 MoE fused
+       3D expert tensors, custom Linear-like wrappers). bnb only swaps nn.Linear
+       instances; fused expert weights stay in BF16, defeating QLoRA savings
+       even though some Linear4bit modules exist.
+
+    Warns rather than raises so non-bnb backends (CPU / MLX / AMD-without-bnb)
+    with legitimately no Linear4bit are not broken.
+    """
+    if full_finetuning:
+        return
+    if quantization_config is not None:
+        if isinstance(quantization_config, dict):
+            load_in_4bit = load_in_4bit or bool(quantization_config.get("load_in_4bit"))
+            load_in_8bit = load_in_8bit or bool(quantization_config.get("load_in_8bit"))
+        else:
+            load_in_4bit = load_in_4bit or bool(getattr(quantization_config, "load_in_4bit", False))
+            load_in_8bit = load_in_8bit or bool(getattr(quantization_config, "load_in_8bit", False))
+    if not (load_in_4bit or load_in_8bit):
+        return
+
+    # Match against the width that was actually asked for. `load_in_4bit` wins
+    # when somehow both are set, matching how transformers builds the config.
+    wanted = _BNB_4BIT_CLASS_NAMES if load_in_4bit else _BNB_8BIT_CLASS_NAMES
+    has_bnb = any(type(m).__name__ in wanted for m in model.modules())
+
+    # Failure mode 1: total bypass, or the wrong width came back.
+    if not has_bnb:
+        kind = "4bit" if load_in_4bit else "8bit"
+        bnb_class_name = "Linear4bit" if load_in_4bit else "Linear8bitLt"
+        other = _BNB_8BIT_CLASS_NAMES if load_in_4bit else _BNB_4BIT_CLASS_NAMES
+        got_other = any(type(m).__name__ in other for m in model.modules())
+        if got_other and _declares_width(
+            getattr(getattr(model, "config", None), "quantization_config", None),
+            "load_in_8bit" if load_in_4bit else "load_in_4bit",
+        ):
+            # The CHECKPOINT is natively that width and bnb honoured its config.
+            # Nothing was dropped, so this is not the #5344 failure. load_in_4bit
+            # defaults to True, so without this every pre-quantized 8-bit repo
+            # loaded with defaults would warn.
+            return
+        if got_other:
+            # Not full precision, so do not say so: the load is quantized at the
+            # width the user did not ask for, which still misses their memory budget.
+            landed = "8bit" if load_in_4bit else "4bit"
+            warnings.warn(
+                f"Unsloth: load_in_{kind}=True was requested but the model came "
+                f"back quantized to {landed} instead, so no {bnb_class_name} "
+                f"modules exist. Memory use will not match a {kind} load. This "
+                f"usually means a quantization_config built elsewhere overrode "
+                f"the request, or the checkpoint is a pre-quantized {landed} "
+                f"repo. See https://github.com/unslothai/unsloth/issues/5344.",
+                stacklevel = 3,
+            )
+            return
+        warnings.warn(
+            f"Unsloth: load_in_{kind}=True was requested but no bitsandbytes "
+            f"{bnb_class_name} modules were produced. The runtime quantization "
+            f"config was silently dropped and the model is in full precision. "
+            f"See https://github.com/unslothai/unsloth/issues/5344 for known "
+            f"triggers (transformers/bnb version mismatch, MoE checkpoints "
+            f"without a -bnb-4bit sibling, multi-GPU dispatch). Workaround: "
+            f'pass device_map="cuda:0" and pin transformers/bitsandbytes to '
+            f"a version known to work.",
+            stacklevel = 3,
+        )
+        return
+
+    # Failure mode 2: partial bypass. Walk named_parameters and find large
+    # floating tensors outside the skip list. If they aggregate to >= 2x the
+    # quantized payload, partial quant is essentially negating 4-bit savings.
+    # The configured skips are read from the caller's config AND the one baked
+    # into the checkpoint, since a pre-quantized repo's config.json is what bnb
+    # actually obeyed and our runtime list is merged into it (#5027).
+    skip_patterns = _GUARDRAIL_SKIP_PATTERNS + _configured_skip_modules(
+        quantization_config,
+        getattr(getattr(model, "config", None), "quantization_config", None),
+    )
+    quantized_bytes = 0
+    suspect_bytes = 0
+    suspect_samples = []
+    for name, p in model.named_parameters():
+        if p is None:
+            continue
+        nbytes = p.numel() * p.element_size()
+        if p.dtype in (torch.uint8, torch.int8):
+            # bnb stores 4-bit payloads as uint8 and 8-bit payloads (Int8Params) as int8.
+            quantized_bytes += nbytes
+            continue
+        if p.dtype not in (torch.bfloat16, torch.float16, torch.float32):
+            continue
+        if p.numel() < _GUARDRAIL_BULK_WEIGHT_NUMEL:
+            continue
+        lname = name.lower()
+        if any(pat in lname for pat in skip_patterns):
+            continue
+        suspect_bytes += nbytes
+        if len(suspect_samples) < 3:
+            suspect_samples.append((name, str(p.dtype), tuple(p.shape)))
+
+    if quantized_bytes > 0 and suspect_bytes >= 2 * quantized_bytes:
+        kind = "4bit" if load_in_4bit else "8bit"
+        suspect_human = ", ".join(f"{n} ({d}, {s})" for n, d, s in suspect_samples)
+        warnings.warn(
+            f"Unsloth: load_in_{kind}=True is partially applied. "
+            f"bitsandbytes quantized ~{quantized_bytes/1024**3:.2f} GB of "
+            f"nn.Linear weights, but ~{suspect_bytes/1024**3:.2f} GB of "
+            f"non-nn.Linear floating Parameters were left unquantized (e.g. "
+            f"fused MoE expert tensors, custom Linear-like wrappers). "
+            f"Examples: {suspect_human}. The model's effective VRAM "
+            f"footprint is close to its full-precision size. See "
+            f"https://github.com/unslothai/unsloth/issues/5344.",
+            stacklevel = 3,
+        )
 
 
 def _infer_device_map_from_loaded_model(model):
@@ -1721,6 +1923,16 @@ class FastBaseModel:
                     subfolder = kwargs.get("subfolder"),
                     cache_dir = kwargs.get("cache_dir"),
                     variant = kwargs.get("variant"),
+                )
+                # Guardrail: see _warn_if_quantization_silently_dropped + #5344.
+                # Must follow _restore_dropped_fp8_scales, which is still repairing
+                # weights above and would otherwise be read as a dropped quantization.
+                _warn_if_quantization_silently_dropped(
+                    model,
+                    load_in_4bit = load_in_4bit,
+                    load_in_8bit = load_in_8bit,
+                    full_finetuning = full_finetuning,
+                    quantization_config = kwargs.get("quantization_config"),
                 )
                 if hasattr(model, "generate"):
                     model.fast_generate = make_fast_generate_wrapper(model.generate)
