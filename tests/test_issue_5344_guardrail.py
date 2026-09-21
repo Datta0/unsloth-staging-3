@@ -1,0 +1,424 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2023-present Daniel Han-Chen & the Unsloth team. All rights reserved.
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+"""Unit tests for the unslothai/unsloth#5344 silent-quantization-bypass guardrail.
+
+Covers two failure modes the helper detects:
+  1. total bypass: load_in_4bit was requested but no bnb modules exist.
+  2. partial bypass: bnb quantized nn.Linear but a large fraction of weight
+     bytes live in non-nn.Linear Parameters (e.g. Gemma-4 MoE fused experts).
+"""
+
+import warnings
+
+import torch
+import torch.nn as nn
+
+
+# unsloth must be imported before transformers per its loading order, but
+# these tests do not exercise the real loader. Import the helper directly.
+from unsloth.models.vision import _warn_if_quantization_silently_dropped
+
+
+class _PretendLinear4bit(nn.Module):
+    """type(m).__name__ == 'Linear4bit' so the guardrail counts it as quantized."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.zeros(1, dtype = torch.uint8),
+            requires_grad = False,
+        )
+
+
+_PretendLinear4bit.__name__ = "Linear4bit"
+
+
+def _unquantized_model():
+    return nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 4))
+
+
+def _quantized_model():
+    return nn.Sequential(nn.Linear(4, 4), _PretendLinear4bit())
+
+
+def test_fires_when_4bit_requested_but_no_bnb_modules():
+    model = _unquantized_model()
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert any("load_in_4bit=True was requested" in m for m in msgs), msgs
+    assert any("issues/5344" in m for m in msgs), msgs
+
+
+def test_silent_when_4bit_succeeded():
+    model = _quantized_model()
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert not any("load_in_4bit" in m for m in msgs), msgs
+
+
+def test_silent_for_full_finetuning():
+    model = _unquantized_model()
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = False,
+            load_in_8bit = False,
+            full_finetuning = True,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert not any("load_in_4bit" in m or "load_in_8bit" in m for m in msgs), msgs
+
+
+def test_silent_when_no_quantization_requested():
+    model = _unquantized_model()
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = False,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert not any("load_in_4bit" in m or "load_in_8bit" in m for m in msgs), msgs
+
+
+def test_fires_for_8bit_silent_bypass():
+    model = _unquantized_model()
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = False,
+            load_in_8bit = True,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert any("load_in_8bit=True was requested" in m for m in msgs), msgs
+
+
+class _MoEFusedExpertWrapper(nn.Module):
+    """Mimics Gemma4TextExperts: fused 3D weights stored as nn.Parameter, not
+    as separate nn.Linear instances. bnb's replace_with_bnb_linear skips this."""
+
+    # Gemma-4's real shape is (128, 1408, 2816), which is ~1 GB of BF16 to
+    # allocate in a unit test. Only the bulk-weight floor matters here, so this
+    # sits just over it at ~16 MB and exercises the same branch.
+    def __init__(
+        self,
+        num_experts = 2,
+        intermediate = 1024,
+        hidden = 4100,
+    ):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(
+            torch.zeros((num_experts, intermediate, hidden), dtype = torch.bfloat16),
+            requires_grad = False,
+        )
+
+
+def _partial_quant_model():
+    return nn.Sequential(_PretendLinear4bit(), _MoEFusedExpertWrapper())
+
+
+def test_fires_on_partial_quant_moe_experts():
+    model = _partial_quant_model()
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert any("partially applied" in m for m in msgs), msgs
+    assert any("gate_up_proj" in m for m in msgs), msgs
+
+
+class _NormParam(nn.Module):
+    """An RMSNorm-like module: large BF16 weight whose name is in the skip list."""
+
+    def __init__(self, dim = 8 * 1024 * 1024 + 10):
+        super().__init__()
+        self.norm_weight = nn.Parameter(
+            torch.zeros(dim, dtype = torch.bfloat16),
+            requires_grad = False,
+        )
+
+
+def test_silent_when_only_skip_list_tensors_unquantized():
+    model = nn.Sequential(_PretendLinear4bit(), _NormParam())
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert not any("partially applied" in m for m in msgs), msgs
+
+
+class _PretendLinear8bitLt(nn.Module):
+    """type(m).__name__ == 'Linear8bitLt', the 8-bit half of the bnb pair."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.zeros(1, dtype = torch.int8),
+            requires_grad = False,
+        )
+
+
+_PretendLinear8bitLt.__name__ = "Linear8bitLt"
+
+
+def test_fires_when_4bit_request_lands_as_8bit():
+    # A 4-bit request satisfied only by Linear8bitLt is a dropped request: the
+    # caller budgeted ~0.5 bytes/param and got ~1, so the load can still OOM.
+    model = nn.Sequential(nn.Linear(4, 4), _PretendLinear8bitLt())
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert any("came back quantized to 8bit" in m for m in msgs), msgs
+    # It must NOT claim full precision: the model is quantized, wrongly.
+    assert not any("is in full precision" in m for m in msgs), msgs
+
+
+def test_fires_when_8bit_request_lands_as_4bit():
+    model = nn.Sequential(nn.Linear(4, 4), _PretendLinear4bit())
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = False,
+            load_in_8bit = True,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert any("came back quantized to 4bit" in m for m in msgs), msgs
+
+
+class _SkippedOutProj(nn.Module):
+    """Falcon-H1 / Nemotron-H leave out_proj unquantized on purpose: the mamba
+    kernels cannot consume a 4-bit one (tiiuae/Falcon-H1#13)."""
+
+    def __init__(self, dim = 8 * 1024 * 1024 + 10):
+        super().__init__()
+        self.out_proj_weight = nn.Parameter(
+            torch.zeros(dim, dtype = torch.bfloat16),
+            requires_grad = False,
+        )
+
+
+def test_silent_when_unquantized_module_was_configured_as_skipped():
+    model = nn.Sequential(_PretendLinear4bit(), _SkippedOutProj())
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+            quantization_config = {
+                "load_in_4bit": True,
+                "llm_int8_skip_modules": ["out_proj"],
+            },
+        )
+    msgs = [str(w.message) for w in caught]
+    assert not any("partially applied" in m for m in msgs), msgs
+
+
+def test_fires_when_the_skip_list_does_not_cover_it():
+    # Negative control for the test above: same model, same call, a skip list
+    # that names something else. Without this, the suppression could be
+    # unconditional and the test above would still pass.
+    model = nn.Sequential(_PretendLinear4bit(), _SkippedOutProj())
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+            quantization_config = {
+                "load_in_4bit": True,
+                "llm_int8_skip_modules": ["some_other_module"],
+            },
+        )
+    msgs = [str(w.message) for w in caught]
+    assert any("partially applied" in m for m in msgs), msgs
+
+
+class _FakeConfig:
+    def __init__(self, quantization_config):
+        self.quantization_config = quantization_config
+
+
+class _ModelWithConfig(nn.Sequential):
+    def __init__(
+        self,
+        *mods,
+        quantization_config = None,
+    ):
+        super().__init__(*mods)
+        self.config = _FakeConfig(quantization_config)
+
+
+def test_silent_when_the_checkpoint_is_natively_the_other_width():
+    # load_in_4bit defaults to True, so loading a pre-quantized 8-bit repo with
+    # defaults must stay quiet: bnb honoured the checkpoint, nothing was dropped.
+    model = _ModelWithConfig(
+        nn.Linear(4, 4),
+        _PretendLinear8bitLt(),
+        quantization_config = {"load_in_8bit": True},
+    )
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert msgs == [], msgs
+
+
+def test_fires_when_the_checkpoint_declares_the_width_it_did_not_produce():
+    # Negative control: the config claims 4-bit, the modules are 8-bit. That is
+    # a real drop, so the suppression above must not swallow it.
+    model = _ModelWithConfig(
+        nn.Linear(4, 4),
+        _PretendLinear8bitLt(),
+        quantization_config = {"load_in_4bit": True},
+    )
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert any("came back quantized to 8bit" in m for m in msgs), msgs
+
+
+class _OffloadedExperts(nn.Module):
+    """A fused expert block left in float because device_map put it on CPU.
+
+    With `llm_int8_enable_fp32_cpu_offload=True`, transformers appends every key
+    mapped to "cpu" or "disk" to `modules_to_not_convert`
+    (quantizers/quantizer_bnb_8bit.py), so these weights are unquantized BY
+    DESIGN and consume no accelerator memory.
+    """
+
+    def __init__(self, device):
+        super().__init__()
+        self.gate_up_proj = nn.Parameter(
+            torch.zeros((2, 1024, 4100), dtype = torch.bfloat16, device = device),
+            requires_grad = False,
+        )
+
+
+class _Quantized(nn.Module):
+    def __init__(self, device):
+        super().__init__()
+        self.weight = nn.Parameter(
+            torch.zeros(1, dtype = torch.uint8, device = device),
+            requires_grad = False,
+        )
+
+
+_Quantized.__name__ = "Linear4bit"
+
+
+def test_silent_when_the_bulk_weight_is_offloaded_off_the_quantized_device():
+    # The quantized payload is on meta (standing in for an accelerator); the
+    # float experts are on CPU. Warning that VRAM is near full precision would
+    # be wrong: those bytes are not on the device the claim is about.
+    model = nn.Sequential(_Quantized("meta"), _OffloadedExperts("cpu"))
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert not any("partially applied" in m for m in msgs), msgs
+
+
+def test_fires_when_the_bulk_weight_shares_the_quantized_device():
+    # Negative control for the test above. Same shapes, same dtypes, one device.
+    # If the placement check were unconditional this would go silent too.
+    model = nn.Sequential(_Quantized("cpu"), _OffloadedExperts("cpu"))
+    with warnings.catch_warnings(record = True) as caught:
+        warnings.simplefilter("always")
+        _warn_if_quantization_silently_dropped(
+            model,
+            load_in_4bit = True,
+            load_in_8bit = False,
+            full_finetuning = False,
+        )
+    msgs = [str(w.message) for w in caught]
+    assert any("partially applied" in m for m in msgs), msgs
+    assert not any("sits off those devices" in m for m in msgs), msgs
+
+
+if __name__ == "__main__":
+    test_fires_when_4bit_requested_but_no_bnb_modules()
+    test_silent_when_4bit_succeeded()
+    test_silent_for_full_finetuning()
+    test_silent_when_no_quantization_requested()
+    test_fires_for_8bit_silent_bypass()
+    test_fires_on_partial_quant_moe_experts()
+    test_silent_when_only_skip_list_tensors_unquantized()
+    test_fires_when_4bit_request_lands_as_8bit()
+    test_fires_when_8bit_request_lands_as_4bit()
+    test_silent_when_unquantized_module_was_configured_as_skipped()
+    test_fires_when_the_skip_list_does_not_cover_it()
+    test_silent_when_the_checkpoint_is_natively_the_other_width()
+    test_fires_when_the_checkpoint_declares_the_width_it_did_not_produce()
+    test_silent_when_the_bulk_weight_is_offloaded_off_the_quantized_device()
+    test_fires_when_the_bulk_weight_shares_the_quantized_device()
+    print("All 15 guardrail tests passed.")
