@@ -2774,6 +2774,24 @@ class FastLlamaModel:
                     cache_dir = kwargs.get("cache_dir"),
                     variant = kwargs.get("variant"),
                 )
+                # Guardrail: see _warn_if_quantization_silently_dropped + #5344.
+                # Must follow _restore_dropped_fp8_scales, which is still repairing
+                # weights above and would otherwise be read as a dropped quantization.
+                from unsloth.models.vision import (
+                    _warn_if_quantization_silently_dropped,
+                )
+
+                _warn_if_quantization_silently_dropped(
+                    model,
+                    load_in_4bit = load_in_4bit,
+                    # The local, not kwargs: check_and_disable_bitsandbytes_loading above
+                    # zeroes both flags for a gptq / awq / compressed-tensors / MXFP4
+                    # checkpoint, while kwargs still carries what the caller asked for.
+                    # Reading kwargs here would warn about every non-bnb quantized load.
+                    load_in_8bit = load_in_8bit,
+                    full_finetuning = kwargs.get("full_finetuning", False),
+                    quantization_config = kwargs.get("quantization_config"),
+                )
             elif not fast_inference:
                 if user_config is not None:
                     # Transformers 5.x @strict model init rejects extra kwargs next to config=, so set the override
@@ -2821,6 +2839,24 @@ class FastLlamaModel:
                     subfolder = kwargs.get("subfolder"),
                     cache_dir = kwargs.get("cache_dir"),
                     variant = kwargs.get("variant"),
+                )
+                # Guardrail: see _warn_if_quantization_silently_dropped + #5344.
+                # Must follow _restore_dropped_fp8_scales, which is still repairing
+                # weights above and would otherwise be read as a dropped quantization.
+                from unsloth.models.vision import (
+                    _warn_if_quantization_silently_dropped,
+                )
+
+                _warn_if_quantization_silently_dropped(
+                    model,
+                    load_in_4bit = load_in_4bit,
+                    # The local, not kwargs: check_and_disable_bitsandbytes_loading above
+                    # zeroes both flags for a gptq / awq / compressed-tensors / MXFP4
+                    # checkpoint, while kwargs still carries what the caller asked for.
+                    # Reading kwargs here would warn about every non-bnb quantized load.
+                    load_in_8bit = load_in_8bit,
+                    full_finetuning = kwargs.get("full_finetuning", False),
+                    quantization_config = kwargs.get("quantization_config"),
                 )
                 model.fast_generate = make_fast_generate_wrapper(model.generate)
                 model.fast_generate_batches = None
