@@ -20,9 +20,17 @@ spec.loader.exec_module(m)
 
 host = m.detect_host()
 ext = ".exe" if host.is_windows else ""
-bin_dir = INSTALL / "build" / "bin"
-server = bin_dir / f"llama-server{ext}"
-quantize = bin_dir / f"llama-quantize{ext}"
+def locate(name):
+    hits = sorted(INSTALL.rglob(name), key = lambda p: (len(p.parts), str(p)))
+    hits = [p for p in hits if ".staging" not in p.parts and ".cache" not in p.parts]
+    if not hits:
+        raise SystemExit(f"{name} not found under {INSTALL}")
+    return hits[0]
+
+
+server = locate(f"llama-server{ext}")
+quantize = locate(f"llama-quantize{ext}")
+print("BINARIES", server, quantize, flush = True)
 work = Path(tempfile.mkdtemp(prefix = "pr6739-probe-"))
 probe = work / "stories260K.gguf"
 m.download_validation_model(probe, m.validation_model_cache_path(INSTALL))
@@ -54,17 +62,16 @@ attempt("server_real", lambda: m.validate_server(
 # Negative control: same install, binaries truncated to 4 KiB.
 broken = work / "broken"
 shutil.copytree(INSTALL, broken, symlinks = False)
-for name in (server.name, quantize.name):
-    target = broken / "build" / "bin" / name
+for original in (server, quantize):
+    target = broken / original.relative_to(INSTALL)
     data = target.read_bytes()[:4096]
     target.unlink()
     target.write_bytes(data)
     target.chmod(0o755)
-bb = broken / "build" / "bin"
 attempt("quantize_truncated", lambda: m.validate_quantize(
-    bb / quantize.name, probe, work / "q2.gguf", broken, host, require_launch = True))
+    broken / quantize.relative_to(INSTALL), probe, work / "q2.gguf", broken, host, require_launch = True))
 attempt("server_truncated", lambda: m.validate_server(
-    bb / server.name, probe, host, broken, require_launch = True))
+    broken / server.relative_to(INSTALL), probe, host, broken, require_launch = True))
 
 print("PROBE " + json.dumps(results))
 ok = (
