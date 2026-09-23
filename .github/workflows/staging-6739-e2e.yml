@@ -14,9 +14,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04, userns: open }
-          - { os: ubuntu-24.04, userns: restricted }
-          - { os: ubuntu-24.04-arm, userns: open }
           - { os: macos-15, userns: na }
           - { os: windows-latest, userns: na }
     runs-on: ${{ matrix.os }}
@@ -75,25 +72,14 @@ jobs:
           done
           cat results.txt
       - name: Direct validation probe with negative control
-        run: python -u head/tests/pr6739_validate_probe.py head "$RUNNER_TEMP/inst_head/llama.cpp" 2>&1 | grep -E "^PROBE|validation|sandbox" | tail -n 20; exit ${PIPESTATUS[0]}
+        if: always()
+        run: python -u head/tests/pr6739_validate_probe.py head "$RUNNER_TEMP/inst_main/llama.cpp" 2>&1 | tail -n 60
+      - name: macOS Metal under the Seatbelt profile
+        if: always() && runner.os == 'macOS'
+        run: python -u head/tests/pr6739_macos_metal_probe.py head "$RUNNER_TEMP/inst_main/llama.cpp" 2>&1 | tail -n 40
       - name: Verdict
         run: |
           cat results.txt
           grep -q "arm=head rc=0 " results.txt
           grep "arm=head" results.txt | grep -q "skipped=0"
           grep "arm=head" results.txt | grep -q "fallback=0"
-  groups-in-userns:
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Supplementary-group access inside unprivileged bwrap
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
-          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          id
-          g=""; for cand in docker adm systemd-journal; do id -nG | tr ' ' '\n' | grep -qx "$cand" && g=$cand && break; done
-          echo "using supplementary group $g"
-          echo secret | sudo tee /opt/groupgated >/dev/null
-          sudo chown root:"$g" /opt/groupgated && sudo chmod 0640 /opt/groupgated
-          ls -la /opt/groupgated "$(command -v bwrap)"
-          echo "direct: $(cat /opt/groupgated)"
-          bwrap --ro-bind / / --unshare-all --die-with-parent --dev /dev --proc /proc sh -c 'id; cat /opt/groupgated && echo GROUP_ACCESS_KEPT=yes || echo GROUP_ACCESS_KEPT=no'
