@@ -3,11 +3,9 @@
 
 """Startup self-heal for the pinned Diffusers main build.
 
-An update from a release that predates the installer's Diffusers main step runs that release's
-installer, so the build never goes in and Qwen-Image-2.1 refuses to load until a second update. The
-backend is the first new code such a host runs, so it runs the installer's own step here, on a
-background thread (git, or the zip route without git). Opt out with
-UNSLOTH_DISABLE_DIFFUSERS_AUTOREPAIR=1.
+Older installers can miss the pinned build during an update. Repair before importing the app:
+the build also upgrades huggingface_hub, which would otherwise mix new files with cached modules.
+Opt out with UNSLOTH_DISABLE_DIFFUSERS_AUTOREPAIR=1.
 """
 
 from __future__ import annotations
@@ -16,10 +14,8 @@ import json
 import os
 import subprocess
 import sys
-import threading
-import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable
 
 import structlog
 
@@ -29,10 +25,12 @@ DISABLE_ENV_VAR = "UNSLOTH_DISABLE_DIFFUSERS_AUTOREPAIR"
 _STUDIO_DIR = Path(__file__).resolve().parents[2]
 _INSTALLER = _STUDIO_DIR / "install_python_stack.py"
 _MAIN_PIN = _STUDIO_DIR / "backend" / "requirements" / "diffusers-main.txt"
-_REPAIR_TIMEOUT_S = 900
-_PEER_POLL_S = 5
+# Inside the desktop app's 300 s start deadline, with room left for the app import after it.
+_REPAIR_TIMEOUT_S = 120
 # The installer's exit codes for --repair-diffusers-main.
 _INSTALLED, _NOTHING_TO_DO = 0, 1
+# The installer's DIFFUSERS_MAIN_MIN_PYTHON: diffusers main needs 3.10, and 3.9 stays supported.
+_MAIN_MIN_PYTHON = (3, 10)
 
 # Unattended, so secrets and index redirects stay out, as in mlx_repair. The Windows names are what
 # Python, git and uv need to start at all there; UV_OFFLINE is the operator's no-network switch.
@@ -75,10 +73,6 @@ _ENV_ALLOWLIST = frozenset(
         "UNSLOTH_DIFFUSERS_MAIN",
     }
 )
-
-_lock = threading.Lock()
-_thread: Optional[threading.Thread] = None
-_installed = False
 
 
 def _opted_out() -> bool:
@@ -133,15 +127,42 @@ def _peer_holds_pass() -> bool:
         return not uncontended
 
 
-def _wait_for_peer_pass() -> None:
-    """Hold the gate until no process holds the dependency pass. Killing our installer released it,
-    but the pass it was waiting behind may still be writing."""
-    while _peer_holds_pass():
-        time.sleep(_PEER_POLL_S)
+class PeerInstallInProgress(RuntimeError):
+    """A peer still holds the install lock at timeout, so importing packages is unsafe."""
 
 
-def _run_repair() -> None:
-    global _installed
+PEER_INSTALL_MESSAGE = (
+    "Another Unsloth install or update is still changing this environment after "
+    f"{_REPAIR_TIMEOUT_S}s. Start Unsloth Studio again once it has finished."
+)
+
+
+def _record_failure() -> None:
+    """Suppress startup retries until an explicit update clears the failure key."""
+    try:
+        from studio.install_manifest import update_manifest
+        update_manifest(diffusers_main_repair = "failed")
+    except Exception as exc:  # noqa: BLE001 - unrecorded means the next start tries again
+        logger.warning("diffusers self-heal could not record its failure: %s", exc)
+
+
+def _installer_would_skip() -> bool:
+    """The installer's no-op gates: a start it would skip must not block or claim to install."""
+    if sys.version_info[:2] < _MAIN_MIN_PYTHON:
+        return True
+    try:
+        from studio.install_manifest import read_manifest
+        manifest = read_manifest() or {}
+    except Exception:  # noqa: BLE001 - an unreadable manifest is no record of a failed try
+        return False
+    step_results = manifest.get("step_results")
+    update_failed = (
+        isinstance(step_results, dict) and step_results.get("diffusers-main.txt") == "failed"
+    )
+    return manifest.get("diffusers_main_repair") == "failed" or update_failed
+
+
+def _run_repair(echo: Callable[[str], None]) -> bool:
     from utils.child_stdio import utf8_child_env
     from utils.process_lifetime import adopt_pid, child_popen_kwargs, forget_pid, terminate_pid
 
@@ -161,65 +182,59 @@ def _run_repair() -> None:
         )
     except OSError as exc:
         logger.warning("diffusers self-heal could not start the installer: %s", exc)
-        return
+        return False
     # Tracked, so a backend that exits mid-install takes the installer and its uv/git children down.
     adopt_pid(proc.pid)
     try:
         output, _ = proc.communicate(timeout = _REPAIR_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        # The whole tree, before the gate reopens: uv keeps rewriting diffusers after its parent dies.
+        # Stop uv/git children too before importing packages they may be replacing.
         terminate_pid(proc.pid, owner_verified = True)
         proc.kill()
         proc.wait()
+        # A remaining lock belongs to a peer. Abort without changing its manifest.
+        if _peer_holds_pass():
+            logger.warning("diffusers self-heal timed out behind a peer's dependency pass")
+            raise PeerInstallInProgress(PEER_INSTALL_MESSAGE)
+        _record_failure()
+        echo(
+            f"  - the pinned Diffusers build took over {_REPAIR_TIMEOUT_S}s and was stopped; "
+            "run `unsloth studio update` to install it"
+        )
         logger.warning("diffusers self-heal timed out after %ss", _REPAIR_TIMEOUT_S)
-        _wait_for_peer_pass()
-        return
+        return False
     finally:
         if proc.poll() is not None:
             forget_pid(proc.pid)
     if proc.returncode == _INSTALLED:
-        _installed = True
+        echo("  - installed the pinned Diffusers build")
         logger.info("diffusers self-heal installed the pinned Diffusers main build")
-    elif proc.returncode != _NOTHING_TO_DO:
+        return True
+    if proc.returncode != _NOTHING_TO_DO:
+        echo(
+            "  - could not install the pinned Diffusers build; run `unsloth studio update` to retry"
+        )
         logger.warning(
             "diffusers self-heal could not install the pinned build; run `unsloth studio "
             "update` to retry. Installer output:\n%s",
             (output or "")[-4000:],
         )
+    return False
 
 
-def start_diffusers_autorepair_if_needed() -> bool:
-    """Start the background install when diffusers is an index release and the pin wants main.
-    True iff a repair thread was started; at most once per process."""
-    global _thread
+def repair_diffusers_before_imports(echo: Callable[[str], None] = lambda _line: None) -> bool:
+    """Repair an index install before app imports. Return True if the build was installed.
+
+    Raise PeerInstallInProgress if a peer holds the install lock at timeout.
+    """
     if _opted_out() or not _MAIN_PIN.is_file() or not _INSTALLER.is_file():
         return False
-    # A peer mid-install can have removed the metadata, so its pass also starts the installer, which
-    # waits the pass out and keeps loads refused meanwhile.
-    if not _diffusers_is_an_index_install() and not _peer_holds_pass():
+    # Check the lock too: an active install may have temporarily removed the metadata.
+    if _diffusers_is_an_index_install() and not _installer_would_skip():
+        echo("  - installing the pinned Diffusers build (first start after an update)...")
+    elif _peer_holds_pass():
+        echo("  - waiting for another Unsloth install or update to finish...")
+    else:
         return False
-    with _lock:
-        if _thread is not None:
-            return False
-        _thread = threading.Thread(target = _run_repair, daemon = True, name = "diffusers-autorepair")
-        _thread.start()
-    logger.info(
-        "checking for the pinned Diffusers main build in the background. Set %s=1 to disable.",
-        DISABLE_ENV_VAR,
-    )
-    return True
-
-
-IN_FLIGHT_MESSAGE = (
-    "Unsloth is installing the pinned diffusers build in the background, which takes a few "
-    "minutes on the first start after an update. Try again shortly."
-)
-
-
-def diffusers_repair_in_flight() -> bool:
-    thread = _thread
-    return thread is not None and thread.is_alive()
-
-
-def diffusers_repair_installed() -> bool:
-    return _installed
+    logger.info("installing the pinned Diffusers main build. Set %s=1 to disable.", DISABLE_ENV_VAR)
+    return _run_repair(echo)
