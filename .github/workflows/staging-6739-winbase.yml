@@ -27,7 +27,7 @@ jobs:
           set +e
           for arm in base head; do
             (cd $arm && PYTHONPATH=studio/backend python -m pytest tests/studio/install/test_install_llama_prebuilt_logic.py -q -p no:cacheprovider -rf > ../out_$arm.txt 2>&1)
-            grep -E "^(FAILED|ERROR) " out_$arm.txt | sed 's/ - .*//' | sort > failed_$arm.txt
+            grep -aE "^(FAILED|ERROR) " out_$arm.txt | sed 's/ - .*//' | sort > failed_$arm.txt
             echo "SUMMARY $arm $(tail -n 1 out_$arm.txt)"
           done
           echo "ONLY_HEAD:"; comm -13 failed_base.txt failed_head.txt
