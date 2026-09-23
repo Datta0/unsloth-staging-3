@@ -74,6 +74,8 @@ jobs:
             echo "RESULT arm=$arm rc=$rc validated=$ok server_launched=$launched skipped=$skipped fallback=$fellback secs=$(( $(date +%s) - start ))" | tee -a results.txt
           done
           cat results.txt
+      - name: Direct validation probe with negative control
+        run: python -u head/tests/pr6739_validate_probe.py head "$RUNNER_TEMP/inst_head/llama.cpp" 2>&1 | grep -E "^PROBE|validation|sandbox" | tail -n 20; exit ${PIPESTATUS[0]}
       - name: Verdict
         run: |
           cat results.txt
