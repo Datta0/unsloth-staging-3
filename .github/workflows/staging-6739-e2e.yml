@@ -80,3 +80,18 @@ jobs:
           grep -q "arm=head rc=0 " results.txt
           grep "arm=head" results.txt | grep -q "skipped=0"
           grep "arm=head" results.txt | grep -q "fallback=0"
+  groups-in-userns:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Supplementary-group access inside unprivileged bwrap
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          id
+          g=""; for cand in docker adm systemd-journal; do id -nG | tr ' ' '\n' | grep -qx "$cand" && g=$cand && break; done
+          echo "using supplementary group $g"
+          echo secret | sudo tee /opt/groupgated >/dev/null
+          sudo chown root:"$g" /opt/groupgated && sudo chmod 0640 /opt/groupgated
+          ls -la /opt/groupgated "$(command -v bwrap)"
+          echo "direct: $(cat /opt/groupgated)"
+          bwrap --ro-bind / / --unshare-all --die-with-parent --dev /dev --proc /proc sh -c 'id; cat /opt/groupgated && echo GROUP_ACCESS_KEPT=yes || echo GROUP_ACCESS_KEPT=no'
