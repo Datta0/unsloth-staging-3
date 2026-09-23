@@ -53,10 +53,10 @@ attempt("server_real", lambda: m.validate_server(
 
 # Negative control: same install, binaries truncated to 4 KiB.
 broken = work / "broken"
-shutil.copytree(INSTALL, broken, symlinks = True)
+shutil.copytree(INSTALL, broken, symlinks = False)
 for name in (server.name, quantize.name):
     target = broken / "build" / "bin" / name
-    data = target.resolve().read_bytes()[:4096]
+    data = target.read_bytes()[:4096]
     target.unlink()
     target.write_bytes(data)
     target.chmod(0o755)

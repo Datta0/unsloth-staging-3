@@ -5897,19 +5897,6 @@ def _linux_validation_setenv_args(payload_env: dict[str, str]) -> list[str]:
     return args
 
 
-def _drop_server_gpu_layers(command: list[str]) -> list[str]:
-    trimmed: list[str] = []
-    index = 0
-    while index < len(command):
-        arg = command[index]
-        if arg == "--n-gpu-layers" and index + 1 < len(command):
-            index += 2
-            continue
-        trimmed.append(arg)
-        index += 1
-    return trimmed
-
-
 def _extract_loopback_port(command: list[str]) -> int:
     for index, arg in enumerate(command):
         if arg != "--port":
@@ -6280,6 +6267,15 @@ def _macos_validation_sandbox_prefix(
             profile_parts.append(f'(subpath "{literal}")')
     profile_parts.append(")")
     if purpose == _VALIDATION_PURPOSE_SERVER:
+        # llama-server offloads to Metal by default and even -ngl 0 still builds a
+        # Metal context, so without these the server exits with "failed to create
+        # command queue" and every install falls back to a source build. GPU user
+        # client class names differ between Apple Silicon generations and virtual
+        # machines, so IOKit opens are not narrowed; the only mach service granted is
+        # the Metal shader compiler. Files and network stay confined as above.
+        profile_parts.append("(allow iokit-open)")
+        profile_parts.append("(allow iokit-get-properties)")
+        profile_parts.append('(allow mach-lookup (global-name "com.apple.MTLCompilerService"))')
         server_port = _extract_loopback_port(command)
         if server_port > 0:
             profile_parts.append(f'(allow network* (local ip "localhost:{server_port}"))')
@@ -6327,20 +6323,19 @@ def build_validation_sandbox_plan(
     )
     if _host_is_linux(host):
         bwrap_path = _resolve_command_path("bwrap")
-        if bwrap_path is not None and _bwrap_can_sandbox(bwrap_path):
+        sandbox_usable = bwrap_path is not None and _bwrap_can_sandbox(bwrap_path)
+        gpu_server = (
+            purpose == _VALIDATION_PURPOSE_SERVER
+            and enable_gpu_layers
+            and gpu_backend in {"cuda", "rocm"}
+        )
+        if sandbox_usable and gpu_server and not _binary_is_setuid_root(bwrap_path):
+            # GPU access inside a non-setuid bwrap's user namespace is unproven, and
+            # validating on the CPU instead would let a bundle whose GPU path is
+            # broken through. Keep main's direct GPU smoke test for this case.
+            sandbox_usable = False
+        if sandbox_usable:
             payload_command = _resolve_sandbox_command(command)
-            if (
-                purpose == _VALIDATION_PURPOSE_SERVER
-                and enable_gpu_layers
-                and gpu_backend in {"cuda", "rocm"}
-                and not _binary_is_setuid_root(bwrap_path)
-            ):
-                # Non-setuid bwrap needs a user namespace, which drops the host's
-                # supplementary GPU device groups. Keep the loopback-only sandbox
-                # and validate the bundle on the CPU path instead.
-                payload_command = _drop_server_gpu_layers(payload_command)
-                enable_gpu_layers = False
-                gpu_backend = None
             network_policy = _VALIDATION_NETWORK_POLICY_SANDBOX
             server_probe_mode = (
                 _VALIDATION_SERVER_PROBE_MODE_IN_SANDBOX
@@ -6404,10 +6399,11 @@ def build_validation_sandbox_plan(
                 sandbox_kind = "linux_bwrap",
                 reason = "No Linux sandbox adapter was available; skip ldd probe",
             )
-        # No usable bwrap (absent, or user namespaces restricted as on Ubuntu >= 23.10).
-        # Studio launches this same binary unsandboxed once installed, so skipping
-        # its smoke test buys no isolation and loses the check that routes a broken
-        # GPU bundle to a source build. Validate directly under the scrubbed env.
+        # No usable bwrap (absent, or user namespaces restricted as on Ubuntu >= 23.10),
+        # or a GPU smoke test the sandbox cannot host. Studio launches this same binary
+        # unsandboxed once installed, so skipping its smoke test buys no isolation and
+        # loses the check that routes a broken GPU bundle to a source build. Validate
+        # directly under the scrubbed env.
         return _ValidationLaunchPlan(
             command = command,
             env = env,
@@ -7619,8 +7615,10 @@ def validate_server(
             # Older call sites that don't pass install_kind: keep ROCm
             # hosts in the GPU-validation path so an AMD-only Linux host
             # is exercised against the actual hardware rather than the
-            # CPU fallback. NVIDIA stays covered here.
-            _enable_gpu_layers = host.has_usable_nvidia or host.has_rocm
+            # CPU fallback. NVIDIA and macOS-arm64 are already covered.
+            _enable_gpu_layers = (
+                host.has_usable_nvidia or host.has_rocm or (host.is_macos and host.is_arm64)
+            )
             if host.is_linux and host.has_usable_nvidia:
                 gpu_backend = "cuda"
             elif host.is_linux and host.has_rocm:
@@ -10895,9 +10893,10 @@ def validate_prebuilt_choice(
         walk_back = walk_back,
         macos_load_probe_passed = macos_load_probe_passed,
     )
-    # Hashless external prebuilts rely on the functional smoke test as their only
-    # integrity gate, so a sandbox that cannot launch it must fall back to source.
-    smoke_validation_required = choice.expected_sha256 is None
+    # Bundles that validate without the opt-in (hashless, or a digest that proves the
+    # bytes but not that they load) rely on the smoke test as their gate, so a launch
+    # the sandbox policy cannot make must fall back to source rather than pass.
+    smoke_validation_required = not choice.expected_sha256 or choice.unmanifested_digest
     if prebuilt_needs_functional_validation(choice):
         # Only branch that reads the probe, so this is where a lazy one is fetched.
         probe_path = resolve_validation_model(probe)

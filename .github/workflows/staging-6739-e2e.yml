@@ -15,7 +15,9 @@ jobs:
       matrix:
         include:
           - { os: macos-15, userns: na }
+          - { os: macos-26, userns: na }
           - { os: windows-latest, userns: na }
+          - { os: ubuntu-24.04, userns: open }
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     steps:
