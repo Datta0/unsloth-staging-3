@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import type { DownloadKind } from "../download-manager/constants";
+import { downloadInventoryHintKind } from "../download-manager/download-manager-types";
 import type { CachedInventoryRow, LocalInventoryRow } from "./types";
 
 function repoFormatKey(
@@ -79,6 +81,70 @@ export function findCompleteHfCacheLocalRow(
         repoFormatKey(row.repoId, row.modelFormat) === key,
     ) ?? null
   );
+}
+
+/** Repos with a download running or cancelling right now, keyed by repo and artifact family. A
+ * scoped job (the "Required assets" of an image model, a staged checkpoint) never shares the key
+ * of the repo's own row, so the repo is the unit; the family keeps a GGUF job from marking the
+ * same repo's safetensors partial as downloading, and vice versa. A job whose family is not known
+ * marks every family. */
+export function activeDownloadRepoKeys(
+  jobs: readonly {
+    kind?: DownloadKind;
+    repoId: string;
+    variant?: string | null;
+    inventoryKind?: "model" | "gguf";
+    state: string;
+  }[],
+): Set<string> {
+  const keys = new Set<string>();
+  for (const job of jobs) {
+    if (job.state !== "running" && job.state !== "cancelling") continue;
+    const key = repoKey(job.repoId);
+    if (!key) continue;
+    keys.add(key);
+    const hint = job.kind
+      ? downloadInventoryHintKind(job.kind, job.variant ?? null, job.inventoryKind)
+      : null;
+    if (hint === "gguf" || hint === "model") {
+      keys.add(`${key}\0${hint}`);
+    } else {
+      keys.add(`${key}\0gguf`);
+      keys.add(`${key}\0model`);
+    }
+  }
+  return keys;
+}
+
+/** Tags the partial rows whose bytes are still arriving. A partial with a live job behind it is
+ * a download in progress, and showing it as "Partial download, open it to finish" reads as
+ * paused while the transfer runs. A row of a known format only matches a job of its family.
+ * Returns `rows` itself when nothing changes, so memoized consumers keep their identity. */
+export function markDownloadingRows<
+  T extends {
+    partial?: boolean;
+    downloading?: boolean;
+    modelFormat?: CachedInventoryRow["modelFormat"];
+  },
+>(
+  rows: T[],
+  getRepoId: (row: T) => string | null | undefined,
+  downloadingRepoKeys: ReadonlySet<string>,
+): T[] {
+  let changed = false;
+  const next = rows.map((row) => {
+    const key = repoKey(getRepoId(row));
+    const family = row.modelFormat ? partialFormatFamily(row.modelFormat) : null;
+    const downloading = Boolean(
+      row.partial &&
+        key &&
+        downloadingRepoKeys.has(family ? `${key}\0${family}` : key),
+    );
+    if (Boolean(row.downloading) === downloading) return row;
+    changed = true;
+    return { ...row, downloading };
+  });
+  return changed ? next : rows;
 }
 
 export function partialSetFromRows<T extends { partial?: boolean }>(
