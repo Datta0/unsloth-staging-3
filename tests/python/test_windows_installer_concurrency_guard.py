@@ -88,14 +88,23 @@ _FINAL_PATH_CHAIN = (
     "New-StudioPrivateTempDirectory",
     "Initialize-StudioTempEnvironment",
     "Write-StudioFinalPathDegraded",
-    "Test-StudioCanDefineNativeTypes",
-    "Test-StudioEmitInChildProcess",
-    "New-StudioDynamicAssembly",
-    "New-StudioEmittedNativeType",
-    "Initialize-StudioFinalPathNativeType",
-    "Get-StudioNativeFinalPath",
     "Resolve-StudioLinkTarget",
     "Get-StudioSubstTarget",
+    "Get-StudioEarlyPython",
+    "Invoke-StudioEarlyPythonScript",
+    "New-StudioChildScriptDirectory",
+    "Test-StudioChildScriptDirectoryElevated",
+    "Test-StudioPathUnderAdminRoot",
+    "Test-StudioSddlRightsAreWrite",
+    "Test-StudioSddlPrincipalIsAdminOnly",
+    "Test-StudioSddlWritableByNonAdmin",
+    "Test-StudioDirectoryIsAdminOnly",
+    "Test-StudioInterpreterFileIsAdminOnly",
+    "Get-StudioLexicalParent",
+    "Get-StudioSystem32Tool",
+    "Invoke-StudioEarlyPython",
+    "Get-StudioPythonFinalPath",
+    "Resolve-StudioFinalPathsInOneChild",
     "Get-StudioLexicalPath",
     "Resolve-StudioFinalPathInfo",
     "Get-StudioFinalPath",
@@ -123,14 +132,23 @@ def _mutex_helpers(source: str) -> str:
             "New-StudioPrivateTempDirectory",
             "Initialize-StudioTempEnvironment",
             "Write-StudioFinalPathDegraded",
-            "Initialize-StudioFinalPathNativeType",
-            "Test-StudioCanDefineNativeTypes",
-            "Test-StudioEmitInChildProcess",
-            "New-StudioDynamicAssembly",
-            "New-StudioEmittedNativeType",
-            "Get-StudioNativeFinalPath",
             "Resolve-StudioLinkTarget",
             "Get-StudioSubstTarget",
+            "Get-StudioEarlyPython",
+            "Invoke-StudioEarlyPythonScript",
+            "New-StudioChildScriptDirectory",
+            "Test-StudioChildScriptDirectoryElevated",
+            "Test-StudioPathUnderAdminRoot",
+            "Test-StudioSddlRightsAreWrite",
+            "Test-StudioSddlPrincipalIsAdminOnly",
+            "Test-StudioSddlWritableByNonAdmin",
+            "Test-StudioDirectoryIsAdminOnly",
+            "Test-StudioInterpreterFileIsAdminOnly",
+            "Get-StudioLexicalParent",
+            "Get-StudioSystem32Tool",
+            "Invoke-StudioEarlyPython",
+            "Get-StudioPythonFinalPath",
+            "Resolve-StudioFinalPathsInOneChild",
             "Get-StudioLexicalPath",
             "Resolve-StudioFinalPathInfo",
             "Get-StudioFinalPath",
@@ -160,20 +178,28 @@ def _process_helpers(source: str) -> str:
             "New-StudioPrivateTempDirectory",
             "Initialize-StudioTempEnvironment",
             "Write-StudioFinalPathDegraded",
-            "Initialize-StudioFinalPathNativeType",
-            "Test-StudioCanDefineNativeTypes",
-            "Test-StudioEmitInChildProcess",
-            "New-StudioDynamicAssembly",
-            "New-StudioEmittedNativeType",
-            "Get-StudioNativeFinalPath",
             "Resolve-StudioLinkTarget",
             "Get-StudioSubstTarget",
+            "Get-StudioEarlyPython",
+            "Invoke-StudioEarlyPythonScript",
+            "New-StudioChildScriptDirectory",
+            "Test-StudioChildScriptDirectoryElevated",
+            "Test-StudioPathUnderAdminRoot",
+            "Test-StudioSddlRightsAreWrite",
+            "Test-StudioSddlPrincipalIsAdminOnly",
+            "Test-StudioSddlWritableByNonAdmin",
+            "Test-StudioDirectoryIsAdminOnly",
+            "Test-StudioInterpreterFileIsAdminOnly",
+            "Get-StudioLexicalParent",
+            "Get-StudioSystem32Tool",
+            "Invoke-StudioEarlyPython",
+            "Get-StudioPythonFinalPath",
+            "Resolve-StudioFinalPathsInOneChild",
             "Get-StudioLexicalPath",
             "Resolve-StudioFinalPathInfo",
             "Get-StudioFinalPath",
             "Test-StudioProtectedPathMatch",
-            "Initialize-StudioProcessImageNativeType",
-            "Get-StudioNativeProcessImagePath",
+            "Get-StudioPythonProcessImageTable",
             "Get-StudioProcessImagePath",
             "Get-RunningStudioVenvProcesses",
         )
@@ -363,7 +389,7 @@ def test_installer_ignores_command_line_and_cwd_only_path_mentions():
 
 @pytest.mark.skipif(os.name != "nt" or not POWERSHELLS, reason = "Windows PowerShell is required")
 @pytest.mark.parametrize("shell", POWERSHELLS)
-def test_versioned_native_helper_loads_after_older_installer_type(shell: str):
+def test_the_resolver_survives_an_older_installer_type_in_the_session(shell: str):
     source = INSTALL_PS1.read_text(encoding = "utf-8")
     final_path_helper = _mutex_helpers(source)
     script = f"""
@@ -376,10 +402,14 @@ public static class UnslothStudioFinalPath
 '@
 {final_path_helper}
 $resolved = Get-StudioFinalPath -Path $env:SystemRoot
-Write-Output ([bool]("UnslothStudioFinalPathV3" -as [type]))
 Write-Output ([bool]($resolved -and (Test-Path -LiteralPath $resolved)))
 """
-    assert _run_powershell(shell, script, os.environ.copy()).splitlines() == ["True", "True"]
+    # A type left in the session by an older installer used to be a collision: the resolver
+    # defined its own and had to carry a version suffix to avoid the name. It defines nothing now,
+    # so the old type is simply inert, and this asserts that rather than asserting the suffix.
+    # A type cannot be unloaded from a session, so an installer that DID collide could not
+    # recover; this is the scenario that made the suffix necessary in the first place.
+    assert _run_powershell(shell, script, os.environ.copy()).splitlines() == ["True"]
 
 
 @pytest.mark.skipif(os.name != "nt" or not POWERSHELLS, reason = "Windows PowerShell is required")
@@ -1118,7 +1148,9 @@ def test_the_extracted_helpers_can_call_everything_they_call(helpers):
     provided = set(re.findall(r"^    function ([\w-]+) \{", extracted, flags = re.M))
     assert provided, "the helper extraction produced nothing"
 
-    called = set(re.findall(r"(?<![\w-])([A-Z][\w]*-[\w-]+)", extracted))
+    # Whole-line comments dropped: a function named in prose is not a call.
+    code = "\n".join(line for line in extracted.splitlines() if not line.lstrip().startswith("#"))
+    called = set(re.findall(r"(?<![\w-])([A-Z][\w]*-[\w-]+)", code))
     missing = sorted((called & installer_functions) - provided)
     assert not missing, (
         f"{helpers.__name__} extracts functions that call {missing}, which the "
