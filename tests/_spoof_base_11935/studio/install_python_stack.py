@@ -57,7 +57,6 @@ from backend.utils.wheel_utils import (
     install_wheel,
     probe_torch_wheel_env,
     url_exists,
-    xformers_torch_requirement_unmet,
 )
 from backend.utils.uv_path_safety import uv_safe_path as _uv_safe_path
 
@@ -194,14 +193,6 @@ def _strix_needs_amd_arch_index(ver: tuple[int, int]) -> bool:
     resolves no generic index at all, so the per-arch index is the only route left."""
     key = next((k for k in sorted(_ROCM_TORCH_INDEX, reverse = True) if ver >= k), None)
     return key is None or key < _ROCM_ARCH_INDEX_FLOOR
-
-
-# Rerouted to AMD's per-arch index below 7.13 (RDNA 4: TheRock #5284). Mirrors install.sh.
-# gfx120X-all publishes cp310+ only, so RDNA 4 on 3.9 keeps the generic wheels.
-_AMD_ARCH_INDEX_FLOOR_GFX: frozenset[str] = frozenset(
-    {"gfx1151", "gfx1150", "gfx1152"}
-    | ({"gfx1200", "gfx1201"} if sys.version_info >= (3, 10) else set())
-)
 
 
 # MI50 / Radeon VII (gfx906, Vega 20): rocm6.4+/7.x wheels bundle ROCm libraries
@@ -5592,13 +5583,13 @@ def _rocm_compat_reroute_pending(
     """Whether a compatibility reroute _ensure_rocm_torch performs has not been applied yet.
 
     Neither reroute is about missing kernels, so neither is visible to the wheel-family
-    question: Strix / RDNA 4 want AMD's 7.13 build over any generic one below the floor, gfx906
+    question: Strix wants AMD's 7.13 build over any generic one below the floor, and gfx906
     wants the last tag whose BLAS still carries it. Both compare against what is installed,
     so a host already on the right wheels keeps the fast path.
     """
     if not runtime_gfx:
         return False
-    if runtime_gfx in _AMD_ARCH_INDEX_FLOOR_GFX and _strix_needs_amd_arch_index(ver):
+    if runtime_gfx in _HSA_SPOOFABLE_PHYSICAL_GFX and _strix_needs_amd_arch_index(ver):
         return not _already_on_amd_arch_leaf(_GFX_TO_AMD_INDEX_ARCH.get(runtime_gfx), installed_ver)
     if _runtime_target_is_gfx906() and _gfx906_needs_legacy_index(ver):
         return _GFX906_LEGACY_TAG not in installed_ver
@@ -5961,7 +5952,8 @@ def _ensure_rocm_torch() -> None:
                 f"(studio/ROCM_RDNA2_APU.md) -- not installing ROCm torch for it.\n"
             )
             return
-        _strix_gfx = _AMD_ARCH_INDEX_FLOOR_GFX
+        _strix_gfx = {"gfx1151", "gfx1150", "gfx1152"}
+        # Only the Strix reroute has a ROCm-version floor.
         _detected_strix = (
             _strix_gfx.intersection(gfx_codes) if _strix_needs_amd_arch_index(ver) else set()
         )
@@ -5988,12 +5980,12 @@ def _ensure_rocm_torch() -> None:
                     "torchaudio>=2.11.0,<2.12.0",
                 )
                 _safe_print(
-                    f"   {_selected_gfx} is the runtime target with ROCm "
+                    f"   {_selected_gfx} (AMD Strix) is the runtime target with ROCm "
                     f"{ver[0]}.{ver[1]}.\n"
                     f"   Routing torch install to AMD's arch-specific index\n"
                     f"   ({_strip_index_url_credentials(_arch_index_url)}) which serves torch\n"
-                    f"   2.11.0+rocm7.13.0 with AMD's fixes for this GPU (the generic pytorch.org\n"
-                    f"   wheels below 7.13 lack them).\n"
+                    f"   2.11.0+rocm7.13.0 with AMD's gfx1150/gfx1151 fixes (more reliable than\n"
+                    f"   the generic pytorch.org rocm7.2 index on ROCm 7.3+ hosts).\n"
                 )
                 # Only on this branch: these wheels carry _selected_gfx kernels, so
                 # the runtime must stop reporting the spoofed arch or they have no
@@ -6004,8 +5996,8 @@ def _ensure_rocm_torch() -> None:
             else:
                 _gfx_str = ", ".join(sorted(_detected_strix))
                 _safe_print(
-                    f"   AMD per-gfx GPU ({_gfx_str}) present but HIP_VISIBLE_DEVICES "
-                    f"selects another runtime target ({_runtime_gfx});\n"
+                    f"   Strix GPU ({_gfx_str}) present but HIP_VISIBLE_DEVICES "
+                    f"selects a non-Strix runtime target ({_runtime_gfx});\n"
                     f"   skipping AMD per-gfx index override.\n"
                 )
 
@@ -7212,25 +7204,6 @@ def _evict_xformers_built_for_another_torch() -> bool:
     _note(
         f"windows on arm: the wheelhouse xformers was built for torch "
         f"{built_for}, not {resident} -- removed; attention uses torch SDPA"
-    )
-    return True
-
-
-def _evict_xformers_requiring_another_torch() -> bool:
-    """Remove an xFormers whose torch requirement is unmet, even if torch is unchanged (--overrides, #11545)."""
-    mismatch = xformers_torch_requirement_unmet()
-    if mismatch is None:
-        return False
-    xformers_version, requirement, torch_version = mismatch
-    if not _uninstall_distribution("xformers"):
-        _safe_print(
-            f"   [WARN] xformers {xformers_version} requires torch{requirement}, not "
-            f"{torch_version}, and could not be removed; diffusers cannot import it."
-        )
-        return False
-    _note(
-        f"xformers {xformers_version} requires torch{requirement}, not {torch_version} "
-        "-- removed; attention uses torch SDPA"
     )
     return True
 
@@ -11829,7 +11802,6 @@ def install_python_stack() -> int:
                 f"{_torch_after_repair} during the repair -- re-selecting torchao"
             )
             _install_torchao_for_torch(_torch_after_repair)
-        _evict_xformers_requiring_another_torch()
 
     # 13w. Windows torch flavor invariant, separate from step 13's Linux-shaped repair set
     # but in the same position: last, after the with-deps steps re-resolved torch.

@@ -1347,8 +1347,6 @@ _is_pkg_installed() {
             command -v dpkg >/dev/null 2>&1 && dpkg -s "$1" >/dev/null 2>&1 ;;
         pciutils)
             command -v lspci >/dev/null 2>&1 ;;
-        bubblewrap)
-            command -v bwrap >/dev/null 2>&1 ;;
         *) command -v "$1" >/dev/null 2>&1 ;;
     esac
 }
@@ -2646,10 +2644,8 @@ _wsl_amd_gpu_name() {
 
 # ── Bounded command runner ──
 _run_bounded() {
-    _rb_secs=10
-    if [ "${1:-}" = "--secs" ]; then _rb_secs=$2; shift 2; fi
     if command -v timeout >/dev/null 2>&1; then
-        timeout "$_rb_secs" "$@"
+        timeout 10 "$@"
     else
         "$@"
     fi
@@ -2680,11 +2676,7 @@ _nvidia_library_inventory() {
     else return 1
     fi
     _NVIDIA_LIBRARY_INVENTORY_STATE="none"
-    _NVIDIA_LIBRARY_INVENTORY_VALUE=""
-    # One deadline per reader: a shared bound let slow NVML starve the CUDA driver API reader.
-    for _nli_reader in nvml cuda; do
-        case "$_nli_reader" in nvml) _nli_secs=30 ;; *) _nli_secs=20 ;; esac
-        _NVIDIA_LIBRARY_INVENTORY_VALUE=$(_run_bounded --secs "$_nli_secs" "$_nli_py" -I - "$_nli_reader" 2>/dev/null <<'PY'
+    _NVIDIA_LIBRARY_INVENTORY_VALUE=$(_run_bounded "$_nli_py" -I - 2>/dev/null <<'PY'
 import ctypes, os, sys
 
 def load(*names):
@@ -2741,10 +2733,8 @@ def cuda():
         caps.append(f"{major.value}.{minor.value}")
     return version.value, caps
 
-# argv[1] runs one reader ("nvml" / "cuda") so each gets its own deadline; none runs both.
-only = {"nvml": (nvml,), "cuda": (cuda,)}.get(sys.argv[1] if len(sys.argv) > 1 else "")
 found = None
-for reader in only or (nvml, cuda):  # a reader that raises (a missing symbol) yields to the next
+for reader in (nvml, cuda):  # a reader that raises (a missing symbol) yields to the next
     try:
         found = reader()
     except Exception:
@@ -2756,50 +2746,9 @@ if not found or not found[1]:
 version, caps = found
 print(f"{version // 1000}.{version % 1000 // 10} {','.join(caps)}")
 PY
-) && [ -n "$_NVIDIA_LIBRARY_INVENTORY_VALUE" ] && break
-        _NVIDIA_LIBRARY_INVENTORY_VALUE=""
-    done
-    [ -n "$_NVIDIA_LIBRARY_INVENTORY_VALUE" ] || return 1
+) && [ -n "$_NVIDIA_LIBRARY_INVENTORY_VALUE" ] || return 1
     _NVIDIA_LIBRARY_INVENTORY_STATE="found"
     printf '%s\n' "$_NVIDIA_LIBRARY_INVENTORY_VALUE"
-}
-
-# Driver CUDA version without cuInit (cuDriverGetVersion, else /proc as in nvidia_probe.py _DRIVER_MAJOR_CUDA); picks a family only.
-_nvidia_driver_cuda_version() {
-    [ "${UNSLOTH_NVIDIA_LIBRARY_PROBE:-1}" != "0" ] || return 1
-    if command -v python3 >/dev/null 2>&1; then _ndv_py=python3
-    elif [ -n "${VENV_DIR:-}" ] && [ -x "$VENV_DIR/bin/python" ]; then _ndv_py="$VENV_DIR/bin/python"
-    else _ndv_py=""
-    fi
-    if [ -n "$_ndv_py" ]; then
-        _ndv_ver=$(_run_bounded "$_ndv_py" -I -c '
-import ctypes, sys
-for name in ("libcuda.so.1", "libcuda.so"):
-    try:
-        lib = ctypes.CDLL(name)
-        break
-    except OSError:
-        lib = None
-v = ctypes.c_int()
-if lib is None or lib.cuDriverGetVersion(ctypes.byref(v)) != 0 or v.value < 1000:
-    sys.exit(1)
-print(f"{v.value // 1000}.{v.value % 1000 // 10}")
-' 2>/dev/null </dev/null | awk 'NR == 1 { print $1 }') || _ndv_ver=""
-        case "$_ndv_ver" in
-            [0-9]*.[0-9]*) printf '%s\n' "$_ndv_ver"; return 0 ;;
-        esac
-    fi
-    # "NVRM version: NVIDIA UNIX Open Kernel Module for x86_64  590.48.01  Release Build ..."
-    _ndv_drv=$(awk 'NR == 1 { for (i = 1; i <= NF; i++) if ($i ~ /^[0-9]+\.[0-9]+(\.[0-9]+)?$/) { split($i, v, "."); print v[1]; exit } }' \
-        /proc/driver/nvidia/version 2>/dev/null) || _ndv_drv=""
-    case "$_ndv_drv" in ''|*[!0-9]*) return 1 ;; esac
-    if [ "$_ndv_drv" -ge 580 ]; then echo "13.0"
-    elif [ "$_ndv_drv" -ge 570 ]; then echo "12.8"
-    elif [ "$_ndv_drv" -ge 560 ]; then echo "12.6"
-    elif [ "$_ndv_drv" -ge 525 ]; then echo "12.0"
-    elif [ "$_ndv_drv" -ge 450 ]; then echo "11.0"
-    else return 1
-    fi
 }
 
 # ── NVIDIA usable-GPU helper ──
@@ -3179,65 +3128,12 @@ _check_linux_deps() {
     return 0
 }
 
-# Keep in step with os_sandbox._BWRAP_APPARMOR_FIX.
-_BWRAP_APPARMOR_FIX="sudo apt-get install -y apparmor-profiles && sudo install -m 644 /usr/share/apparmor/extra-profiles/bwrap-userns-restrict /etc/apparmor.d/ && sudo apparmor_parser -r /etc/apparmor.d/bwrap-userns-restrict"
-
-# The command that installs bubblewrap here; keep in step with os_sandbox._BWRAP_INSTALL_COMMANDS.
-_bwrap_install_command() {
-    if command -v apt-get >/dev/null 2>&1; then echo "sudo apt-get install -y bubblewrap"
-    elif command -v dnf >/dev/null 2>&1; then echo "sudo dnf install -y bubblewrap"
-    elif command -v pacman >/dev/null 2>&1; then echo "sudo pacman -S --needed bubblewrap"
-    elif command -v zypper >/dev/null 2>&1; then echo "sudo zypper install -y bubblewrap"
-    elif command -v apk >/dev/null 2>&1; then echo "sudo apk add bubblewrap"
-    fi
-}
-
-# Wanted, never required: bubblewrap runs Python and Terminal tool calls in an OS sandbox, and without it they run with software safeguards. Optional like the build tools, so it never asks for sudo: installed when the installer already runs as root, otherwise the one command is printed.
-_check_linux_tool_sandbox() {
-    _bw_restrict=""
-    # read, not cat: a builtin, so a minimal image without coreutils still gets the right advice.
-    read -r _bw_restrict <"${_BW_USERNS_SYSCTL:-/proc/sys/kernel/apparmor_restrict_unprivileged_userns}" 2>/dev/null || true
-    if ! command -v bwrap >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
-        ( _SMART_APT_OPTIONAL=true; _smart_apt_install bubblewrap ) || true
-    fi
-    if ! command -v bwrap >/dev/null 2>&1; then
-        step "sandbox" "bubblewrap not installed: tool calls run with software safeguards" "$C_WARN"
-        _bw_cmd="$(_bwrap_install_command)"
-        # One copy-paste on Ubuntu 23.10+: installing bwrap alone still leaves it blocked there.
-        case "$_bw_restrict:$_bw_cmd" in
-            1:*apt-get*) _bw_cmd="$_bw_cmd && $_BWRAP_APPARMOR_FIX" ;;
-        esac
-        if [ -n "$_bw_cmd" ]; then
-            substep "To run them in an OS sandbox: $_bw_cmd"
-        else
-            substep "To run them in an OS sandbox, install bubblewrap with your package manager."
-        fi
-        return 0
-    fi
-    # The runtime's namespaces, not --unshare-all: that adds the network namespace, which tool calls never get.
-    if bwrap --unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-cgroup --ro-bind / / true </dev/null >/dev/null 2>&1; then
-        step "sandbox" "bubblewrap works: tool calls run in an OS sandbox"
-        return 0
-    fi
-    if [ "$_bw_restrict" = 1 ]; then
-        step "sandbox" "AppArmor blocks bubblewrap: tool calls run with software safeguards" "$C_WARN"
-        # Ubuntu ships this profile disabled in apparmor-profiles; it lets /usr/bin/bwrap create the namespace and strips its children's capabilities.
-        substep "To enable it, load Ubuntu's own bwrap profile:"
-        substep "  $_BWRAP_APPARMOR_FIX"
-    else
-        step "sandbox" "bubblewrap cannot create a sandbox here: tool calls run with software safeguards" "$C_WARN"
-        substep "Containers usually block user namespaces; outside one, check user.max_user_namespaces."
-    fi
-    return 0
-}
-
 case "$OS" in
     macos)
         _check_macos_deps || exit 1
         ;;
     linux|wsl)
         _check_linux_deps || exit 1
-        _check_linux_tool_sandbox || true
         ;;
 esac
 
@@ -5339,37 +5235,19 @@ get_torch_index_url() {
         echo "$_base/cpu"; return
     fi
     # CUDA version from nvidia-smi: accept "CUDA Version:" and the newer "CUDA UMD Version:".
-    _smi_rc=0
-    _smi_out=$(export LC_ALL=C; _run_bounded "$_smi" 2>/dev/null) || _smi_rc=$?
-    if [ "$_smi_rc" = "124" ]; then
-        echo "[INFO] nvidia-smi did not answer within 10s; retrying with a 45s limit..." >&2
-        _smi_rc=0
-        _smi_out=$(export LC_ALL=C; _run_bounded --secs 45 "$_smi" 2>/dev/null) || _smi_rc=$?
-        # Still hung: do not spend another bound asking it for compute capabilities below.
-        [ "$_smi_rc" = "124" ] && _smi=""
-    fi
-    _cuda_ver=$(printf '%s\n' "$_smi_out" \
+    _cuda_ver=$(export LC_ALL=C; _run_bounded "$_smi" 2>/dev/null \
         | sed -n \
             -e 's/.*CUDA UMD Version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
             -e 's/.*CUDA Version:[[:space:]]*\([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' \
         | head -1)
     _inventory_caps=""
-    _cuda_from_driver=""
-    # A mirror base can carry credentials, so name only the leaf.
-    if [ -n "${UNSLOTH_PYTORCH_MIRROR:-}" ]; then _pin_hint="UNSLOTH_TORCH_INDEX_FAMILY="
-    else _pin_hint="UNSLOTH_TORCH_INDEX_URL=$_base/"
-    fi
     if [ -z "$_cuda_ver" ]; then
         # nvidia-smi absent, stale or hung: the driver library knows both; cu126 is the last resort.
         if _inventory=$(_nvidia_library_inventory) && [ -n "$_inventory" ]; then
             _cuda_ver=${_inventory%% *}
             _inventory_caps=$(printf '%s' "${_inventory#* }" | tr ',' '\n')
-        elif _cuda_ver=$(_nvidia_driver_cuda_version) && [ -n "$_cuda_ver" ]; then
-            _cuda_from_driver=1
         else
             echo "[WARN] Could not determine CUDA version from nvidia-smi, defaulting to cu126" >&2
-            echo "[WARN] cu126 has no kernels for Blackwell (sm_100 / sm_120). To choose the wheel yourself, re-run with" >&2
-            echo "[WARN]   ${_pin_hint}cu128   (or cu130 on a driver that supports CUDA 13)" >&2
             echo "$_base/cu126"; return
         fi
     fi
@@ -5381,14 +5259,7 @@ get_torch_index_url() {
     elif [ "$_major" -ge 12 ]; then _cuda_tag=cu124
     elif [ "$_major" -ge 11 ]; then _cuda_tag=cu118
     else echo "$_base/cpu"; return; fi
-    _cuda_tag=$(_cap_cuda_family_for_pre_turing "$_cuda_tag" "$_smi" "$_inventory_caps")
-    if [ -n "$_cuda_from_driver" ]; then
-        echo "[WARN] nvidia-smi and the NVIDIA driver libraries did not answer in time; the driver supports CUDA $_cuda_ver." >&2
-        echo "[WARN] Selecting the $_cuda_tag PyTorch wheels from the driver version alone. If that is wrong for this GPU, re-run with" >&2
-        echo "[WARN]   ${_pin_hint}cu126   (Maxwell to Hopper, sm_50-90)" >&2
-        echo "[WARN]   ${_pin_hint}cu128   (Turing and newer, including Blackwell)" >&2
-    fi
-    echo "$_base/$_cuda_tag"
+    echo "$_base/$(_cap_cuda_family_for_pre_turing "$_cuda_tag" "$_smi" "$_inventory_caps")"
 }
 
 # ── Torch flavor helpers (to repair a stale CPU / wrong-CUDA wheel) ──
@@ -6155,10 +6026,6 @@ _amd_gpu_radeon=false
 _gfx_rocm64_target=false
 _gfx_rocm64_floor_maj=""
 _gfx_rocm64_floor_min=""
-# Set when torch is routed to an AMD per-arch index; the migrated repair then needs 7.13+
-# from that family.
-_amd_arch_index_routed=false
-_amd_arch_index_family=""
 if [ "$_torch_index_pinned" = false ]; then
 # On the LEAF, like every other index classifier here: the AMD per-arch mirror is https://repo.amd.com/ROCM/whl/gfx120X-all/, so a whole-URL */rocm* glob brands every per-arch reroute as Radeon and the summary then reports repo.radeon.com wheels that were never fetched. The two older per-arch reroutes each clear the flag by hand afterwards; matching the leaf is what stops the next one from having to.
 case "$_torch_index_leaf" in
@@ -6179,22 +6046,6 @@ _rocm_leaf_below() {
     return 1
 }
 # 0 when the venv's torch has no identifiable rocm family at $2.$3 or newer, mirroring _installed_rocm_wheel_is_below in studio/install_python_stack.py
-# The AMD per-arch family the venv's torch runs on, read like _installed_rocm_wheel_family in
-# install_python_stack.py: off the `rocm` meta-package. Empty when unknown.
-_venv_torch_amd_family() {
-    "$1" -c 'import re
-from importlib import metadata
-try:
-    reqs = metadata.requires("rocm") or []
-except Exception:
-    reqs = []
-for r in reqs:
-    m = re.search(r"rocm[-_]sdk[-_]libraries[-_]([A-Za-z0-9][A-Za-z0-9._-]*)", r, re.I)
-    if m:
-        print(re.split(r"[=<>!~;,\[\]()\s]", m.group(1))[0].lower().replace("_", "-"))
-        break' 2>/dev/null || true
-}
-
 _venv_torch_rocm_below() {
     _vtr_leaf=$("$1" -c 'import re, torch; m = re.search(r"rocm([0-9]+)\.([0-9]+)", getattr(torch, "__version__", "") or ""); print("rocm%s.%s" % m.groups() if m else "")' 2>/dev/null || true)
     [ -n "$_vtr_leaf" ] || return 0
@@ -6209,8 +6060,6 @@ case "$_torch_index_leaf" in
         _gfx_rocm64_target=false
         _gfx_rocm64_floor_maj=""
         _gfx_rocm64_floor_min=""
-        _amd_arch_index_routed=false
-        _amd_arch_index_family=""
         # One record per adapter in probe enumeration order, indexed by HIP_VISIBLE_DEVICES / ROCR_VISIBLE_DEVICES so the mask selects a CARD. A deduplicated arch list could not: gfx1100 + gfx1100 + gfx1200 ran off the end of a two-entry list, and a Strix iGPU + dGPU box rerouted the selected dGPU to the Strix per-gfx index. `|| true` on each probe so one that finds nothing does not abort the installer under set -euo pipefail before the next fallback. UNSLOTH_ROCM_GFX_ARCH overrides probing, mirroring setup.sh and the display block.
         _gfx_all=$(printf '%s' "${UNSLOTH_ROCM_GFX_ARCH:-}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
         # strip a copied hip gcnArchName suffix, matching _gfx906_env below and the python helper
@@ -6345,8 +6194,6 @@ case "$_torch_index_leaf" in
                 _amd_strix_base="${_amd_strix_base%/}"
             done
             TORCH_INDEX_URL="${_amd_strix_base}/${_strix_gfx}/"
-            _amd_arch_index_routed=true
-            _amd_arch_index_family="$_strix_gfx"
             TORCH_CONSTRAINT="torch>=2.11.0,<2.12.0"
             # Pin companions to 2.11 (per-gfx index publishes them independently).
             TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
@@ -6360,38 +6207,6 @@ case "$_torch_index_leaf" in
                 echo "  [WARN] to report the real arch. Remove the export from your shell profile" >&2
                 echo "  [WARN] (~/.bashrc, ~/.profile) as well, or the next terminal restores it." >&2
             fi
-        fi
-        # RDNA 4 generic wheels below 7.13 have a null HIP _grouped_mm (TheRock #5284); use
-        # gfx120X-all. Leaf is rewritten so the rocm6.4 floor below cannot undo it.
-        _rdna4_gfx=""
-        if [ "$_gfx906_env" != "gfx906" ]; then
-            case "$_runtime_gfx" in
-                gfx1200|gfx1201) _rdna4_gfx="$_runtime_gfx" ;;
-            esac
-        fi
-        # gfx120X-all publishes cp310+ only, so a 3.9 venv keeps the generic wheels.
-        if [ -n "$_rdna4_gfx" ] && [ "$("${VENV_DIR:-}/bin/python" -c 'import sys; print("%d.%d" % sys.version_info[:2])' 2>/dev/null || true)" = "3.9" ]; then
-            _rdna4_gfx=""
-        fi
-        if [ -n "$_rdna4_gfx" ] && _rocm_leaf_below "$_torch_index_leaf" 7 13; then
-            echo "" >&2
-            echo "  [WARN] $_rdna4_gfx (RDNA 4) detected -- routing to the AMD arch-specific index" >&2
-            echo "  [WARN] torch 2.11+rocm7.13 fixes the RDNA 4 _grouped_mm kernel that the" >&2
-            echo "  [WARN] $_torch_index_leaf wheels lack, so training does not fall back to a slow path." >&2
-            echo "" >&2
-            _amd_rdna4_base="${UNSLOTH_AMD_ROCM_MIRROR:-https://repo.amd.com/rocm/whl}"
-            while [ "${_amd_rdna4_base%/}" != "$_amd_rdna4_base" ]; do
-                _amd_rdna4_base="${_amd_rdna4_base%/}"
-            done
-            # Literal, not _amd_arch_index_family_for_gfx: tests lift this arm out whole.
-            TORCH_INDEX_URL="${_amd_rdna4_base}/gfx120X-all/"
-            _amd_arch_index_routed=true
-            _amd_arch_index_family="gfx120x-all"
-            TORCH_CONSTRAINT="torch>=2.11.0,<2.12.0"
-            TORCHVISION_CONSTRAINT="torchvision>=0.26.0,<0.27.0"
-            TORCHAUDIO_CONSTRAINT="torchaudio>=2.11.0,<2.12.0"
-            _amd_gpu_radeon=false
-            _torch_index_leaf="gfx120x-all"
         fi
         # Navi 33 (gfx1102) and RDNA 4 (gfx1200/gfx1201) have no kernels in the
         # older generic wheel families. The floor is per arch, read from the
@@ -7244,14 +7059,6 @@ if [ "$_MIGRATED" = true ]; then
             # kernels for it. The SAME floor the reroute used, so an adequate wheel is left alone.
             substep "reinstalling torch from $_torch_index_leaf (the migrated wheels have no kernels for this GPU)..."
             _install_torch_default_index --force-reinstall
-        elif [ "${_amd_arch_index_routed:-false}" = true ] && {
-                 _venv_torch_rocm_below "$_VENV_PY" 7 13 ||
-                 { _vfam=$(_venv_torch_amd_family "$_VENV_PY")
-                   [ -n "$_vfam" ] && [ "$_vfam" != "${_amd_arch_index_family:-}" ]; }; }; then
-            # Below 7.13, or another GPU family's wheel: neither has kernels for this route.
-            # An unreadable family is left alone, as install_python_stack.py does.
-            substep "reinstalling torch from the AMD per-arch index (the migrated wheels do not match it)..."
-            _install_torch_default_index --force-reinstall
         fi
         _gfx906_bnb_prune
     fi
@@ -7562,112 +7369,6 @@ if [ "$SKIP_TORCH" = false ] && [ -n "${TORCH_INDEX_URL:-}" ]; then
             substep "[WARN]   uv pip install --python \"$_VENV_PY\" \"$(_torch_spec_with_extra "$TORCH_CONSTRAINT")\" \"$(_torch_spec_with_extra "$TORCHVISION_CONSTRAINT")\" \"$TORCHAUDIO_CONSTRAINT\" --default-index $(_strip_index_url_credentials "$TORCH_INDEX_URL") --reinstall-package torch --reinstall-package torchvision --reinstall-package torchaudio" "$C_WARN"
         fi
     fi
-fi
-
-# A wrong CUDA family fails only at first kernel launch; never cuInit here (minutes on a congested driver).
-if [ "$SKIP_TORCH" = false ] && ! _cvd_hides_nvidia; then
-    case "${_expected_torch_tag:-}" in
-        cu[0-9]*)
-            _arch_check=$(_run_bounded --secs 120 "$_VENV_PY" -c '
-import ctypes, sys
-
-def load(*names):
-    for name in names:
-        try:
-            return ctypes.CDLL(name)
-        except OSError:
-            pass
-
-def nvml_caps():
-    lib = load("libnvidia-ml.so.1", "libnvidia-ml.so")
-    if lib is None or lib.nvmlInit_v2() != 0:
-        return None
-    try:
-        count, caps = ctypes.c_uint(), set()
-        if lib.nvmlDeviceGetCount_v2(ctypes.byref(count)) != 0 or not count.value:
-            return None
-        for i in range(count.value):
-            dev, major, minor = ctypes.c_void_p(), ctypes.c_int(), ctypes.c_int()
-            if lib.nvmlDeviceGetHandleByIndex_v2(i, ctypes.byref(dev)) != 0 or \
-               lib.nvmlDeviceGetCudaComputeCapability(dev, ctypes.byref(major), ctypes.byref(minor)) != 0:
-                return None
-            caps.add((major.value, minor.value))
-        return sorted(caps)
-    finally:
-        lib.nvmlShutdown()
-
-try:
-    import torch
-    if not torch.version.cuda or getattr(torch.version, "hip", None):
-        sys.exit(0)
-    try:
-        archs = torch._C._cuda_getArchFlags().split()
-    except Exception:
-        archs = torch.cuda.get_arch_list()
-    try:
-        caps = nvml_caps()
-    except Exception:
-        caps = None
-    if caps is None:
-        if not torch.cuda.is_available():
-            sys.exit(0)
-        caps = sorted({torch.cuda.get_device_capability(i) for i in range(torch.cuda.device_count())})
-except Exception:
-    sys.exit(0)
-
-def runs(arch, cap):
-    kind, _, rest = arch.partition("_")
-    n = len(rest) - len(rest.lstrip("0123456789"))
-    digits, suffix = rest[:n], rest[n:]
-    if n < 2:
-        return False
-    built = (int(digits[:-1]), int(digits[-1]))
-    if suffix == "a":  # arch-specific cubin / PTX: that exact GPU only
-        return built == cap
-    if kind == "sm":  # a cubin runs on its own major at the same or a newer minor
-        return built[0] == cap[0] and built[1] <= cap[1]
-    return kind == "compute" and built <= cap  # PTX is JIT-compiled forward
-
-missing = [c for c in caps if not any(runs(a, c) for a in archs)]
-if not archs or not caps or not missing:
-    sys.exit(0)
-driver = ctypes.c_int()
-cuda = load("libcuda.so.1", "libcuda.so")  # cuDriverGetVersion needs no cuInit
-if cuda is None or cuda.cuDriverGetVersion(ctypes.byref(driver)) != 0:
-    driver.value = 0
-family = "cu126" if min(missing) < (7, 5) else ("cu130" if driver.value >= 13000 else "cu128")
-status = "none" if len(missing) == len(caps) else "some"
-# No wheel to point at (pre-Maxwell, or the family already installed): warn, never fail the install.
-if min(missing) < (5, 0) or family == "cu" + torch.version.cuda.replace(".", ""):
-    status = "nofix"
-fmt = lambda cs: ",".join(f"{a}.{b}" for a, b in cs)
-print("UNSLOTH_ARCH_CHECK=%s|%s|%s|%s|%s" % (status, fmt(missing), torch.__version__, " ".join(archs), family))
-' 2>/dev/null | sed -n 's/^UNSLOTH_ARCH_CHECK=//p' | tail -n 1 || true)
-            if [ -n "$_arch_check" ]; then
-                IFS='|' read -r _ac_status _ac_caps _ac_torch _ac_archs _ac_family <<EOF_ARCH
-$_arch_check
-EOF_ARCH
-                if [ -n "${UNSLOTH_PYTORCH_MIRROR:-}" ]; then _ac_pin="UNSLOTH_TORCH_INDEX_FAMILY=$_ac_family"
-                else _ac_pin="UNSLOTH_TORCH_INDEX_URL=https://download.pytorch.org/whl/$_ac_family"
-                fi
-                if [ "$_ac_status" = "none" ] && [ "$_torch_index_pinned" = false ]; then
-                    tauri_log "ERROR" "PyTorch $_ac_torch has no kernels for this GPU (compute capability $_ac_caps)"
-                    substep "[ERROR] PyTorch $_ac_torch has no kernels for this GPU (compute capability $_ac_caps)." "$C_ERR"
-                    substep "[ERROR] It was built for: $_ac_archs" "$C_ERR"
-                    substep "[ERROR] Training would fail with \"no kernel image is available for execution on the device\"." "$C_ERR"
-                    substep "[ERROR] Re-run this installer with the matching PyTorch wheels:" "$C_ERR"
-                    substep "[ERROR]   $_ac_pin" "$C_ERR"
-                    exit 1
-                fi
-                substep "[WARN] PyTorch $_ac_torch has no kernels for the GPUs with compute capability $_ac_caps." "$C_WARN"
-                if [ "$_ac_status" = "nofix" ]; then
-                    substep "[WARN] It was built for: $_ac_archs. Those GPUs will not be usable for training." "$C_WARN"
-                else
-                    substep "[WARN] It was built for: $_ac_archs. Those GPUs will not be usable; for them, re-run with $_ac_pin" "$C_WARN"
-                fi
-            fi
-            ;;
-    esac
 fi
 
 # An extras pin lands on a leaf the flavor enforcement above does not recognise, so it skips
