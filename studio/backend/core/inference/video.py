@@ -5155,6 +5155,11 @@ class VideoBackend:
         # Sets a flag the pipelines read when they first build their frequency tables, so it need only happen before
         # generation, not before placement.
         force_float32_rope(pipe, target, logger = logger)
+        # HunyuanVideo-1.5 VAE only: same mask values, so bit-identical, but held off on SPEED_OFF like the trim above.
+        hv15_mask_engaged = False
+        if effective_speed != SPEED_OFF:
+            from .video_hv15_vae import install_vectorised_causal_mask
+            hv15_mask_engaged = install_vectorised_causal_mask(pipe, logger = logger) > 0
         speed_optims: tuple = ()
         for view in views:
             # Both helpers act on ``view.transformer``; call once per view (engaged values match, so record the first).
@@ -5189,6 +5194,8 @@ class VideoBackend:
                 speed_optims = tuple(k for k, v in applied.items() if v)
                 if attention_trim_engaged:
                     speed_optims += ("hunyuan_attn_trim",)
+                if hv15_mask_engaged:
+                    speed_optims += ("hv15_vae_vector_mask",)
         with self._generate_lock:
             # A cancelled/superseded load must not place weights on a GPU the arbiter may have reassigned; recheck
             # before placement.
@@ -5822,12 +5829,12 @@ class VideoBackend:
         effective_speed = resolve_speed_mode(speed_mode, is_gguf = False, dense_default = SPEED_DEFAULT)
         h3_vae_speed = effective_speed
         if effective_speed == SPEED_MAX:
-            # SPEED_MAX compiles static until a dimension changes. H3's packed sequence length carries the caption's
-            # token rows, so a static graph recompiles on new prompts: measured 0.957-1.000 s/step static against
-            # 1.000-1.040 dynamic, and two recompiles paid for it.
+            # Max no longer retraces on a new caption (the prompt-length dims and temb compile dynamic / unbacked from
+            # the first forward), but it still does not pay: max-autotune measured 2.41 against 2.45 s/step at
+            # 1344x768x124 while the first render took 110 s against 48 s, about 45 renders to break even.
             logger.info(
                 "video.speed_mode: MiniMax-H3 runs the 'default' regional profile under max "
-                "(a static graph retraces on the caption's contribution to the packed length)"
+                "(max-autotune's first-render cost is not repaid by its 2% faster step)"
             )
             effective_speed = SPEED_DEFAULT
         if device != "cpu":
