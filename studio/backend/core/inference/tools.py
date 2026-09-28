@@ -3972,6 +3972,9 @@ def _references_studio_credential_here(
     text: str,
     workdir: "str | None",
     _unescaped: bool = False,
+    _assign_expand_depth: int = 0,
+    _quoted_assignments: bool = False,
+    _positional_assignments: bool = False,
 ) -> bool:
     """`_references_studio_credential`, plus the relative paths *text* would open from *workdir*.
 
@@ -4044,12 +4047,37 @@ def _references_studio_credential_here(
     # One level of indirection, `r=$STUDIO_HOME; sqlite3 "$r/auth/auth.db"`. Same substitution the
     # sensitive-path scan uses, and it only ADDS detections.
     if "$" in text:
-        expanded = _expand_shell_assignments(text)
-        # The WHOLE workdir-aware analysis, not only the literal scan: `d=../..; cd "$d"` moves the
-        # directory every later relative path opens from, and handing the unexpanded text to the cwd
-        # walk read `$d` as a directory name and never moved.
-        if expanded != text and _references_studio_credential_here(expanded, workdir):
-            return True
+        # Quoted bindings scanned separately: log text shaped like an assignment must not overwrite real ones.
+        quoted_modes = (
+            (False, True)
+            if _assign_expand_depth == 0 and ("'" in text or '"' in text)
+            else (_quoted_assignments,)
+        )
+        positional_modes = (
+            (True, False) if _assign_expand_depth == 0 else (_positional_assignments,)
+        )
+        seen = {text}
+        for include_quoted in quoted_modes:
+            for positional in positional_modes:
+                expanded = _expand_shell_assignments(
+                    text, _include_quoted = include_quoted, _positional = positional
+                )
+                if expanded in seen:
+                    continue
+                seen.add(expanded)
+                # Exhausted expansion budget fails closed: unresolved aliases may still hide the auth path.
+                if _assign_expand_depth >= _MAX_SHELL_ASSIGN_EXPAND_PASSES or (
+                    "$" in expanded and len(expanded) > max(_MAX_TERMINAL_SCAN_CHARS, len(text))
+                ):
+                    return True
+                if _references_studio_credential_here(
+                    expanded,
+                    workdir,
+                    _assign_expand_depth = _assign_expand_depth + 1,
+                    _quoted_assignments = include_quoted,
+                    _positional_assignments = positional,
+                ):
+                    return True
     # A `cd` earlier in the command moves where every later relative path opens from.
     if workdir and ("cd" in text.lower() or "pushd" in text.lower()):
         for offset, limit, cwd in _cwds_after_cd(workdir, text):
@@ -5026,7 +5054,8 @@ _SHELL_PARAM_CASE_RE = re.compile(r"\$\{(\w+)(\^\^|,,|\^|,)\}")
 # Indirect expansion ${!p} yields the value of the variable *named* by $p, so x=passwd; p=x; cat /etc/${!p} builds
 # /etc/passwd.
 _SHELL_PARAM_INDIRECT_RE = re.compile(r"\$\{!(\w+)\}")
-_SHELL_ASSIGN_RE = re.compile(r"(?:^|[\s;&|(])([A-Za-z_]\w*)=([^\s;&|)]+)")
+_SHELL_PARAM_VALUE_OP_RE = re.compile(r"\$\{([A-Za-z_]\w*)(:?)([-=+])([^{}]*)\}")
+_SHELL_ASSIGN_RE = re.compile(r"(?:^|[\s;&|(])([A-Za-z_]\w*)=([^\s;&|)]*)")
 # Bash ANSI-C quoting ($'\x77' -> 'w') is expanded after this classifier, so decode $'...' bodies before the
 # sensitive-path scan.
 _ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
@@ -5117,6 +5146,8 @@ _SHELL_PARAM_OP_RE = re.compile(r"\$\{[A-Za-z_]\w*:?[-=+]([^{}]*)\}")
 # path fails closed rather than spending unbounded time. Ordinary commands are far below these bounds.
 _MAX_PATH_SCAN_CHARS = 2048
 _MAX_TERMINAL_SCAN_CHARS = 4096
+# Each pass doubles resolved alias hops; leftover work after the cap fails closed.
+_MAX_SHELL_ASSIGN_EXPAND_PASSES = 16
 # A glob needs one of these to expand into anything but itself; used to skip the glob scans outright.
 _GLOB_META_RE = re.compile(r"[?*\[]")
 # Where the memoised node list is parked on a parsed tree (see _tree_nodes).
@@ -5286,13 +5317,40 @@ def _posix_join(parts) -> str:
     return out
 
 
-def _expand_shell_assignments(command: str) -> str:
+def _shell_assign_value_self_references(name: str, value: str) -> bool:
+    """True when *value* expands *name* (VAR=$VAR), which must not feed back into itself."""
+    if any((m.group(1) or m.group(2)) == name for m in _SHELL_VAR_RE.finditer(value)):
+        return True
+    return any(
+        m.group(1) == name
+        for pattern in (
+            _SHELL_PARAM_REPL_RE,
+            _SHELL_PARAM_CASE_RE,
+            _SHELL_PARAM_INDIRECT_RE,
+            _SHELL_PARAM_VALUE_OP_RE,
+        )
+        for m in pattern.finditer(value)
+    )
+
+
+def _expand_shell_assignments(
+    command: str,
+    *,
+    _include_quoted: bool = True,
+    _positional: bool = False,
+) -> str:
     """Best-effort substitution of `NAME=value ... $NAME`, so a sensitive path split across an
     assignment and an argument (p=/etc; cat $p/passwd) is still visible to the scan. Also applies
     pattern replacement. Fail-open: only adds detections."""
-    env = dict(_SHELL_ASSIGN_RE.findall(command))
-    if not env:
-        return command
+    env = {}
+
+    def repl_default(m):
+        name, colon, op, operand = m.groups()
+        value = env.get(name)
+        missing = value is None or (colon and not value.strip("'\""))
+        if op == "+":
+            return "" if missing else operand
+        return operand if missing else value
 
     def repl_pattern(m):
         var, is_global, pat, rep = m.group(1), m.group(2), m.group(3), m.group(4)
@@ -5318,10 +5376,46 @@ def _expand_shell_assignments(command: str) -> str:
         pointed = env.get(m.group(1))
         return env.get(pointed, m.group(0)) if pointed is not None else m.group(0)
 
-    command = _SHELL_PARAM_INDIRECT_RE.sub(repl_indirect, command)
-    command = _SHELL_PARAM_REPL_RE.sub(repl_pattern, command)
-    command = _SHELL_PARAM_CASE_RE.sub(repl_case, command)
-    return _SHELL_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), command)
+    def expand(text):
+        text = _SHELL_PARAM_INDIRECT_RE.sub(repl_indirect, text)
+        text = _SHELL_PARAM_REPL_RE.sub(repl_pattern, text)
+        text = _SHELL_PARAM_CASE_RE.sub(repl_case, text)
+        return _SHELL_VAR_RE.sub(lambda m: env.get(m.group(1) or m.group(2), m.group(0)), text)
+
+    quote_states = None
+    # _positional: each use sees the binding active where it stands, so `x=../..; cat "$x/auth/auth.db"; x=/tmp`
+    # still names the auth path; the default (last binding everywhere) covers loops that bind after the use.
+    pieces, pos = [], 0
+    for match in _SHELL_ASSIGN_RE.finditer(command):
+        if not _include_quoted:
+            if quote_states is None:
+                quote_states = _shell_quote_states(command)
+            if quote_states[match.start(1)]:
+                continue
+        var, val = match.groups()
+        if _positional:
+            pieces.append(expand(command[pos : match.start(2)]))
+            pieces.append(expand(val))
+            pos = match.end(2)
+        if _shell_assign_value_self_references(var, val):
+            # Studio home vars stay references: `H=$H; cat "$H/auth/auth.db"` must still name the install.
+            if var.upper() in _STUDIO_HOME_ENV_VARS:
+                env.setdefault(var, "${" + var + "}")
+            val = _SHELL_PARAM_VALUE_OP_RE.sub(repl_default, val)
+            env.setdefault(var, "")
+            val = expand(val)
+            # `a=$a$a` repeated doubles each time: past the path cap keep the earlier binding.
+            if len(val) > _MAX_PATH_SCAN_CHARS:
+                continue
+        # `x=../..; (x=); cat "$x/auth/auth.db"`: a scoped empty assignment must not erase the outer binding.
+        if not val and var in env:
+            continue
+        env[var] = val
+    if not env:
+        return command
+    if _positional:
+        return "".join(pieces) + expand(command[pos:])
+    return expand(command)
 
 
 def _expand_param_defaults(command: str) -> str:
