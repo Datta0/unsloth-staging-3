@@ -8620,6 +8620,8 @@ const EditComposer: FC = () => {
   const { inputProps, isComposingRef } = useImeComposerInputHandlers();
   const resendAfterCancelRef = useRef(false);
   const researchActive = useThreadResearchActive();
+  // send() drops an empty composer, e.g. a paste-only message whose chip was removed.
+  const editEmpty = useAuiState(({ composer }) => composer.isEmpty);
 
   useAuiEvent("thread.runEnd", () => {
     if (!resendAfterCancelRef.current) {
@@ -8652,6 +8654,7 @@ const EditComposer: FC = () => {
           submitEdit();
         }}
       >
+        <ComposerAttachments className="mb-0 px-3 pt-3 [&_.aui-pasted-text-chip:not(:hover)]:bg-background" />
         <ComposerPrimitive.Input
           submitMode={
             effectiveSendShortcut(sendShortcut, editMultiline ? "\n" : "") === "mod-enter"
@@ -8670,7 +8673,7 @@ const EditComposer: FC = () => {
               Cancel
             </Button>
           </ComposerPrimitive.Cancel>
-          <Button type="submit" size="sm" disabled={researchActive}>
+          <Button type="submit" size="sm" disabled={researchActive || editEmpty}>
             Send
           </Button>
         </div>
