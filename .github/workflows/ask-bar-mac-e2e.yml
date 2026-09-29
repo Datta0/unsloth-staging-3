@@ -3,6 +3,8 @@ name: "Ask bar on Mac (MLX end to end)"
 on:
   pull_request:
   workflow_dispatch:
+  push:
+    branches: ['ask-bar-e2e-*']
 
 permissions:
   contents: read
