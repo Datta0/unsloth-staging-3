@@ -13,10 +13,10 @@ now_ms() { python3 -c 'import time; print(int(time.time()*1000))'; }
 panel_up() { "$DRIVER" windows "$APP" | python3 -c '
 import json,sys
 rows=json.load(sys.stdin)
-print("yes" if any(r["layer"]==101 and r["onscreen"] for r in rows) else "no")'; }
+print("yes" if any(r["name"]=="Unsloth" and r["layer"]>0 and r["onscreen"] for r in rows) else "no")'; }
 panel_exists() { "$DRIVER" windows "$APP" | python3 -c '
 import json,sys
-print("yes" if any(r["layer"]==101 for r in json.load(sys.stdin)) else "no")'; }
+print("yes" if any(r["name"]=="Unsloth" and r["layer"]>0 for r in json.load(sys.stdin)) else "no")'; }
 server_hits() { cat "$STUDIO_LOGS"/server/*.log 2>/dev/null | grep -c "$1" || true; }
 
 launch() {
@@ -76,6 +76,8 @@ done
 [ -n "$shown" ] || fail "Option+Space did not show the panel"
 echo "hotkey_to_panel_ms=${shown:-none}" | tee -a "$OUT/metrics.txt"
 "$DRIVER" windows "$APP" > "$OUT/windows-shown.json"
+python3 -c 'import json,sys; print("panel_level=" + ",".join(str(r["layer"]) for r in json.load(open(sys.argv[1])) if r["name"]=="Unsloth" and r["layer"]>0))' "$OUT/windows-shown.json" | tee -a "$OUT/metrics.txt"
+grep -q "^panel_level=101$" "$OUT/metrics.txt" || fail "the panel is not at the pop-up menu level (101)"
 screencapture -x "$OUT/1-panel-open.png" || true
 
 loads0=$(server_hits '/api/inference/load')
@@ -123,9 +125,10 @@ screencapture -x "$OUT/5-reopened-fresh.png" || true
 # With Unsloth itself frontmost, a click in its own main window dismisses the panel too.
 main_center=$("$DRIVER" windows "$APP" | python3 -c '
 import json,sys
-rows=[r for r in json.load(sys.stdin) if r["layer"]==0 and r["onscreen"]]
-b=max(rows,key=lambda r:r["bounds"]["Width"]*r["bounds"]["Height"])["bounds"] if rows else None
-print(f"{b[\"X\"]+b[\"Width\"]/2:.0f} {b[\"Y\"]+b[\"Height\"]/2:.0f}" if b else "")')
+rows=[r for r in json.load(sys.stdin) if r["layer"]==0 and r["onscreen"] and r["name"]=="Unsloth"]
+if rows:
+    b=max(rows,key=lambda r:r["bounds"]["Width"]*r["bounds"]["Height"])["bounds"]
+    print(int(b["X"]+b["Width"]/2), int(b["Y"]+b["Height"]*0.85))')
 if [ -n "$main_center" ]; then
   "$DRIVER" click $main_center; sleep 1
   "$DRIVER" hotkey; sleep 1.5
