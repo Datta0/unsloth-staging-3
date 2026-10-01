@@ -960,3 +960,4 @@ jobs:
           done
           [ "$found" -gt 0 ] || { echo "::error::no shell tests discovered under tests/sh"; exit 1; }
           echo "ran $found shell installer test files"
+# staging trigger for a full run on main d2528e679
