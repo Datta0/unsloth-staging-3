@@ -183,6 +183,26 @@ export function decodeSegment(segment: string): string {
  * honestly instead of silently fetching another chat's file (or another route).
  */
 export function sandboxFileForSrc(src: string): string | null {
+  const file = sandboxPathForSrc(src);
+  if (file === null) return null;
+  const name = file.slice(file.lastIndexOf("/") + 1);
+  const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
+  // A `.csv` is a download card, not an `<img>`; leave it to the file cards.
+  return SANDBOX_INLINE_IMAGE_EXTS.has(ext) ? file : null;
+}
+
+/** Sandbox file a markdown link targets (`outputs/report.csv`); needs an extension, so `#intro` stays a link. */
+// A site without a scheme (`www.example.com`, `example.org/page`), not a sandbox path.
+const BARE_HOST_RE = /^(?:www\.[^/]+|[^/]+\.(?:com|org|net|edu|gov|io|ai|dev|app|co|me|info|xyz|uk|de|fr|jp|cn|ru|ca|au|in|us|eu))(?:[:/?#]|$)/i;
+
+export function sandboxFileForHref(href: string): string | null {
+  const trimmed = href.trim();
+  if (trimmed.startsWith("#") || BARE_HOST_RE.test(trimmed)) return null;
+  const file = sandboxPathForSrc(href);
+  return file !== null && /[^/]\.[A-Za-z0-9]{1,8}$/.test(file) ? file : null;
+}
+
+function sandboxPathForSrc(src: string): string | null {
   const trimmed = src.trim();
   if (!trimmed || HAS_SCHEME_RE.test(trimmed) || PROTOCOL_RELATIVE_RE.test(trimmed)) {
     return null;
@@ -206,11 +226,7 @@ export function sandboxFileForSrc(src: string): string | null {
     return null;
   }
   const parts = decoded.filter((segment) => segment !== ".");
-  const name = parts[parts.length - 1] ?? "";
-  const ext = name.slice(name.lastIndexOf(".")).toLowerCase();
-  // A `.csv` is a download card, not an `<img>`; leave it to the file cards.
-  if (!SANDBOX_INLINE_IMAGE_EXTS.has(ext)) return null;
-  return parts.join("/");
+  return parts.length > 0 ? parts.join("/") : null;
 }
 
 /**
@@ -264,4 +280,15 @@ export function sandboxFilePath(sessionId: string, filename: string): string {
     .join("/");
   const { prefix, query } = sandboxRoutePrefix(sessionId);
   return `${prefix}/${path}${query}`;
+}
+
+/** Route URL for a link to a tool-written file (a bare relative path would be blocked); null otherwise. */
+export function markdownSandboxLinkHref(
+  href: string,
+  ctx: { threadId: string | undefined; projectId: string | null | undefined },
+): string | null {
+  const file = sandboxFileForHref(href);
+  if (file === null) return null;
+  const sessionId = sandboxSessionInSrc(href) ?? sandboxSessionIdFor(ctx.threadId, ctx.projectId);
+  return sessionId ? sandboxFilePath(sessionId, file) : null;
 }
