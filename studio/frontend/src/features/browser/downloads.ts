@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+import { getLocale, translate } from "@/i18n";
 import { isTauri } from "@/lib/api-base";
 import { DownloadCancelledError, downloadFile, isDownloadCancelled } from "@/lib/native-files";
 import { toast } from "@/lib/toast";
 import { fileNameFromUrl, withBaseUrl } from "./address";
 import { type BrowserPage, fetchBrowserPage } from "./api";
 import { useBrowserHistoryStore } from "./history-store";
-import { saveNativeDownload } from "./native-downloads";
+import { type SavedNativeDownload, saveNativeDownload } from "./native-downloads";
 import { useBrowserPrefsStore } from "./prefs-store";
 
 export type BrowserDownload = { blob: Blob; name: string; contentType: string; url: string | null };
@@ -51,18 +52,21 @@ async function pickSaveTarget(name: string): Promise<SaveHandle | null> {
   }
 }
 
-/** Save a file from the panel and add it to the download history. `target` is a save location
- *  already picked, or null for none; left out, the dialog opens here when Settings asks. */
-export async function saveBrowserDownload(
-  { blob, name, contentType, url }: BrowserDownload,
-  target?: SaveHandle | null,
-): Promise<void> {
-  let saved: { id: string; name: string } | null = null;
+/** Save a file from the panel and add it to the download history; a file that runs code asks first.
+ *  `target` is a save location already picked, or null for none; left out, the dialog opens here
+ *  when Settings asks. */
+export async function saveBrowserDownload(download: BrowserDownload, target?: SaveHandle | null): Promise<void> {
+  const { isDangerousDownload, safeDownloadName } = await import("./download-safety");
+  const { blob, contentType, url } = download;
+  const name = safeDownloadName(download.name);
+  // Before any dialog: its Save anyway click is also the fresh click a save dialog needs.
+  if (isDangerousDownload(name) && !(await confirmDangerous(name))) return;
+  let saved: SavedNativeDownload | null = null;
   let picked: SaveHandle | null = null;
   try {
     if (isTauri) {
-      // The app keeps the path so Download history can reveal it.
-      saved = await saveNativeDownload(blob, name);
+      // The app keeps the path so Download history can reveal it, and marks the file with its source.
+      saved = await saveNativeDownload(blob, name, url);
       if (!saved) return;
     } else {
       picked = target === undefined ? await pickSaveTarget(name) : target;
@@ -78,12 +82,36 @@ export async function saveBrowserDownload(
     if (!isDownloadCancelled(error)) toast.error(error instanceof Error ? error.message : String(error));
     return;
   }
+  const savedName = saved?.name || picked?.name || name;
   useBrowserHistoryStore.getState().recordDownload({
-    name: saved?.name || picked?.name || name,
+    name: savedName,
     url,
     size: blob.size,
     contentType,
     nativeId: saved?.id,
+  });
+  if (saved?.marked === false) toast.warning(translate("browser.downloadSafety.notMarked", { name: savedName }, getLocale()));
+}
+
+let nextConfirm = 0;
+
+/** Resolves true on Save anyway; Cancel, closing or swiping it away is false. */
+function confirmDangerous(name: string): Promise<boolean> {
+  const t = (key: Parameters<typeof translate>[0]) => translate(key, { name }, getLocale());
+  return new Promise((resolve) => {
+    let answered = false;
+    const answer = (save: boolean) => {
+      if (answered) return;
+      answered = true;
+      resolve(save);
+    };
+    toast(t("browser.downloadSafety.savePrompt"), {
+      id: `browser-save-${nextConfirm++}`,
+      duration: Number.POSITIVE_INFINITY,
+      action: { label: t("browser.downloadSafety.saveAnyway"), onClick: () => answer(true) },
+      cancel: { label: t("browser.downloadSafety.cancel"), onClick: () => answer(false) },
+      onDismiss: () => answer(false),
+    });
   });
 }
 

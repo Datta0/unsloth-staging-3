@@ -5,18 +5,25 @@
 // opaque id to reveal the file or check it still exists.
 
 import { isTauri } from "@/lib/api-base";
-import { NATIVE_FILE_NAME_HEADER, encodeNativeFilename } from "@/lib/native-files";
+import { NATIVE_FILE_NAME_HEADER, NATIVE_FILE_SOURCE_HEADER, encodeNativeFilename } from "@/lib/native-files";
 
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const core = await import("@tauri-apps/api/core");
   return core.invoke<T>(command, args);
 }
 
-/** Save through the desktop app's dialog; the saved name and its id, or null if cancelled. */
-export async function saveNativeDownload(blob: Blob, name: string): Promise<{ id: string; name: string } | null> {
+/** A panel save: `marked` is false where the volume keeps no internet mark, null where nothing marks it. */
+export type SavedNativeDownload = { id: string; name: string; marked: boolean | null };
+
+/** Save through the desktop app's dialog; the saved name and its id, or null if cancelled. A web
+ *  source has the app mark the file as downloaded from the internet. */
+export async function saveNativeDownload(blob: Blob, name: string, source?: string | null): Promise<SavedNativeDownload | null> {
   const core = await import("@tauri-apps/api/core");
-  return core.invoke<{ id: string; name: string } | null>("browser_download_save", new Uint8Array(await blob.arrayBuffer()), {
-    headers: { [NATIVE_FILE_NAME_HEADER]: encodeNativeFilename(name) },
+  return core.invoke<SavedNativeDownload | null>("browser_download_save", new Uint8Array(await blob.arrayBuffer()), {
+    headers: {
+      [NATIVE_FILE_NAME_HEADER]: encodeNativeFilename(name),
+      ...(source ? { [NATIVE_FILE_SOURCE_HEADER]: encodeNativeFilename(source) } : {}),
+    },
   });
 }
 

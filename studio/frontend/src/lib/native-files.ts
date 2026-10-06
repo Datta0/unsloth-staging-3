@@ -5,6 +5,8 @@ import { isTauri } from "@/lib/api-base";
 import { decodeDataUri, isDataUri } from "@/lib/data-uri";
 
 export const NATIVE_FILE_NAME_HEADER = "x-unsloth-default-name";
+/** A web page a panel save came from: the desktop app marks the file as downloaded from the internet. */
+export const NATIVE_FILE_SOURCE_HEADER = "x-unsloth-source-url";
 const NATIVE_FILE_SAVE_TOKEN_HEADER = "x-unsloth-save-token";
 const NATIVE_FILE_CHUNK_BYTES = 8 * 1024 * 1024;
 export class DownloadCancelledError extends Error {

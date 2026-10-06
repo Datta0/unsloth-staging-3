@@ -35,6 +35,9 @@ pub fn new_browser_downloads() -> BrowserDownloads {
 pub struct SavedDownload {
     id: String,
     name: String,
+    /// Marked as downloaded from its web source: false on volumes that keep no mark, None when
+    /// nothing marks it (no source sent).
+    marked: Option<bool>,
 }
 
 fn store_path<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
@@ -137,7 +140,8 @@ pub async fn browser_download_save(
     request: tauri::ipc::Request<'_>,
 ) -> Result<Option<SavedDownload>, String> {
     crate::native_intents::ensure_main_window(&webview)?;
-    let Some(path) = crate::native_file_dialogs::save_request_with_dialog(&app, &request).await?
+    let Some((path, marked)) =
+        crate::native_file_dialogs::save_request_with_dialog(&app, &request).await?
     else {
         return Ok(None);
     };
@@ -148,6 +152,7 @@ pub async fn browser_download_save(
     Ok(Some(SavedDownload {
         id: record(&app, path),
         name,
+        marked,
     }))
 }
 

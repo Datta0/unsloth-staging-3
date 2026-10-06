@@ -29,3 +29,11 @@ export async function clearNativeBrowsingData(): Promise<void> {
     for (const listener of closedListeners) listener();
   }
 }
+
+/** An account switch is about to commit: the desktop app deletes the last account's downloads
+ * awaiting Keep and silences those still running. Clearing browsing data never does this. */
+export async function forgetNativeAccountDownloads(): Promise<void> {
+  if (!isTauri) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("browser_downloads_account_switched");
+}
