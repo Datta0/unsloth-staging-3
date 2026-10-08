@@ -415,6 +415,8 @@ def test_optional_loader_retries_with_gpu_init_disabled(monkeypatch):
 
     monkeypatch.setattr(importlib, "import_module", _fake_import)
     monkeypatch.delenv("UNSLOTH_ZOO_DISABLE_GPU_INIT", raising = False)
+    # The retry only runs on a host with no accelerator.
+    monkeypatch.setattr(shim, "_gpu_present", lambda: False)
 
     assert shim._load_optional("unsloth_zoo.hf_xet_tuning") is sentinel
     assert attempts == [None, "1"]
@@ -428,6 +430,9 @@ def test_optional_loader_returns_none_when_truly_absent(monkeypatch):
         raise ModuleNotFoundError(name)
 
     monkeypatch.setattr(importlib, "import_module", _always_fail)
+    # Truly absent: not even left in sys.modules by an earlier real import.
+    for name in ("unsloth_zoo.hf_xet_tuning", "unsloth_zoo.hf_xet_health"):
+        monkeypatch.delitem(sys.modules, name, raising = False)
     assert shim._load_optional("unsloth_zoo.hf_xet_tuning") is None
     # A missing module means "no opinion", never a hard failure.
     assert shim.xet_env_overrides() == {}
@@ -508,6 +513,8 @@ def test_gpu_init_override_is_serialized(monkeypatch):
         raise ModuleNotFoundError(name)
 
     monkeypatch.setattr(importlib, "import_module", _always_fail)
+    # The retry only runs on a host with no accelerator.
+    monkeypatch.setattr(shim, "_gpu_present", lambda: False)
 
     threads = [
         threading.Thread(target = shim._load_optional, args = ("unsloth_zoo.hf_xet_tuning",))
