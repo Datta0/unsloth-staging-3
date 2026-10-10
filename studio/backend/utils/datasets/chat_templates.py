@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 # Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
+"""Chat template utilities for dataset processing: apply chat templates to datasets and generate dataset info summaries."""
+
 import json
 import warnings as python_warnings
 
@@ -171,36 +173,110 @@ def _drop_none_values(value):
     return value
 
 
-def _json_cell(value):
-    if not isinstance(value, str):
-        return value
-    try:
-        return json.loads(value)
-    except ValueError:
-        return None
+def _sharegpt_tool_turns(conversation, content = "", probe = False):
+    """Map ShareGPT ``function_call`` / ``observation`` turns to OpenAI tool turns, and the
+    markers ``probe`` put in place of each call's arguments and each result; the conversation
+    itself when it has neither role."""
+    if not any(
+        isinstance(message, dict) and message.get("role") in ("observation", "function_call")
+        for message in conversation
+    ):
+        return conversation, []
+    turns = []
+    markers = []
+    result_ids = []
+    calls_made = 0
+    for index, message in enumerate(conversation):
+        role = message.get("role") if isinstance(message, dict) else None
+        if role == "observation":
+            message = {**message, "role": "tool"}
+            if result_ids:
+                message["tool_call_id"] = result_ids.pop(0)
+            if probe:
+                markers.append(f"unslothresult{len(markers)}end")
+                message["content"] = markers[-1]
+        elif role == "function_call":
+            try:
+                calls = json.loads(message.get("content"))
+            except (TypeError, ValueError, RecursionError):
+                calls = None
+            calls = calls if isinstance(calls, list) else [calls]
+            if calls and all(isinstance(call, dict) and call.get("name") for call in calls):
+                tool_calls = []
+                for call in calls:
+                    arguments = call.get("arguments", {})
+                    # A JSON string keeps explicit nulls through _drop_none_values.
+                    if not isinstance(arguments, str):
+                        arguments = json.dumps(arguments, ensure_ascii = False)
+                    name = call["name"]
+                    if probe:
+                        markers.append(f"unslothname{len(markers)}end")
+                        name = markers[-1]
+                        markers.append(f"unslothcall{len(markers)}end")
+                        arguments = json.dumps({"probe": markers[-1]})
+                    calls_made += 1
+                    tool_calls.append(
+                        {
+                            # Nine alphanumerics, as Mistral requires.
+                            "id": f"call{calls_made:05d}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    )
+                message = {"role": "assistant", "content": content, "tool_calls": tool_calls}
+                results = 0
+                for later in conversation[index + 1 :]:
+                    if not (isinstance(later, dict) and later.get("role") == "observation"):
+                        break
+                    results += 1
+                # Results pair with calls by position only when there is one per call.
+                result_ids = [call["id"] for call in tool_calls] if results == len(calls) else []
+        turns.append(message)
+    return turns, markers
 
 
-def _row_tools(tools):
-    if isinstance(tools, list):
-        tools = [tool if isinstance(tool, str) else _drop_none_values(tool) for tool in tools]
-    else:
-        tools = _json_cell(tools)
-    if not isinstance(tools, list):
-        return None
-    tools = [_json_cell(tool) for tool in tools]
-    if not tools or not all(isinstance(tool, dict) for tool in tools):
-        return None
-    normalized = []
-    for tool in tools:
-        if tool.get("type") is None and isinstance(tool.get("function"), dict):
-            tool = {**tool, "type": "function"}
-        elif "function" not in tool and "name" in tool:
-            tool = {"type": "function", "function": tool}
-        normalized.append(tool)
-    return normalized
+def _one_call_per_message(turns):
+    # Results stay where they are: interleaving them would reorder the source, and a shared
+    # result cannot be split.
+    split = []
+    for message in turns:
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if calls and len(calls) > 1:
+            split.extend(
+                {**message, "tool_calls": [call], "content": message["content"] if not i else ""}
+                for i, call in enumerate(calls)
+            )
+        else:
+            split.append(message)
+    return split if len(split) != len(turns) else turns
 
 
-def _render_conversation(tokenizer, conversation, tools = None, fallback_without_tools = True):
+def _render_conversation(tokenizer, conversation):
+    candidates = []
+    # None content for templates that render calls only then (DeepSeek); one call per message
+    # for templates taking no more (Llama 3.x, gpt-oss).
+    for content in ("", None):
+        turns, _ = _sharegpt_tool_turns(conversation, content)
+        if turns is conversation:
+            break
+        probe, markers = _sharegpt_tool_turns(conversation, content, probe = True)
+        candidates.append((turns, probe, markers))
+        split = _one_call_per_message(turns)
+        if split is not turns:
+            candidates.append((split, _one_call_per_message(probe), markers))
+    for turns, probe, markers in candidates:
+        # The markers show every call name, arguments and result survived: templates may ignore
+        # tool_calls (plain ChatML), drop tool turns, or render only the first call (gpt-oss).
+        try:
+            shown = _render_messages(tokenizer, probe)
+            if all(marker in shown for marker in markers):
+                return _render_messages(tokenizer, turns)
+        except Exception:
+            pass
+    return _render_messages(tokenizer, conversation)
+
+
+def _render_messages(tokenizer, conversation):
     from core.inference.chat_template_helpers import _normalize_tool_call_arguments
 
     attempts = []
