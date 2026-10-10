@@ -118,6 +118,11 @@ def _set_job(
 def _progress(conn, job_id: str, stage: str, progress: float) -> None:
     if account_is_retired():
         raise job_leases.JobLeaseLost("Account is retired")
+    # An unlink stops a linked-folder document mid-embed, not after it (folder_sync imports this module).
+    from . import folder_sync
+
+    if folder_sync.is_cancel_requested(getattr(folder_sync._worker_state, "folder_id", None)):
+        raise job_leases.JobLeaseLost("Linked folder was removed")
     if not job_leases.renew_owned(conn, job_leases.INGESTION, job_id):
         raise job_leases.JobLeaseLost("Ingestion job lease was reclaimed")
     _set_job(conn, job_id, status = "running", stage = stage, progress = progress)
