@@ -1745,6 +1745,10 @@ export function SharedComposer({
                 gpu_layers: effectiveGpuLayers,
                 // Slots scale the KV estimate; keep validate sized like the load.
                 n_parallel: ownConfig.nParallel ?? null,
+                ...(ownConfig.useModelIni && !resolvedIsDiffusion
+                  ? // biome-ignore lint/style/useNamingConvention: API schema
+                    { use_model_ini: true }
+                  : {}),
                 reasoning_budget: resolvedIsDiffusion
                   ? -1
                   : ownConfig.reasoningBudget,
@@ -1858,6 +1862,10 @@ export function SharedComposer({
                 ...(ownConfig.llamaExtraArgs !== undefined
                   ? // biome-ignore lint/style/useNamingConvention: API schema
                     { llama_extra_args: ownConfig.llamaExtraArgs ?? [] }
+                  : {}),
+                ...(ownConfig.useModelIni && !resolvedIsDiffusion
+                  ? // biome-ignore lint/style/useNamingConvention: API schema
+                    { use_model_ini: true }
                   : {}),
                 ...(ownConfig.nBatch != null
                   ? { n_batch: ownConfig.nBatch }
@@ -2003,6 +2011,8 @@ export function SharedComposer({
           // Adopted from the echo like the knob above: this pane loaded its own model, so the editable
           // value must follow it or Advanced Settings shows the other pane's Vision state.
           disableVision: resp.disable_vision ?? false,
+          useModelIni: resp.model_ini_applied === true,
+          loadedModelIni: resp.model_ini_applied === true,
           defaultChatTemplate: resp.chat_template ?? null,
           chatTemplateOverride: effectiveChatTemplateOverride,
           loadedChatTemplateOverride: effectiveChatTemplateOverride,

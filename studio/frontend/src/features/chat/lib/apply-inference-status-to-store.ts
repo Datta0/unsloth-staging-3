@@ -15,6 +15,7 @@ import { modelDisplayName } from "@/features/hub/lib/model-identity";
 import { getInferenceStatus } from "../api/chat-api";
 import { isSpeechOnlyStatus } from "./speech-only-status";
 import {
+  layersQwenThinkingDefaults,
   mergeBackendRecommendedInference,
   replayMaxTokensCap,
 } from "../presets/preset-policy";
@@ -522,6 +523,17 @@ export function applyActiveModelStatusToStore(
           tensorParallel: status.tensor_parallel,
         }),
       }),
+    // Seeded like tensorParallel: a tab that never performed the load must not show the .ini
+    // switch off over a server launched with it, or its next Reload drops the file.
+    ...(seedLoadParams &&
+      status.model_ini_applied !== undefined && {
+        loadedModelIni: status.model_ini_applied,
+        ...((prevState.loadedModelIni === null ||
+          hydratingExistingModel ||
+          prevState.useModelIni === prevState.loadedModelIni) && {
+          useModelIni: status.model_ini_applied,
+        }),
+      }),
     // A load knob like tensorParallel above. Without a reseed a tab that never performed the
     // load shows Vision ON over a projector-off server and the next Reload puts it back.
     // Seeded from disable_vision, the request the load ran with, not vision_disabled_by_user,
@@ -765,7 +777,10 @@ export function applyActiveModelStatusToStore(
       checkpointId,
       reasoningAlwaysOn || current.reasoningEnabled,
     );
-    if (qwenParams !== null && current.activePresetSource === "builtin-default") {
+    if (
+      qwenParams !== null &&
+      layersQwenThinkingDefaults(current.activePresetSource, status.model_ini_sampling)
+    ) {
       current.setParams(
         { ...current.params, ...qwenParams },
         {

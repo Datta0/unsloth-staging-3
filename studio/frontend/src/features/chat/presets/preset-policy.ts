@@ -274,6 +274,7 @@ interface BackendInferenceDefaults {
   top_k?: number;
   min_p?: number;
   presence_penalty?: number;
+  repetition_penalty?: number;
   trust_remote_code?: boolean;
 }
 
@@ -281,6 +282,15 @@ export interface BackendInferenceEnvelope {
   is_gguf?: boolean;
   context_length?: number | null;
   inference?: BackendInferenceDefaults | null;
+}
+
+/** Whether the Qwen3 thinking table may be laid over a load's defaults. Not when the model's unsloth.ini
+ *  set sampling: those values are already in `inference`, and the table would replace them. */
+export function layersQwenThinkingDefaults(
+  presetSource: ChatPresetSource,
+  modelIniSampling: boolean | null | undefined,
+): boolean {
+  return presetSource === "builtin-default" && modelIniSampling !== true;
 }
 
 export function mergeBackendRecommendedInference({
@@ -330,6 +340,9 @@ export function mergeBackendRecommendedInference({
     presencePenalty:
       toFiniteNumber(inference?.presence_penalty) ??
       defaultInferenceParams.presencePenalty,
+    // Only an unsloth.ini reports it; absent, the slider keeps its value as before.
+    repetitionPenalty:
+      toFiniteNumber(inference?.repetition_penalty) ?? next.repetitionPenalty,
   };
 }
 
