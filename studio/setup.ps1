@@ -8760,6 +8760,18 @@ if ($WinArm64Venv -and $WinArm64EffectiveTorchIndexUrl) {
 }
 # <3.7 everywhere except Windows on ARM, whose first win_arm64 wheel is 3.8.0.post28.
 $_tritonSpec = if ($WinArm64Venv) { "triton-windows>=3.8.0.post28" } else { "triton-windows<3.7" }
+# triton-windows: torch 2.13 -> 3.7, 2.14 -> 3.8, older keeps <3.7.
+function Get-TritonWindowsSpec {
+    param([string]$TorchVersion, [bool]$WinArm64 = $false)
+    if ($WinArm64) { return "triton-windows>=3.8.0.post28" }
+    if ($TorchVersion -match '^2\.(\d+)\.') {
+        switch ([int]$Matches[1]) {
+            13 { return "triton-windows>=3.7,<3.8" }
+            14 { return "triton-windows>=3.8,<3.9" }
+        }
+    }
+    return "triton-windows<3.7"
+}
 # The win_arm64 index publishes only the trio, so a dependency index rides beside it (the caller's configured one, public PyPI by default). Not gated on $UseUv: pip needs the extra index too.
 $WinArm64IndexArgs = if ($WinArm64Venv) {
     $_woaResolver = if ($UseUv) { "uv" } else { "pip" }
@@ -8808,7 +8820,7 @@ if ($ROCmIndexUrl) {
         if (-not ($ROCmTorchSpec -match 'torch>=2\.11' -and $_keptMinor -lt 11)) {
             $ROCmTorchSpec  = "torch==$($env:UNSLOTH_KEPT_TORCH)"
             $ROCmVisionSpec = "torchvision==0.$($_keptMinor + 15).*"
-            $ROCmAudioSpec  = "torchaudio==2.$($_keptMinor).*"
+            $ROCmAudioSpec  = "torchaudio==2.$([Math]::Min($_keptMinor, 11)).*"
             $_rocmKeptActive = $true
         }
     }
@@ -8972,7 +8984,7 @@ if (-not $ROCmIndexUrl -and -not $XpuIndexUrl -and ($CuTag -eq "cpu" -or $ROCmCp
         $_keptMinor = [int](($env:UNSLOTH_KEPT_TORCH -split '\.')[1])
         $cpuTorchSpec  = "torch==$($env:UNSLOTH_KEPT_TORCH)"
         $cpuVisionSpec = "torchvision==0.$($_keptMinor + 15).*"
-        $cpuAudioSpec  = "torchaudio==2.$($_keptMinor).*"
+        $cpuAudioSpec  = "torchaudio==2.$([Math]::Min($_keptMinor, 11)).*"
         $_cpuKeptActive = $true
     }
     while ($true) {
@@ -9026,12 +9038,19 @@ if (-not $ROCmIndexUrl -and -not $XpuIndexUrl -and ($CuTag -eq "cpu" -or $ROCmCp
     # Release preservation: keep the same release across re-runs (+cuXXX follows this index).
     # Not on win_arm64: the kept release is one NVIDIA's channel does not publish.
     $_cudaKeptActive = $false
-    $_cudaOrigTorch = $cudaTorchSpec; $_cudaOrigVision = $cudaVisionSpec; $_cudaOrigAudio = $cudaAudioSpec
-    if (-not $WinArm64Venv -and $env:UNSLOTH_KEPT_TORCH -match '^\d+\.\d+(\.\d+)?$') {
-        $_keptMinor = [int](($env:UNSLOTH_KEPT_TORCH -split '\.')[1])
-        $cudaTorchSpec = "torch==$($env:UNSLOTH_KEPT_TORCH)"
+    $_cudaKeptRelease = $env:UNSLOTH_KEPT_TORCH
+    # A forced reinstall (pin change, failed import) with no installer handoff, e.g. `studio update`
+    # or the startup repair, keeps the resident release like install.sh; UPGRADE=1 asks for newer.
+    if (-not $WinArm64Venv -and -not $_cudaKeptRelease -and $cudaForce.Count -gt 0 -and $env:UNSLOTH_TORCH_UPGRADE -ne "1") {
+        $_residentProbe = Invoke-BoundedPythonProbe -PythonExe "python" -Code "import importlib.metadata as m; print(m.version('torch'))"
+        if ($_residentProbe.Ok -and ($_residentProbe.Output -match '(?m)^(2\.\d+\.\d+)(\+\S*)?\s*$')) { $_cudaKeptRelease = $Matches[1] }
+    }
+    if (-not $WinArm64Venv -and $_cudaKeptRelease -match '^\d+\.\d+(\.\d+)?$') {
+        $_keptMinor = [int](($_cudaKeptRelease -split '\.')[1])
+        $cudaTorchSpec = "torch==$_cudaKeptRelease"
         $cudaVisionSpec = "torchvision==0.$($_keptMinor + 15).*"
-        $cudaAudioSpec = "torchaudio==2.$($_keptMinor).*"
+        # torchaudio 2.11 is the last release (stable ABI), so newer torch minors pair with it.
+        $cudaAudioSpec = "torchaudio==2.$([Math]::Min($_keptMinor, 11)).*"
         $_cudaKeptActive = $true
     }
     while ($true) {
@@ -9089,8 +9108,9 @@ if (-not $ROCmIndexUrl -and -not $XpuIndexUrl -and ($CuTag -eq "cpu" -or $ROCmCp
             foreach ($_woaCutoffName in @($_woaCutoffSaved.Keys)) { Set-Item "Env:$_woaCutoffName" $_woaCutoffSaved[$_woaCutoffName] }
         }
         if ($torchInstallExit -eq 0 -or -not $_cudaKeptActive) { break }
-        substep "[WARN] torch==$($env:UNSLOTH_KEPT_TORCH) not installable from this CUDA index -- using the supported release" "Yellow"
-        $cudaTorchSpec = $_cudaOrigTorch; $cudaVisionSpec = $_cudaOrigVision; $cudaAudioSpec = $_cudaOrigAudio
+        substep "[WARN] torch==$_cudaKeptRelease not installable from this CUDA index -- using the supported release" "Yellow"
+        # The bounded default trio, as install.sh's fallback: a bare spec would take the newest torch.
+        $cudaTorchSpec = "torch>=2.4,<2.12.0"; $cudaVisionSpec = "torchvision>=0.19,<0.27.0"; $cudaAudioSpec = "torchaudio>=2.4,<2.12.0"
         Remove-Item Env:UNSLOTH_KEPT_TORCH -ErrorAction SilentlyContinue
         $_cudaKeptActive = $false
     }
@@ -9121,7 +9141,13 @@ if (-not $ROCmIndexUrl -and -not $XpuIndexUrl -and ($CuTag -eq "cpu" -or $ROCmCp
         }
     }
 
-    # Triton for Windows enables torch.compile (without it training can hang).
+    # Triton for Windows enables torch.compile (without it training can hang). Paired with the
+    # installed torch, read from metadata.
+    $_tritonTorchProbe = Invoke-BoundedPythonProbe -PythonExe "python" -Code "import importlib.metadata as m; print(m.version('torch'))"
+    if ($_tritonTorchProbe.Ok) {
+        $_tritonTorchVer = @($_tritonTorchProbe.Output -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        if ($_tritonTorchVer.Count -gt 0) { $_tritonSpec = Get-TritonWindowsSpec -TorchVersion $_tritonTorchVer[-1] -WinArm64 ([bool]$WinArm64Venv) }
+    }
     substep "installing Triton for Windows..."
     if ($script:UnslothVerbose) {
         Fast-Install $_tritonSpec
