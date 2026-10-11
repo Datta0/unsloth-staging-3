@@ -110,6 +110,10 @@ import {
 } from "../search-images/search-images";
 import { parseParamCountB } from "@/lib/model-size";
 import { createLoadingToastIcon, toast } from "@/lib/toast";
+import {
+  type AdmissionStatus,
+  admissionStatusLabel,
+} from "../utils/admission-status";
 import { notifyPromptQueueRunFailed } from "../utils/prompt-queue-boundary";
 import {
   providerCompactionConnectionKey,
@@ -351,6 +355,7 @@ import { resolveLoadMaxSeqLength } from "../presets/preset-policy";
 import type { CachedGgufRepo, CachedModelRepo } from "./chat-api";
 import {
   budgetImpliesTruncation,
+  completedAfterGivingUp,
   CONTINUE_INSTRUCTION,
   continuationSeed,
   createContinuationMerger,
@@ -358,6 +363,7 @@ import {
   incompleteLabel,
   incompleteReasonAfterError,
   type IncompleteReason,
+  isPreemptGaveUp,
   isRestart,
   noteRunStartedThisSession,
   readIncompleteInfo,
@@ -5896,6 +5902,11 @@ export function createOpenAIStreamAdapter(
       };
       let codexRoundToolCallIds: string[] = [];
       let contextTruncation: OpenAIChatChunk["context_truncated"];
+      // The server re-prefilled this answer after a park it could not hold: persisted with the
+      // message, so the chip's note survives a reload and follows the thread's last answer.
+      // Seeded from the answer this continues, so a later round that was not recomputed does
+      // not clear it off the joined answer.
+      let sawPreemptRecompute = continuation?.preemptRecomputed === true;
       let providerCompaction: ProviderCompactionContentPart | undefined =
         continuationCompaction ?? undefined;
       let providerCompactionAfterToolCalls: number | undefined =
@@ -5927,6 +5938,7 @@ export function createOpenAIStreamAdapter(
         openaiCodexReasoning: codexReasoningLedger,
         openaiResponsesReasoning: openAIResponsesReasoningLedger,
         contextTruncation,
+        preemptRecomputed: sawPreemptRecompute || undefined,
         providerCompaction,
         providerCompactionAfterToolCalls,
         providerCompactionProviderType,
@@ -5952,6 +5964,9 @@ export function createOpenAIStreamAdapter(
       });
       // Why this turn stopped early. Drives the Continue affordance.
       let incompleteReason: IncompleteReason | null = null;
+      // Latched here rather than read off the last chunk, because the notice arrives before
+      // the terminal chunk and that chunk's `length` would otherwise be the last word.
+      let preemptGaveUp = false;
       // MLX reports finish_reason "stop" even at the cap, so an exhausted budget is its only truncation signal.
       let requestedMaxTokens: number | undefined;
       // Served window: null if unknown, Infinity if only the output cap can bind.
@@ -7235,6 +7250,27 @@ export function createOpenAIStreamAdapter(
                 responseModelId = chunkModel;
               }
 
+              // Queued for a slot, or paused so another chat can finish. Neither is an error and
+              // neither produces a token, so without a line on screen both look like a wedged
+              // backend. Via setToolStatus, which handles two runs sharing the "__default" key.
+              const admissionStatus = (
+                chunk as unknown as { _admissionStatus?: AdmissionStatus }
+              )._admissionStatus;
+              if (admissionStatus !== undefined) {
+                if (admissionStatus === "recomputed") {
+                  // Qualifies the resume before it, so the status line stays as it is.
+                  // Reaches the chip through the message metadata below, per branch.
+                  sawPreemptRecompute = true;
+                  continue;
+                }
+                runtime.setToolStatus(
+                  liveThreadKey(serverCancel),
+                  admissionStatusLabel(admissionStatus),
+                  serverCancel,
+                );
+                continue;
+              }
+
               const toolStatusText = (
                 chunk as unknown as { _toolStatus?: string }
               )._toolStatus;
@@ -7262,6 +7298,9 @@ export function createOpenAIStreamAdapter(
                   contextTruncation,
                   chunk.context_truncated,
                 );
+                if (isPreemptGaveUp(chunk.context_truncated)) {
+                  preemptGaveUp = true;
+                }
                 const activeThreadId = useChatRuntimeStore.getState().activeThreadId;
                 // What must stay silent is a fit that returned the ORIGINAL messages: "older turns were
                 // removed" would be untrue and burns the once-per-thread flag. Not `fits`, which is also
@@ -7800,6 +7839,11 @@ export function createOpenAIStreamAdapter(
                 incompleteReason = "length";
               } else if (chunk.choices?.[0]?.finish_reason) {
                 incompleteReason = null;
+                if (completedAfterGivingUp(chunk.choices[0].finish_reason)) {
+                  // The give-up latch too, not just the reason it set: a tool run that gave up
+                  // breaks into the final pass, which can finish, and the override is unconditional.
+                  preemptGaveUp = false;
+                }
               }
               // Latch the chunk's `model` field so the openrouter/free chip shows the underlying model.
               if (
@@ -8657,6 +8701,12 @@ export function createOpenAIStreamAdapter(
           );
         }
 
+        // A turn the backend gave up on is `paused`, not `length`: it ends on `length` because that
+        // is the shape a continuation resumes from, but `paused` also refuses the AUTOMATIC one.
+        if (preemptGaveUp) {
+          incompleteReason = "paused";
+        }
+
         // Before the lookup below: its network time is not generation time.
         const finishedAt = Date.now();
 
@@ -8784,6 +8834,7 @@ export function createOpenAIStreamAdapter(
               openaiCodexReasoning: codexReasoningLedger,
               openaiResponsesReasoning: openAIResponsesReasoningLedger,
               contextTruncation,
+              preemptRecomputed: sawPreemptRecompute || undefined,
               providerCompaction,
               providerCompactionAfterToolCalls,
               providerCompactionProviderType,
