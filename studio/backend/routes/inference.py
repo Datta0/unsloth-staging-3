@@ -36503,6 +36503,16 @@ async def loaded_inference_models(current_subject: str = Depends(get_current_sub
     return {"object": "list", "data": [{**entry, "loaded": True} for entry in models]}
 
 
+async def _openai_catalog_with_aliases() -> list[dict]:
+    from utils.model_aliases import alias_model_objects
+
+    objects = await _openai_catalog_objects()
+    aliases = await asyncio.to_thread(alias_model_objects, objects, _pinned_quant_object)
+    # The rewrite gives an alias precedence, so a same-named model row would never be served.
+    shadowed = {row["id"].lower() for row in aliases}
+    return [o for o in objects if str(o.get("id", "")).lower() not in shadowed] + aliases
+
+
 # Some OpenAI-compatible clients (notably DEVONthink) probe ``/v1/models/``
 # literally and do not follow FastAPI's automatic slash redirect. Register the
 # slash form directly so model discovery reaches authentication and returns the
@@ -36522,10 +36532,10 @@ async def openai_list_models(
     """
     wanted = {m.strip() for m in (output_modalities or "").split(",")}
     if not wanted & {"all", "decisions"}:
-        return {"object": "list", "data": await _openai_catalog_objects()}
+        return {"object": "list", "data": await _openai_catalog_with_aliases()}
     from routes.systemone import decision_model_objects
 
-    data = [] if wanted == {"decisions"} else await _openai_catalog_objects()
+    data = [] if wanted == {"decisions"} else await _openai_catalog_with_aliases()
     data += await asyncio.to_thread(decision_model_objects)
     return {"object": "list", "data": data}
 
@@ -36594,13 +36604,17 @@ async def openai_retrieve_model(model_id: str, current_subject: str = Depends(ge
     # the full catalog -- which may hit the filesystem -- for unloaded ids. Match
     # case-insensitively, like the catalog loop below and the resolver's index.
     # Off-loop like the catalog helper, and for the same sync resolver-index work.
+    from utils.model_aliases import resolve_model_alias
+
     _loaded = await asyncio.to_thread(_openai_model_objects)
-    for entry in _loaded:
+    # An alias wins over a same-named loaded model, as the request rewrite does.
+    aliased = await asyncio.to_thread(resolve_model_alias, model_id)
+    for entry in [] if aliased else _loaded:
         eid = entry["id"]
         if isinstance(eid, str) and eid.lower() == model_id.lower():
             return {**entry, "loaded": True}
 
-    objects = await _openai_catalog_objects()
+    objects = await _openai_catalog_with_aliases()
     for model in objects:
         # Case-insensitive to match the resolver, which lowercases its index.
         mid = model.get("id")
