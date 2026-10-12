@@ -25,6 +25,7 @@ export type IncompleteReason =
   | "cancelled"
   | "interrupted"
   | "context_window"
+  | "paused"
   | "empty"
   | "quote_cut";
 
@@ -52,6 +53,7 @@ const INCOMPLETE_REASONS: readonly IncompleteReason[] = [
   "cancelled",
   "interrupted",
   "context_window",
+  "paused",
   "empty",
   "quote_cut",
 ];
@@ -91,7 +93,9 @@ export function incompleteReasonAfterError(
 export function isProviderReportedReason(
   reason: IncompleteReason | null | undefined,
 ): boolean {
-  return reason === "context_window";
+  // `paused` too: it has no assistant-ui status of its own, so a reload would relabel it
+  // "Response stopped", which reads as something the user did. The stamp wins.
+  return reason === "context_window" || reason === "paused";
 }
 
 /** Read the incomplete marker off an assistant message's metadata. */
@@ -110,8 +114,10 @@ export function readIncompleteInfo(metadata: unknown): IncompleteInfo | null {
 }
 
 /** assistant-ui's reason for each of ours. `length` is a truthful stop, not a failure: mapping it
- *  to `error` paints a red box and a Retry button over a turn that already offers the Continue
- *  bar. `interrupted` keeps `error` on purpose, since a cut stream must be told about. */
+ *  to `error` paints a red box and a Retry over a turn that already offers the Continue bar.
+ *  `interrupted` keeps `error` on purpose, a cut stream needing to be told about. `paused` takes
+ *  `cancelled`, assistant-ui having no value for it: neither an error box over a healthy turn nor
+ *  a false claim that Max Tokens was reached. */
 const STATUS_REASON: Record<
   IncompleteReason,
   "cancelled" | "length" | "error"
@@ -120,6 +126,7 @@ const STATUS_REASON: Record<
   length: "length",
   interrupted: "error",
   context_window: "length",
+  paused: "cancelled",
   // Not `cancelled`: the bar reads that status as a real Stop and drops the stamped
   // reason, losing the explanation on reload. `context_window` maps here for the same
   // reason. Not `error` either, which would paint a red box over the bar.
@@ -143,6 +150,9 @@ const INCOMPLETE_LABELS: Record<IncompleteReason, string> = {
   cancelled: "Response stopped",
   interrupted: "Response interrupted",
   context_window: "Response filled the model's context window",
+  // No failure vocabulary: nothing went wrong, the model was shared out. Deliberately does not
+  // promise text, the backend being able to give up before the first token.
+  paused: "Response paused while another chat used the model, and did not get it back",
   empty: "The model returned an empty response",
   quote_cut: "This response may have ended early",
 };
@@ -166,6 +176,23 @@ const INCOMPLETE_REMEDIES: Partial<Record<IncompleteReason, string>> = {
 /** What to do about a turn that stopped early, or `null` when resuming is the answer. */
 export function incompleteRemedy(reason: IncompleteReason): string | null {
   return INCOMPLETE_REMEDIES[reason] ?? null;
+}
+
+/** The way out where resuming would be the answer but the turn cannot be resumed: a paused
+ *  tool turn holds calls a continuation cannot replay, and with no remedy and no Resume the
+ *  bar showed nothing, so the pause went unexplained. */
+const UNRESUMABLE_REMEDIES: Partial<Record<IncompleteReason, string>> = {
+  paused: "Regenerate the response once the other chat finishes",
+};
+
+/** `incompleteRemedy`, falling back to the unresumable one when the turn cannot resume. */
+export function incompleteRemedyFor(
+  reason: IncompleteReason,
+  canResume: boolean,
+): string | null {
+  return (
+    incompleteRemedy(reason) ?? (canResume ? null : (UNRESUMABLE_REMEDIES[reason] ?? null))
+  );
 }
 
 /** Drop text the continuation repeated from the end of the partial: local models continue
@@ -255,13 +282,18 @@ export function budgetImpliesTruncation({
   );
 }
 
-/** Mirrors the backend guard: tool calls block; reasoning-only needs `thought`. */
+/** Mirrors the backend guard: tool calls block; reasoning-only needs `thought`.
+ *
+ *  `allowEmpty` drops the requirement that there BE text, and nothing else. Its one caller is the
+ *  Continue bar on a turn the backend gave up on: a chat evicted while still prefilling never
+ *  produced a token, and that must not render as a blank bubble with nothing to do. */
 export function isContinuableContent(
   content: readonly unknown[] | undefined,
   {
     thought = false,
     replay = false,
-  }: { thought?: boolean; replay?: boolean } = {},
+    allowEmpty = false,
+  }: { thought?: boolean; replay?: boolean; allowEmpty?: boolean } = {},
 ): boolean {
   if (!content) {
     return replay;
@@ -285,7 +317,7 @@ export function isContinuableContent(
     }
     return false;
   }
-  return hasText || (thought && hasReasoning) || replay;
+  return hasText || (thought && hasReasoning) || replay || allowEmpty;
 }
 
 /** Reasoning is kept only when it all precedes the answer, as reasoning_content does. */
@@ -316,6 +348,35 @@ export function continuationSeed(partial: string, thought: string): string {
     return partial;
   }
   return partial ? `<think>${thought}</think>${partial}` : `<think>${thought}`;
+}
+
+/** The `reason` the backend stamps on a `context_truncated` event when it stopped waiting for
+ *  room in the shared KV cache. Not a truncation: that event carries it because it is the one
+ *  event that reaches this client on every surface. */
+export const PREEMPT_GAVE_UP_REASON = "preempt_gave_up";
+
+/** Whether a `context_truncated` payload is that signal rather than a fit. */
+export function isPreemptGaveUp(
+  truncation: { reason?: string } | null | undefined,
+): boolean {
+  return truncation?.reason === PREEMPT_GAVE_UP_REASON;
+}
+
+/** Whether a terminal `finish_reason` says the answer FINISHED, so an earlier give-up no longer
+ *  describes how this turn ended: a tool run that gave up breaks into the final answering pass,
+ *  which usually still writes the reply. `length` is excluded, being the shape a give-up ends on. */
+export function completedAfterGivingUp(
+  finishReason: string | null | undefined,
+): boolean {
+  return Boolean(finishReason) && finishReason !== "length";
+}
+
+/** Reasons a turn may offer Continue with no text behind it. Only `paused` does, being the only
+ *  reason the backend can raise before the first token. */
+export function resumesWithoutText(
+  reason: IncompleteReason | null | undefined,
+): boolean {
+  return reason === "paused";
 }
 
 /** The newest Gemini text-part thoughtSignature on an assistant turn, carried so the resumed turn
@@ -405,6 +466,11 @@ export type ContinuationRequest = {
   providerCompactionProviderType?: string;
   providerCompactionModelId?: string;
   providerCompactionConnectionKey?: string;
+  /** The answer being continued was re-prefilled after a park, so the joined answer was too. */
+  preemptRecomputed?: boolean;
+  /** Every model a re-prefill of the joined answer happened on, kept when Continue runs on
+   *  another: each part was recomputed on its own. */
+  preemptRecomputedModelIds?: string[];
 };
 
 type ProviderCompactionContinuationFields = Pick<
@@ -482,6 +548,7 @@ export function readContinuationRequest(
         providerCompactionProviderType?: unknown;
         providerCompactionModelId?: unknown;
         providerCompactionConnectionKey?: unknown;
+        preemptRecomputed?: unknown;
       }
     | undefined;
   const partial = typeof request?.partial === "string" ? request.partial : "";
@@ -521,14 +588,62 @@ export function readContinuationRequest(
     ...(answerParts.length > 0 ? { answerParts } : {}),
     ...(geminiReplayTurns.length > 0 ? { geminiReplayTurns } : {}),
     ...providerCompactionFields(request),
+    ...preemptRecomputedField(request),
   };
+}
+
+/** The models an answer's re-prefills happened on, as recorded; a message saved with the single
+ *  `preemptRecomputedModelId` reads as that one. */
+export function recomputedModelIds(value: unknown): string[] {
+  const fields = value as
+    | { preemptRecomputedModelIds?: unknown; preemptRecomputedModelId?: unknown }
+    | undefined;
+  const listed = Array.isArray(fields?.preemptRecomputedModelIds)
+    ? fields.preemptRecomputedModelIds
+    : [fields?.preemptRecomputedModelId];
+  return listed.reduce<string[]>(
+    (ids, id) => (typeof id === "string" && id ? withRecomputedModel(ids, id) : ids),
+    [],
+  );
+}
+
+/** `ids` with `modelId` added, once. */
+export function withRecomputedModel(ids: string[], modelId: string | null | undefined): string[] {
+  return !modelId || ids.includes(modelId) ? ids : [...ids, modelId];
+}
+
+function preemptRecomputedField(
+  value: unknown,
+): { preemptRecomputed?: true; preemptRecomputedModelIds?: string[] } {
+  if ((value as { preemptRecomputed?: unknown } | undefined)?.preemptRecomputed !== true) {
+    return {};
+  }
+  const modelIds = recomputedModelIds(value);
+  return modelIds.length > 0
+    ? { preemptRecomputed: true, preemptRecomputedModelIds: modelIds }
+    : { preemptRecomputed: true };
+}
+
+/** The recompute fields a Continue carries forward, read off the message being continued. */
+export function readPreemptRecomputedFields(
+  metadata: unknown,
+): { preemptRecomputed?: true; preemptRecomputedModelIds?: string[] } {
+  return preemptRecomputedField((metadata as { custom?: unknown } | undefined)?.custom);
+}
+
+/** Whether a message's answer was re-prefilled after a park, as its metadata records it. */
+export function readPreemptRecomputed(metadata: unknown): boolean {
+  return preemptRecomputedField((metadata as { custom?: unknown } | undefined)?.custom)
+    .preemptRecomputed === true;
 }
 
 /** Resuming a Max Tokens cut WITHOUT asking: hitting the cap is not a decision the user made.
  *  Every other reason is left alone, since `cancelled` would restart what the user just
  *  stopped, `interrupted` can hide a broken link, and `context_window` has no room left to
  *  resume into. Bounded, because a model that will not stop would loop forever and each round
- *  drives compaction harder. */
+ *  drives compaction harder. `paused` is refused, pinned by a test: a pause is the backend
+ *  rationing one KV cache and it resumes in place, so a client continuation would ask for a
+ *  SECOND slot. */
 export const AUTO_CONTINUE_LIMIT = 3;
 
 /** Rounds already spent per logical turn, keyed by the parent the continuation hangs off: a
