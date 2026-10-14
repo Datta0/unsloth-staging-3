@@ -1340,3 +1340,5 @@ jobs:
             logs/studio-indicator-*.log
             logs/indicator-*.out
           retention-days: 1
+
+# seed restore probe
