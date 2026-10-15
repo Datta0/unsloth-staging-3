@@ -13,7 +13,6 @@ const ModelsPage = lazyRouteComponent(
   "ModelsPage",
 );
 
-// Discover capability filters a link can preselect.
 const HUB_CAPABILITIES: readonly CapabilityKey[] = [
   "reasoning",
   "vision",
