@@ -119,3 +119,6 @@ def test_the_merged_job_did_not_absorb_the_two_long_jobs():
     """inference-smoke and no-vs-cpu stay separate; merged, they would queue behind seconds-long checks."""
     jobs = yaml.safe_load(WORKFLOW.read_text(encoding = "utf-8"))["jobs"]
     assert {"inference-smoke", "no-vs-cpu"} <= set(jobs), sorted(jobs)
+
+
+# staging base arm
