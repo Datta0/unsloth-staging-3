@@ -5887,3 +5887,282 @@ def test_the_header_scan_refuses_what_it_cannot_parse(tmp_path):
     with pytest.raises(ValueError):
         LlamaCppBackend._gguf_scan_tensor_bytes(str(bad))
     assert LlamaCppBackend()._gguf_tensor_scan(str(bad)) is None
+
+
+# Discrete before integrated (#7624): a unified-memory APU's "free" is system RAM.
+_APU = (0, 60_000, 0)
+_DGPU = (1, 16_000, 16_384)
+
+
+def _mixed_host_launch(
+    tmp_path,
+    monkeypatch,
+    memory,
+    *,
+    gguf_gb,
+    path,
+    rocm = (),
+    cuda = (),
+    setup = None,
+    **kw,
+):
+    monkeypatch.setattr(
+        LlamaCppBackend, "_rocm_unified_memory_gpu_ids", staticmethod(lambda: set(rocm))
+    )
+    monkeypatch.setattr(
+        LlamaCppBackend,
+        "_INTEGRATED_CUDA_IDS",
+        {LlamaCppBackend._integrated_cuda_mask_key(): set(cuda)},
+    )
+    backend, gguf = _backend(tmp_path, vulkan = False, memory = memory)
+    backend._get_gguf_size_bytes = lambda _path: int(gguf_gb * 1024**3)
+    if path != "filesize":
+        backend._can_estimate_kv = lambda: True
+        backend._estimate_kv_cache_bytes = lambda ctx, *a, **k: int(ctx) * 64 * 1024
+        backend._compute_buffer_ctx_bytes = lambda *a, **k: 0
+        backend._estimate_compute_buffer_bytes = lambda **k: 1
+
+        def read_metadata(_path):
+            backend._context_length = 131_072
+
+        backend._read_gguf_metadata = read_metadata
+        kw["n_ctx"] = 0 if path == "auto_ctx" else 8192
+    if setup is not None:
+        setup(backend)
+    return _launch(backend, gguf, **kw)["env"].get("CUDA_VISIBLE_DEVICES")
+
+
+@pytest.mark.parametrize("path", ["filesize", "auto_ctx", "explicit_ctx"])
+@pytest.mark.parametrize(
+    "memory, rocm, cuda, expected",
+    [
+        ([_APU, _DGPU], {0}, (), "1"),
+        ([(0, 60_000, 65_536), _DGPU], {0}, (), "1"),
+        ([(0, 16_000, 16_384), (1, 60_000, 0)], {1}, (), "0"),
+        ([_APU, _DGPU], (), {0}, "1"),
+    ],
+    ids = ["rocm_apu_total0", "rocm_apu_total", "apu_second", "cuda_integrated"],
+)
+def test_auto_placement_prefers_a_discrete_gpu_that_holds_the_model(
+    tmp_path, monkeypatch, memory, rocm, cuda, expected, path
+):
+    got = _mixed_host_launch(
+        tmp_path, monkeypatch, memory, gguf_gb = 8, path = path, rocm = rocm, cuda = cuda
+    )
+    assert got == expected
+
+
+@pytest.mark.parametrize("path", ["filesize", "auto_ctx", "explicit_ctx"])
+@pytest.mark.parametrize(
+    "memory, rocm, gguf_gb, gpu_ids, expected",
+    [
+        # Homogeneous hosts: most usable VRAM wins, as before.
+        ([(0, 10_000, 16_384), (1, 16_000, 16_384)], (), 8, None, "1"),
+        ([_APU, (1, 30_000, 0)], {0, 1}, 8, None, "0"),
+        ([_APU, _DGPU], {0}, 20, None, "0"),
+        # User pick / mask leaving only the APU.
+        ([_APU, _DGPU], {0}, 8, [0], "0"),
+        ([_APU, _DGPU], {0}, 8, [0, 1], "0"),
+        ([_APU], {0}, 8, None, "0"),
+    ],
+    ids = ["discrete_only", "integrated_only", "only_apu_fits", "pick_apu", "pick_both", "mask_apu"],
+)
+def test_discrete_first_leaves_other_placements_alone(
+    tmp_path, monkeypatch, memory, rocm, gguf_gb, gpu_ids, expected, path
+):
+    kw = {"gpu_ids": gpu_ids} if gpu_ids is not None else {}
+    got = _mixed_host_launch(
+        tmp_path, monkeypatch, memory, gguf_gb = gguf_gb, path = path, rocm = rocm, **kw
+    )
+    assert got == expected
+
+
+def test_select_gpus_discrete_tier_keeps_a_spread_request_spread():
+    gib = 1024**3
+    gpus = [(0, 60_000), (1, 16_000)]
+    total = {0: 0, 1: 16_384}
+    # min_gpus=2 but one discrete GPU: both count.
+    assert LlamaCppBackend._select_gpus(
+        8 * gib, gpus, total_by_idx = total, min_gpus = 2, integrated = frozenset({0})
+    ) == ([0, 1], False)
+    assert LlamaCppBackend._select_gpus(
+        8 * gib, gpus, total_by_idx = total, integrated = frozenset({0})
+    ) == ([1], False)
+    assert LlamaCppBackend._select_gpus(8 * gib, gpus, total_by_idx = total) == ([0], False)
+
+
+def _mixed_drafter_launch(tmp_path, monkeypatch, *, speculative_type):
+    """14 GiB target and a sidecar drafter; the dGPU holds the target alone at native context."""
+    gb, mib = 1024**3, 1024 * 1024
+    monkeypatch.setattr(LlamaCppBackend, "_rocm_unified_memory_gpu_ids", staticmethod(lambda: {0}))
+    monkeypatch.setattr(
+        LlamaCppBackend,
+        "_INTEGRATED_CUDA_IDS",
+        {LlamaCppBackend._integrated_cuda_mask_key(): set()},
+    )
+    backend, gguf = _backend(tmp_path, vulkan = False, memory = [(0, 60_000, 0), (1, 24_576, 24_576)])
+    sidecar = tmp_path / "dspark-model-Q8_0.gguf"
+    sidecar.write_bytes(b"draft")
+    backend._get_gguf_size_bytes = lambda path: (
+        int(0.5 * gb) if str(path) == str(sidecar) else 14 * gb
+    )
+    backend._can_estimate_kv = lambda: True
+    backend._estimate_kv_cache_bytes = lambda ctx, *a, **k: int(ctx) * mib // 4
+    backend._compute_buffer_ctx_bytes = lambda *a, **k: 0
+    backend._estimate_compute_buffer_bytes = lambda **k: 1
+    backend._mtp_draft_kv_bytes = lambda *a, **k: 0
+    backend._estimate_mtp_overhead_bytes = lambda n_ctx, *a, **k: int(n_ctx) * mib // 4
+
+    def read_metadata(_path):
+        backend._context_length = 32_768
+
+    backend._read_gguf_metadata = read_metadata
+    backend.probe_server_capabilities = lambda _binary = None: {
+        "supports_dspark": True,
+        "spec_draft_n_max_flag": "--spec-draft-n-max",
+    }
+    kw = {"dspark_draft_path": str(sidecar)} if speculative_type == "auto" else {}
+    result = _launch(backend, gguf, n_ctx = 0, speculative_type = speculative_type, **kw)
+    cmd = result["cmd"]
+    return result["env"].get("CUDA_VISIBLE_DEVICES"), int(cmd[cmd.index("-c") + 1]), cmd
+
+
+def test_drafter_probe_prices_the_discrete_tier_the_placement_takes(tmp_path, monkeypatch):
+    # The APU holds target + drafter; the dGPU holds the target only at full context. The
+    # probe must answer for the dGPU placement, not keep a drafter that costs it context.
+    _dev, ctx_off, _cmd = _mixed_drafter_launch(tmp_path, monkeypatch, speculative_type = "off")
+    dev, ctx, cmd = _mixed_drafter_launch(tmp_path, monkeypatch, speculative_type = "auto")
+    assert dev == "1"
+    assert ctx == ctx_off == 32_768
+    assert "--model-draft" not in cmd
+
+
+def test_cuda_integrated_ids_join_pci_rows_only_under_pci_bus_order(tmp_path, monkeypatch):
+    # nvidia-smi rows are PCI indices, CUDA ids are ordinals: with FASTEST_FIRST they can
+    # name different cards, so the tier stands down and base ranking applies.
+    monkeypatch.setattr(LlamaCppBackend, "_GPU_IDS_ARE_PCI_INDICES", True)
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising = False)
+    memory = [_APU, _DGPU]
+    assert (
+        _mixed_host_launch(tmp_path, monkeypatch, memory, gguf_gb = 8, path = "filesize", cuda = {0})
+        == "0"
+    )
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    assert (
+        _mixed_host_launch(tmp_path, monkeypatch, memory, gguf_gb = 8, path = "filesize", cuda = {0})
+        == "1"
+    )
+
+
+def test_split_aware_discrete_tier_falls_back_to_the_base_pick():
+    # Two dGPUs pool the model at the single-device rate but not as a split; the APU
+    # alone holds it. Same answer as without the tier, not a mixed APU+dGPU split.
+    mib = 1024 * 1024
+    gpus = [(0, 12_000), (1, 12_000), (2, 21_000)]
+    kw = dict(usable_fraction = 1.0, split_extra_bytes = 2_000 * mib)
+    base = LlamaCppBackend._select_gpus_split_aware(20_480 * mib, gpus, **kw)
+    assert base == ([2], False)
+    assert (
+        LlamaCppBackend._select_gpus_split_aware(
+            20_480 * mib, gpus, integrated = frozenset({2}), **kw
+        )
+        == base
+    )
+    # A discrete split that holds it at the split rate still wins.
+    assert LlamaCppBackend._select_gpus_split_aware(
+        16_000 * mib, gpus, integrated = frozenset({2}), **kw
+    ) == ([0, 1], False)
+
+
+def test_discrete_tier_subset_is_not_charged_host_checkpoints(tmp_path, monkeypatch):
+    # Checkpoints live in host RAM: only a unified-memory GPU's "VRAM" pays for them.
+    seen = []
+    real_fit = LlamaCppBackend._fit_context_to_vram
+
+    def spy(
+        self,
+        requested,
+        available_mib,
+        *a,
+        ctx_checkpoints = 0,
+        **k,
+    ):
+        seen.append((available_mib, ctx_checkpoints))
+        return real_fit(self, requested, available_mib, *a, ctx_checkpoints = ctx_checkpoints, **k)
+
+    def setup(backend):
+        backend._rollback_state_bytes = lambda *a, **k: 0
+        backend._amd_apu_wants_unified_memory = lambda ids = None, *a, **k: 0 in (ids or [0])
+        backend.probe_server_capabilities = lambda _binary = None: {
+            "ctx_checkpoints_flag": "--ctx-checkpoints"
+        }
+
+    monkeypatch.setattr(LlamaCppBackend, "_fit_context_to_vram", spy)
+    got = _mixed_host_launch(
+        tmp_path,
+        monkeypatch,
+        [_APU, _DGPU],
+        gguf_gb = 8,
+        path = "auto_ctx",
+        rocm = {0},
+        setup = setup,
+        ctx_checkpoints = 32,
+    )
+    assert got == "1"
+    # The APU candidate makes the pool pay; the dGPU-only subset does not.
+    assert seen and seen[-1][1] == 0 and seen[-1][0] < 16_384
+
+
+def _host_projector_launch(tmp_path, monkeypatch, memory, rocm, gguf_gb):
+    """Explicit 8K vision load whose 3 GiB projector the user keeps on the CPU."""
+    gb = 1024**3
+
+    def setup(backend):
+        mmproj = tmp_path / "mmproj.gguf"
+        mmproj.write_bytes(b"GGUF")
+        backend._mmproj_vram_bytes = lambda _path: 3 * gb
+        backend._resolve_launch_mmproj_path = lambda **_kw: str(mmproj)
+
+    return _mixed_host_launch(
+        tmp_path,
+        monkeypatch,
+        memory,
+        gguf_gb = gguf_gb,
+        path = "explicit_ctx",
+        rocm = rocm,
+        setup = setup,
+        is_vision = True,
+        extra_args = ["--no-mmproj-offload"],
+    )
+
+
+def test_explicit_ctx_discrete_tier_is_not_charged_a_host_projector(tmp_path, monkeypatch):
+    # The projector sits in host RAM: the APU pool pays for it, the dGPU does not.
+    assert _host_projector_launch(tmp_path, monkeypatch, [_APU, _DGPU], {0}, 13) == "1"
+
+
+def test_explicit_ctx_host_projector_control_without_integrated_gpu(tmp_path, monkeypatch):
+    # No unified-memory GPU: the larger dGPU wins exactly as before the discrete tier.
+    memory = [(0, 60_000, 65_536), _DGPU]
+    assert _host_projector_launch(tmp_path, monkeypatch, memory, (), 13) == "0"
+
+
+def test_slot_search_discrete_tier_is_not_charged_host_checkpoints():
+    # Two slots fit the dGPU; 16 checkpoints only fit the APU's host-RAM pool.
+    mib = 1024 * 1024
+    backend = LlamaCppBackend()
+    backend._estimate_compute_buffer_bytes = lambda **k: 1
+    backend._estimate_kv_cache_bytes = lambda ctx, *a, n_parallel = 1, ctx_checkpoints = 0, **k: (
+        n_parallel * 1_000 * mib + ctx_checkpoints * 500 * mib
+    )
+    gpus = [(0, 60_000), (1, 16_000)]
+    total = {0: 0, 1: 16_384}
+    kw = dict(include_requested = True, ctx_checkpoints = 16)
+    args = (2, 8192, gpus, total, 10_000 * mib, None, 1.0, 0, 1)
+    assert backend._slots_that_fit_on_gpu(*args, integrated = frozenset({0}), **kw) == (
+        [1],
+        False,
+        2,
+    )
+    # Control: no integrated GPU prices every candidate with the checkpoints, as before.
+    assert backend._slots_that_fit_on_gpu(*args, **kw) == ([0], False, 2)
