@@ -322,8 +322,12 @@ export const BUDGET = {
   // Raised to that build plus the same 160 B raw / 189 B transfer margin.
   // Slider tracks round to whole screen pixels at any zoom: theme-boot.js publishes --device-px before first
   // paint, 1,501 -> 1,847 B (served uncompressed, so 346 B raw and transfer). Raised by that, same margin.
-  transferBytes: 2_067_227,
-  rawBytes: 6_864_038,
+  // Picking a preset forgetting a model's remembered sampling (#14128) keeps its preset marks in the eager chat
+  // runtime store: 1,862 B raw / 443 B transfer (6,870,348 -> 6,872,210 B raw, 2,068,964 -> 2,069,407 B transfer
+  // against 491d3dc433, one machine and build, Node 24, 97 chunks). 491d3dc433 alone already measured 6,310 B raw
+  // over its limit, so this is raised to the merged build plus the same 160 B raw / 189 B transfer margin.
+  transferBytes: 2_069_596,
+  rawBytes: 6_872_370,
 };
 
 // The chunk count is reported but not budgeted. Splitting a page out of the entry raises it while lowering the
