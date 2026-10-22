@@ -79,6 +79,14 @@ from core.inference.context_window import (
     turn_is_servable,
 )
 from core.inference.llama_tool_schema import llama_grammar_tools
+from core.inference.split_policy import (
+    GpuInfo as _SplitGpuInfo,
+    SplitDecision as _SplitDecision,
+    auto_tensor_split_enabled as _auto_tensor_split_enabled,
+    binary_supports_tensor_split as _binary_supports_tensor_split,
+    choose_split_mode as _choose_split_mode,
+    mtp_draft_depth_for_split as _mtp_draft_depth_for_split,
+)
 from core.inference.stream_errors import stream_error_from_chunk
 from hub.utils.hf_errors import modelscope_missing
 from hub.utils.hf_tokens import (
@@ -4229,7 +4237,7 @@ def _with_gguf_load_marker(load: Callable):
                 raise RuntimeError(
                     f"'{hf_repo}' is currently being downloaded by the download manager"
                 )
-            return load(self, intent, load_cancel_event = load_cancel_event)
+            return _load_with_auto_tensor_layer_retry(self, load, intent, load_cancel_event)
 
     return wrapped
 
@@ -8438,6 +8446,119 @@ def _extra_args_have_tensor_split(
     return bool(str((env or {}).get("LLAMA_ARG_TENSOR_SPLIT", "")).strip())
 
 
+# Pass-through that places the weights itself: the auto split policy stays off when any is present, so the load
+# is planned exactly as it was before the policy existed. Presence only: a value that places nothing (-ncmoe 0,
+# --fit off) still keeps the policy off, which can only cost the auto speedup, never a placement.
+_AUTO_SPLIT_USER_PLACEMENT_FLAGS = (
+    _SPLIT_MODE_FLAGS
+    | _TENSOR_SPLIT_FLAGS
+    | _DEVICE_FLAGS
+    | _LAYER_OFFLOAD_FLAGS
+    | _CPU_PLACEMENT_FLAGS
+    | _CPU_FFN_COUNT_FLAGS
+    | _VRAM_FIT_VOIDING_FLAGS
+)
+_AUTO_SPLIT_USER_PLACEMENT_ENV = (
+    "LLAMA_ARG_SPLIT_MODE",
+    "LLAMA_ARG_TENSOR_SPLIT",
+    "LLAMA_ARG_DEVICE",
+    "LLAMA_ARG_MAIN_GPU",
+    "LLAMA_ARG_N_GPU_LAYERS",
+    "LLAMA_ARG_OVERRIDE_TENSOR",
+    "LLAMA_ARG_CPU_MOE",
+    "LLAMA_ARG_N_CPU_MOE",
+    "LLAMA_ARG_N_CPU_FFN",
+    *_VRAM_FIT_VOIDING_ENV_VARS,
+)
+
+
+def _auto_split_user_placement(
+    extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
+) -> Optional[str]:
+    """Why the user already owns GPU placement (split mode, ratio, devices, layer count, CPU / offload or fitter
+    controls, in the extras or the inherited env), None when nothing does."""
+    if _extra_args_set_any_flag(extra_args, _AUTO_SPLIT_USER_PLACEMENT_FLAGS):
+        return "a placement flag in the extra arguments"
+    if _extra_args_have_tensor_split(extra_args, None):
+        return "a --tensor-split in the extra arguments"
+    source_env = os.environ if env is None else env
+    for name in _AUTO_SPLIT_USER_PLACEMENT_ENV:
+        if str(source_env.get(name) or "").strip():
+            return f"inherited {name}"
+    return None
+
+
+@dataclass
+class _AutoSplitAttempt:
+    """The auto split policy's state for ONE load attempt, owned by the attempt.
+
+    Created under the serial load lock by _load_with_auto_tensor_layer_retry, read by
+    load_model through ``self._auto_split_attempt`` and, once a server launches, kept
+    with it as ``self._auto_split``. Nothing long-lived holds auto state of its own, so
+    no reset, fallback or recovery path has any to clear: what a reader needs about
+    the live server (``_auto_tensor_live``) is gated on ``_tensor_parallel``, which
+    every path that drops tensor already clears."""
+
+    # False for the relaunch after an abandoned auto attempt: the load runs as on main.
+    allowed: bool = True
+    decision: Optional[_SplitDecision] = None
+    # The policy chose --split-mode tensor for this attempt.
+    engaged: bool = False
+
+
+class _AutoSplitAbandoned(RuntimeError):
+    """An auto tensor attempt reached a downgrade, fallback, retry or recovery path.
+    load_model stops there and the load is redone once with the policy off, so every
+    such path only ever runs exactly as it does without the policy."""
+
+
+def _load_with_auto_tensor_layer_retry(
+    self,
+    load: Callable,
+    intent,
+    load_cancel_event: Optional[threading.Event] = None,
+) -> bool:
+    """Run one LlamaCppBackend.load_model call. When the auto split policy (not the
+    user) chose --split-mode tensor and that attempt is abandoned, fails or raises,
+    load the same intent once more with the policy off, i.e. exactly as without it.
+    Under the load marker, so every caller gets it (the /load route, the MTP-crash
+    reload, the respawn, helper backends), and under the serial load lock for both
+    attempts, so a queued load can neither run between them nor see their state. The
+    intent is not rewritten, so an identical repeat request still matches."""
+    if not isinstance(self, LlamaCppBackend):
+        return load(self, intent, load_cancel_event = load_cancel_event)
+
+    def cancelled() -> bool:
+        return (
+            self._cancel_event.is_set()
+            or bool(load_cancel_event is not None and load_cancel_event.is_set())
+            or getattr(self, "_health_wait_cancelled", False)
+            or self._spawn_is_stale()
+        )
+
+    with self._serial_load_lock:
+        previous = self._auto_split_attempt
+        attempt = _AutoSplitAttempt()
+        self._auto_split_attempt = attempt
+        try:
+            try:
+                # An engaged attempt that did not start raises; a False is terminal
+                # (cancelled, or failed after a healthy start) and is not retried.
+                return load(self, intent, load_cancel_event = load_cancel_event)
+            except Exception as exc:
+                if not attempt.engaged:
+                    raise
+                if cancelled():
+                    if isinstance(exc, _AutoSplitAbandoned):
+                        return False
+                    raise
+                logger.warning(f"Auto tensor split abandoned ({exc}); loading without it")
+            self._auto_split_attempt = _AutoSplitAttempt(allowed = False)
+            return load(self, intent, load_cancel_event = load_cancel_event)
+        finally:
+            self._auto_split_attempt = previous
+
+
 @functools.lru_cache(maxsize = 1)
 def _local_ssl_context() -> ssl.SSLContext:
     # httpx loads CA certificates even for loopback HTTP. Share that setup, not streaming sockets.
@@ -8627,6 +8748,10 @@ class LlamaCppBackend:
         self._cache_type_kv: Optional[str] = None
         # Whether --split-mode tensor was applied on the active load.
         self._tensor_parallel: bool = False
+        # The auto split attempt in flight (set and cleared by _load_with_auto_tensor_layer_retry
+        # under the serial load lock) and the one the live server launched from. See _AutoSplitAttempt.
+        self._auto_split_attempt: Optional[_AutoSplitAttempt] = None
+        self._auto_split: Optional[_AutoSplitAttempt] = None
         # GPU memory strategy applied on the active load ("auto"/"manual").
         self._gpu_memory_mode: str = "auto"
         # Manual-mode load options (echoed back so the UI round-trips them).
@@ -9587,6 +9712,18 @@ class LlamaCppBackend:
         return self._tensor_parallel
 
     @property
+    def _auto_tensor_live(self) -> bool:
+        """The live --split-mode tensor came from the auto split policy, not a request."""
+        return bool(
+            self._tensor_parallel and self._auto_split is not None and self._auto_split.engaged
+        )
+
+    @property
+    def _auto_split_decision(self):
+        """The auto split decision of the launch the live (or last) server came from."""
+        return self._auto_split.decision if self._auto_split is not None else None
+
+    @property
     def gpu_memory_mode(self) -> str:
         """Active GPU memory strategy: 'auto' or 'manual' (gpu_layers < 0 = Auto/--fit, >= 0 = pinned)."""
         return self._gpu_memory_mode
@@ -9793,6 +9930,17 @@ class LlamaCppBackend:
         # leaves in place, would otherwise never match.
         if _metal_device_is_paravirtual():
             if self._tensor_parallel:
+                return False
+        elif self._auto_tensor_live:
+            # The auto policy chose this tensor split for a request that asked for no split
+            # mode at all. Compared on that explicit intent: the same request matches (the
+            # idle check is not re-run against the cards it holds); a tensor toggle, an
+            # extras --split-mode or Manual is a different load, planned afresh.
+            if (
+                _effective_tensor_parallel(extra_args, intent.tensor_parallel)
+                or parse_split_mode_override(extra_args) is not None
+                or intent.gpu_memory_mode == "manual"
+            ):
                 return False
         elif not _tensor_parallel_matches_loaded(
             extra_args, intent.tensor_parallel, self._tensor_parallel
@@ -12934,6 +13082,139 @@ class LlamaCppBackend:
             return saw
         except Exception:
             return False
+
+    @staticmethod
+    def _gpu_names_by_physical_id() -> dict[int, str]:
+        """GPU id -> device name, in the index space the planner's ``gpus`` use. When
+        those ids are nvidia-smi (PCI) indices the names come from nvidia-smi itself:
+        torch ordinals follow CUDA_DEVICE_ORDER (FASTEST_FIRST by default) and a
+        UUID / MIG mask, so joining them to PCI indices can name the wrong card. Torch
+        ordinals mapped through CUDA_VISIBLE_DEVICES only when the ids came from torch.
+        Empty on ROCm, no CUDA or any error, which the split policy reads as "names
+        unknown" (layer split)."""
+        if LlamaCppBackend._GPU_IDS_ARE_PCI_INDICES is True:
+            try:
+                from utils.hardware import gpu_query
+
+                result = gpu_query.run_nvidia_smi(
+                    ["nvidia-smi", "--query-gpu=index,name", "--format=csv,noheader,nounits"],
+                    cache = False,
+                    capture_output = True,
+                    text = True,
+                    encoding = "utf-8",
+                    errors = "replace",
+                    timeout = 5,
+                    env = child_env_without_native_path_secret(),
+                    **_windows_hidden_subprocess_kwargs(),
+                )
+                names: dict[int, str] = {}
+                if result.returncode == 0:
+                    for line in (result.stdout or "").splitlines():
+                        parts = [p.strip() for p in line.split(",", 1)]
+                        if len(parts) == 2 and parts[0].isdigit() and parts[1]:
+                            names[int(parts[0])] = parts[1]
+                if names:
+                    return names
+            except Exception:
+                pass
+            # nvidia-smi absent or hung: the NVML inventory that supplied the PCI-indexed
+            # rows names them in the same index space (whole cards; MIG slices excluded).
+            names = {}
+            for row in LlamaCppBackend._NVML_ROWS or ():
+                try:
+                    if not row.get("mig") and str(row.get("name") or "").strip():
+                        names[int(row["index"])] = str(row["name"]).strip()
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+            return names
+        try:
+            import torch
+
+            if getattr(torch.version, "hip", None) is not None:
+                return {}
+            if not (hasattr(torch, "cuda") and torch.cuda.is_available()):
+                return {}
+            physical_ids = LlamaCppBackend._resolve_visible_physical_ids()
+            names: dict[int, str] = {}
+            for ordinal in range(torch.cuda.device_count()):
+                try:
+                    name = torch.cuda.get_device_properties(ordinal).name or ""
+                except Exception:
+                    continue
+                pid = (
+                    physical_ids[ordinal]
+                    if physical_ids is not None and ordinal < len(physical_ids)
+                    else ordinal
+                )
+                names[pid] = name
+            return names
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _auto_tensor_platform_reason() -> Optional[str]:
+        """None on the platform the auto tensor split was measured on (Linux, NVIDIA
+        CUDA torch), else why not. The HIP prebuilt and Windows were not measured, so
+        the auto policy stays off there; the Tensor Parallelism toggle still works."""
+        try:
+            if not sys.platform.startswith("linux"):
+                return f"measured on Linux only (this host is {sys.platform})"
+            import torch
+
+            if getattr(torch.version, "hip", None) is not None:
+                return "measured on NVIDIA CUDA only (this is a ROCm / HIP build)"
+            if not getattr(torch.version, "cuda", None):
+                return "measured on NVIDIA CUDA only (no CUDA torch)"
+            return None
+        except Exception as e:
+            return f"platform check failed ({type(e).__name__})"
+
+    @staticmethod
+    def _gpu_utilization_by_physical_id(
+        samples: int = 2, interval_s: float = 0.15
+    ) -> dict[int, float]:
+        """nvidia-smi index -> compute utilisation percent, the max over ``samples``
+        readings ``interval_s`` apart, so a card mid-job between kernels is not read
+        as idle. Only returned when the GPU ids Studio plans with ARE nvidia-smi (PCI)
+        indices; empty otherwise (the split policy then relies on the free-memory check
+        alone). An error keeps the readings taken before it, so a busy card stays busy."""
+        if LlamaCppBackend._GPU_IDS_ARE_PCI_INDICES is not True:
+            return {}
+        util: dict[int, float] = {}
+        try:
+            from utils.hardware import gpu_query
+            for i in range(max(1, samples)):
+                if i:
+                    time.sleep(interval_s)
+                result = gpu_query.run_nvidia_smi(
+                    [
+                        "nvidia-smi",
+                        "--query-gpu=index,utilization.gpu",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    cache = False,
+                    capture_output = True,
+                    text = True,
+                    encoding = "utf-8",
+                    errors = "replace",
+                    timeout = 5,
+                    env = child_env_without_native_path_secret(),
+                    **_windows_hidden_subprocess_kwargs(),
+                )
+                if result.returncode != 0:
+                    return util
+                for line in (result.stdout or "").splitlines():
+                    parts = [p.strip() for p in line.split(",")]
+                    if len(parts) < 2:
+                        continue
+                    try:
+                        idx, pct = int(parts[0]), float(parts[1])
+                    except ValueError:
+                        continue
+                    util[idx] = max(util.get(idx, 0.0), pct)
+            return util
+        except Exception:
+            return util
 
     @staticmethod
     def _is_datacenter_gpu(gpu_indices = None) -> bool:
@@ -26836,6 +27117,10 @@ class LlamaCppBackend:
                 # Layer-fallback min GPUs; raised below on a tensor downgrade. Bound
                 # before the try so the --fit-on except path still has it (no UnboundLocal).
                 _layer_min_gpus = 1
+                # This attempt's auto split state (see _AutoSplitAttempt). A body run outside
+                # the wrapper gets the policy off.
+                _auto = self._auto_split_attempt or _AutoSplitAttempt(allowed = False)
+                _auto.decision, _auto.engaged = None, False
                 # An explicit Vulkan ordinal absent from the ggml probe cannot be
                 # honored; flag it in the fit and reject after the try (raising inside
                 # would be swallowed into the --fit-on fallback). Bound before the try.
@@ -27328,7 +27613,12 @@ class LlamaCppBackend:
                         # gpus to bypass the planner -- keep the GPU draft depth the
                         # launch flags also use, instead of the CPU default.
                         _mtp_eff_n_max = (
-                            3 if _mtp_effective == "dspark" else (2 if _detected_gpus else 3)
+                            3
+                            if _mtp_effective == "dspark"
+                            else _mtp_draft_depth_for_split(
+                                "tensor" if (tensor_parallel and _detected_gpus) else None,
+                                2 if _detected_gpus else 3,
+                            )
                         )
                     # Separate-drafter weights live on GPU (an embedded head is
                     # already in model_size). Size the drafter the launch loads, by
@@ -27625,6 +27915,271 @@ class LlamaCppBackend:
                         explicit_ctx = False
                         _replayed_ctx_refit = True
 
+                    # Normalize the speculative reserve BEFORE anything prices it.
+                    # _mtp_bytes reads mtp_overhead_fn at call time, so leaving this
+                    # until after the probes below charged the projector probe the full
+                    # GPU-drafter footprint for a drafter pinned to the CPU (-ngld 0),
+                    # which allocates none of it: the probe then answers "does not fit",
+                    # pins the projector, and costs ~8.8x on every image encode for
+                    # memory nothing was holding. _draft_cpu_no_embedded is settled well
+                    # above, and every input this needs with it, so there is nothing to
+                    # wait for.
+                    if _draft_cpu_no_embedded and mtp_overhead_fn is not None:
+                        # Nothing speculative is GPU-resident: the drafter that launches
+                        # is the separate CPU-offloaded one, and any embedded head it
+                        # displaced does not run. The flat fraction below is gated on
+                        # this; the byte-accurate callback was not, so the fit went on
+                        # charging VRAM no drafter allocates.
+                        # Two terms survive: a recurrent target's rollback snapshots and
+                        # the verification output rows sit in the TARGET context, so
+                        # pinning the drafter to CPU does not move them. Charge those
+                        # alone. Flat in ctx (both are per-slot), hence the same
+                        # _np/_n_ubatch keywords the replaced callback takes, so
+                        # _mtp_bytes can still re-price slots.
+                        def _cpu_draft_target_state(
+                            _ctx: int,
+                            _np: int = n_parallel,
+                            _n_ubatch: Optional[int] = _effective_ubatch,
+                            _n: int = _mtp_eff_n_max,
+                            _rollback: bool = _target_rollback,
+                        ) -> int:
+                            if _n <= 0:
+                                return 0
+                            rollback = self._rollback_state_bytes(_np) * _n if _rollback else 0
+                            return rollback + self._spec_verify_rows_bytes(_np, _n)
+
+                        mtp_overhead_fn = (
+                            _cpu_draft_target_state
+                            if _cpu_draft_target_state(effective_ctx) > 0
+                            else None
+                        )
+                        _mtp_kv_unsized = False
+
+                    # Auto split mode (core/inference/split_policy.py): with no explicit
+                    # choice (toggle off, no placement pass-through, no inherited
+                    # LLAMA_ARG_SPLIT_MODE / LLAMA_ARG_TENSOR_SPLIT) a dense model, or a
+                    # MoE model whose MTP head runs, goes --split-mode tensor on a matching
+                    # idle GPU pair. Decided here, once MTP engagement and the NextN weight
+                    # adjustment are settled, and before the tensor -> layer downgrades
+                    # below. Those downgrades are checked first on the pair itself, so
+                    # an auto load either runs tensor or is planned exactly as it would
+                    # have been without the policy. A downgrade or relaunch that still
+                    # reaches an auto tensor attempt abandons it (_AutoSplitAbandoned) and
+                    # the load is redone with the policy off, exactly as on main.
+                    if (
+                        gpu_memory_mode != "manual"
+                        and not tensor_parallel
+                        and not tensor_split
+                        and not preserve_multi_gpu_on_layer
+                        and not is_vulkan_backend
+                        and len(gpus) >= 2
+                    ):
+                        _split_single = "layer"
+                        _split_excluded = None
+                        _split_user_placement = _auto_split_user_placement(extra_args)
+                        if not _auto.allowed:
+                            _split_excluded = (
+                                "an auto tensor attempt was abandoned; loading without it"
+                            )
+                        elif _split_user_placement is not None and split_mode_override is None:
+                            _split_excluded = f"the user owns placement ({_split_user_placement})"
+                        elif _spec_canon == "dflash" or _extra_args_requests_dflash(
+                            extra_args, env = _spec_env
+                        ):
+                            # DFlash2 + --split-mode tensor aborts at startup (#11308).
+                            _split_excluded = "DFlash keeps the layer split"
+                        elif self._tensor_quant_kv_unsupported_binary(binary, _planned_cache_pair):
+                            _split_excluded = (
+                                "this build refused a quantized KV cache with --split-mode tensor"
+                            )
+                        elif self._tensor_split_aborts(
+                            binary, model_identifier, _planned_cache_pair
+                        ):
+                            _split_excluded = "this build aborted on --split-mode tensor earlier"
+                        try:
+                            if _split_excluded is not None:
+                                _split_decision = _SplitDecision(
+                                    _split_single,
+                                    False,
+                                    f"auto tensor split off: {_split_excluded}",
+                                )
+                            else:
+                                _split_platform = self._auto_tensor_platform_reason()
+                                # The nvidia-smi probes only when the policy can choose tensor.
+                                _split_probe = bool(
+                                    split_mode_override is None
+                                    and not (os.environ.get("LLAMA_ARG_SPLIT_MODE") or "").strip()
+                                    and not (os.environ.get("LLAMA_ARG_TENSOR_SPLIT") or "").strip()
+                                    and _auto_tensor_split_enabled()
+                                    and not _split_platform
+                                    and _binary_supports_tensor_split(server_caps)
+                                )
+                                _split_names = (
+                                    self._gpu_names_by_physical_id() if _split_probe else {}
+                                )
+                                _split_util = (
+                                    self._gpu_utilization_by_physical_id() if _split_probe else {}
+                                )
+                                _single_pick, _single_fit = self._select_gpus(
+                                    model_size,
+                                    gpus,
+                                    usable_fraction = _vram_frac,
+                                    total_by_idx = total_by_idx,
+                                    shared = _shared_gpus,
+                                )
+                                _fits_one = (
+                                    not _single_fit
+                                    and _single_pick is not None
+                                    and len(_single_pick) == 1
+                                )
+                                _split_gpus = [
+                                    _SplitGpuInfo(
+                                        index = idx,
+                                        name = _split_names.get(idx),
+                                        total_mib = int(total_by_idx.get(idx, 0) or 0),
+                                        free_mib = int(free),
+                                        util_pct = _split_util.get(idx),
+                                    )
+                                    for idx, free in gpus
+                                ]
+                                # The tensor gates below, priced on the pair up front with
+                                # the planner's own terms: every card clears the per-device
+                                # tensor compute buffer, and the pooled budget holds weights,
+                                # soft overhead, the flat cushion for a GPU drafter it cannot
+                                # size, and KV + drafter + context scratch at the requested
+                                # context (Auto: the planner's floor). main's layer placement
+                                # adds GPUs to honor a requested context, so a pair that would
+                                # cut it keeps layer split. Unpriceable (no KV dims): no auto
+                                # tensor, whose planner would then cap the context.
+                                _auto_tp_bytes = self._estimate_compute_buffer_bytes(
+                                    n_ubatch = _effective_ubatch,
+                                    n_parallel = n_parallel,
+                                    per_device_tensor = True,
+                                )
+                                _auto_reserve_mib = (
+                                    _auto_tp_bytes // (1024 * 1024)
+                                    if _auto_tp_bytes > 0
+                                    else self._TENSOR_PARALLEL_BUFFER_RESERVE_MIB
+                                )
+                                _auto_ctx = (
+                                    effective_ctx
+                                    if (explicit_ctx and effective_ctx > 0)
+                                    else (min(2048, effective_ctx) if effective_ctx > 0 else 2048)
+                                )
+                                _auto_ctx_priced = self._can_estimate_kv()
+                                # The planner's _mtp_reserves_gpu (the CPU drafter is normalized above).
+                                _auto_mtp_gpu = _mtp_will_engage and not _draft_cpu_no_embedded
+                                _auto_kv_bytes = 0
+                                _auto_cc_mib = 0.0
+                                _auto_mtp_floor = (
+                                    2 * 1024**3
+                                    if _auto_mtp_gpu
+                                    and (mtp_overhead_fn is None or _mtp_kv_unsized)
+                                    else 0
+                                )
+                                # Priced through the load's own closures under the tensor
+                                # attention plan, the one this pair would launch with.
+                                _auto_layer_fa = planned_flash_attn
+                                planned_flash_attn = _replanned_flash_attn(True)
+                                try:
+                                    if _auto_ctx_priced:
+                                        _auto_kv_bytes = _kv_bytes(_auto_ctx) + _mtp_bytes(
+                                            _auto_ctx
+                                        )
+                                        _auto_cc_mib = _cc_bytes(_auto_ctx) / (1024 * 1024)
+                                finally:
+                                    planned_flash_attn = _auto_layer_fa
+                                _auto_soft = self._CUDA_CONTEXT_RESERVE_BYTES
+                                if effective_is_vision and mmproj_size > 0:
+                                    _auto_soft += int(
+                                        mmproj_size * (self._MMPROJ_VRAM_SAFETY - 1.0)
+                                    )
+                                if _auto_mtp_gpu:
+                                    _auto_soft += self._MTP_DRAFT_COMPUTE_BYTES
+                                _auto_required_mib = (
+                                    model_size + _auto_mtp_floor + _auto_soft + _auto_kv_bytes
+                                ) / (1024 * 1024)
+                                _auto_per_gpu_mib = _auto_reserve_mib + _auto_cc_mib
+
+                                def _split_fits_on(_indices):
+                                    # Weights resident on exactly these GPUs (no CPU offload),
+                                    # and none of the tensor gates below would drop the split.
+                                    _sub = [g for g in gpus if g[0] in set(_indices)]
+                                    if not _auto_ctx_priced:
+                                        return False
+                                    if any(_gpu_usable(g) < _auto_per_gpu_mib for g in _sub):
+                                        return False
+                                    if (
+                                        sum(_gpu_usable(g) for g in _sub)
+                                        - len(_sub) * _auto_per_gpu_mib
+                                        <= _auto_required_mib
+                                    ):
+                                        return False
+                                    _pick, _use_fit = self._select_gpus(
+                                        model_size,
+                                        _sub,
+                                        usable_fraction = _vram_frac,
+                                        total_by_idx = total_by_idx,
+                                        shared = _shared_gpus,
+                                    )
+                                    return _pick is not None and not _use_fit
+
+                                _split_decision = _choose_split_mode(
+                                    fits_on = _split_fits_on,
+                                    is_moe = self.n_moe_layers > 0,
+                                    gpus = _split_gpus,
+                                    fits_one_gpu = _fits_one,
+                                    binary_supports_tensor = _binary_supports_tensor_split(
+                                        server_caps
+                                    ),
+                                    # An MTP head really runs (the resolution above: the
+                                    # spec mode, extras, binary support and the drafter).
+                                    draft_active = _engaged_is_mtp,
+                                    split_mode_override = split_mode_override,
+                                    shared_gpus = _shared_gpus,
+                                    platform_reason = _split_platform,
+                                )
+                                if (
+                                    _split_decision.auto
+                                    and _split_decision.mode == "tensor"
+                                    and _split_decision.gpu_indices
+                                ):
+                                    # Diagnostic only, on the pair that runs; the
+                                    # GGML_CUDA_P2P gate at launch is separate.
+                                    _pair_veto = self._p2p_veto_reason(
+                                        list(_split_decision.gpu_indices)
+                                    )
+                                    if _pair_veto:
+                                        _split_decision = replace(
+                                            _split_decision,
+                                            reason = f"{_split_decision.reason}; no GPU peer "
+                                            f"path ({_pair_veto}), the AllReduce stages "
+                                            "through host memory",
+                                        )
+                        except Exception as _split_exc:
+                            logger.debug(f"auto split-mode policy failed: {_split_exc}")
+                            _split_decision = None
+                        if _split_decision is not None:
+                            _auto.decision = _split_decision
+                            logger.info(
+                                "Split mode: %s (%s, %s)",
+                                _split_decision.mode,
+                                "auto" if _split_decision.auto else "unchanged",
+                                _split_decision.reason,
+                            )
+                            if (
+                                _split_decision.auto
+                                and _split_decision.mode == "tensor"
+                                and _split_decision.gpu_indices
+                            ):
+                                _auto.engaged = True
+                                tensor_parallel = True
+                                planned_flash_attn = _replanned_flash_attn(tensor_parallel)
+                                # Tensor split runs on the chosen matching idle pair only (the
+                                # internal AllReduce covers exactly 2 GPUs).
+                                _keep = set(_split_decision.gpu_indices)
+                                gpus = [g for g in gpus if g[0] in _keep]
+
                     # The two tensor -> layer downgrades that need nothing the probe
                     # decides run BEFORE it: the probe is gated on `not tensor_parallel`
                     # and must answer for any load that ends up layer-split.
@@ -27644,6 +28199,8 @@ class LlamaCppBackend:
                             "use a quantized KV cache with --split-mode tensor "
                             "(needs b9455+); loading with a layer split."
                         )
+                        if _auto.engaged:
+                            raise _AutoSplitAbandoned("a tensor -> layer downgrade")
                         tensor_parallel = False
                         # Like the split-axis skip below: a missing capability says
                         # nothing about capacity, so keep the multi-GPU request rather
@@ -27662,6 +28219,8 @@ class LlamaCppBackend:
                             "session; using layer split across %d GPU(s).",
                             len(gpus),
                         )
+                        if _auto.engaged:
+                            raise _AutoSplitAbandoned("a tensor -> layer downgrade")
                         tensor_parallel = False
                         # The abort says nothing about capacity, so keep multi-GPU.
                         _layer_min_gpus = max(_layer_min_gpus, len(gpus))
@@ -27710,6 +28269,8 @@ class LlamaCppBackend:
                             len(tp_gpus),
                             len(gpus),
                         )
+                        if _auto.engaged:
+                            raise _AutoSplitAbandoned("a tensor -> layer downgrade")
                         tensor_parallel = False
                         # GPUs below tensor's compute-buffer reserve can still do layer
                         # split, so keep multi-GPU (mirrors the budget/geometry drops);
@@ -27718,46 +28279,6 @@ class LlamaCppBackend:
                             _layer_min_gpus = max(_layer_min_gpus, len(gpus))
                         extra_args = strip_split_mode_only(extra_args)
                         planned_flash_attn = _replanned_flash_attn(tensor_parallel)
-
-                    # Normalize the speculative reserve BEFORE anything prices it.
-                    # _mtp_bytes reads mtp_overhead_fn at call time, so leaving this
-                    # until after the probes below charged the projector probe the full
-                    # GPU-drafter footprint for a drafter pinned to the CPU (-ngld 0),
-                    # which allocates none of it: the probe then answers "does not fit",
-                    # pins the projector, and costs ~8.8x on every image encode for
-                    # memory nothing was holding. _draft_cpu_no_embedded is settled well
-                    # above, and every input this needs with it, so there is nothing to
-                    # wait for.
-                    if _draft_cpu_no_embedded and mtp_overhead_fn is not None:
-                        # Nothing speculative is GPU-resident: the drafter that launches
-                        # is the separate CPU-offloaded one, and any embedded head it
-                        # displaced does not run. The flat fraction below is gated on
-                        # this; the byte-accurate callback was not, so the fit went on
-                        # charging VRAM no drafter allocates.
-                        # Two terms survive: a recurrent target's rollback snapshots and
-                        # the verification output rows sit in the TARGET context, so
-                        # pinning the drafter to CPU does not move them. Charge those
-                        # alone. Flat in ctx (both are per-slot), hence the same
-                        # _np/_n_ubatch keywords the replaced callback takes, so
-                        # _mtp_bytes can still re-price slots.
-                        def _cpu_draft_target_state(
-                            _ctx: int,
-                            _np: int = n_parallel,
-                            _n_ubatch: Optional[int] = _effective_ubatch,
-                            _n: int = _mtp_eff_n_max,
-                            _rollback: bool = _target_rollback,
-                        ) -> int:
-                            if _n <= 0:
-                                return 0
-                            rollback = self._rollback_state_bytes(_np) * _n if _rollback else 0
-                            return rollback + self._spec_verify_rows_bytes(_np, _n)
-
-                        mtp_overhead_fn = (
-                            _cpu_draft_target_state
-                            if _cpu_draft_target_state(effective_ctx) > 0
-                            else None
-                        )
-                        _mtp_kv_unsized = False
 
                     # Projector placement, the FIRST thing given up when the load does
                     # not fit: the encoder runs once per image, layers once per token,
@@ -28459,6 +28980,8 @@ class LlamaCppBackend:
                                 "budget cannot hold the weights, MTP reserve, and "
                                 "per-device compute buffers; falling back to layer split."
                             )
+                            if _auto.engaged:
+                                raise _AutoSplitAbandoned("a tensor -> layer downgrade")
                             tensor_parallel = False
                             # Weights needed >1 card, so keep multi-GPU across the
                             # usable tensor GPUs.
@@ -28539,6 +29062,21 @@ class LlamaCppBackend:
                             vram_fraction = _vram_frac,
                             explicit_ctx = explicit_ctx,
                         )
+                        # main keeps a requested context (adding GPUs, or past the native
+                        # length), and Auto drops a GPU drafter before it shortens one.
+                        if (
+                            _auto.engaged
+                            and effective_ctx < target_ctx
+                            and (
+                                explicit_ctx
+                                or (
+                                    _mtp_reserves_gpu
+                                    and (_canonicalize_spec_mode(speculative_type) or "auto")
+                                    == "auto"
+                                )
+                            )
+                        ):
+                            raise _AutoSplitAbandoned("the tensor plan shortened the context")
                         use_fit = False
                         _tp_planned = True
                         if explicit_ctx and not self._can_estimate_kv():
@@ -30182,6 +30720,10 @@ class LlamaCppBackend:
                                 _moe_expert_bytes / (1024**3),
                             )
                 except Exception as e:
+                    # A downgrade on an auto tensor attempt, or a placement failure under
+                    # it: redo the load without the policy rather than patch this one.
+                    if _auto.engaged:
+                        raise _AutoSplitAbandoned(f"placement: {e}") from e
                     logger.warning(f"GPU selection failed ({e}), using --fit on")
                     gpu_indices, use_fit = None, True
                     _metal_full_offload_pinned = False
@@ -30966,6 +31508,9 @@ class LlamaCppBackend:
                         _emitted_values = [float(x) for x in _emitted_tensor_split.split(",")]
                     self._tensor_parallel = True
                     self._layer_preserves_tensor_intent = False
+                    # The attempt this server launches from (the matcher and /load /
+                    # /status read _auto_tensor_live off it).
+                    self._auto_split = _auto
                     # Record the ratio this auto load was ASKED for, so a later
                     # request with a different ratio is not incorrectly reused.
                     # Not the emitted list: see _auto_split_fingerprint for why
@@ -30981,6 +31526,7 @@ class LlamaCppBackend:
                     )
                 else:
                     self._tensor_parallel = False
+                    self._auto_split = _auto
                     # > 1 only when a tensor request was downgraded but kept multi-GPU.
                     self._layer_preserves_tensor_intent = _layer_min_gpus > 1
 
@@ -31097,6 +31643,9 @@ class LlamaCppBackend:
                     model_identifier = model_identifier,
                     model_path = model_path,
                     gpus = bool(_detected_gpus),
+                    # The split the child runs (after every downgrade), for Studio's
+                    # own MTP depth; the fit-time reserve above used the same rule.
+                    split_mode = "tensor" if tensor_parallel else None,
                     binary = binary,
                     mtp_draft_path = (
                         None if _spec_canon in ("dspark", "dflash") else launch_mtp_draft_path
@@ -32983,10 +33532,19 @@ class LlamaCppBackend:
                         run_cmd = self._drop_moe_cache(
                             run_cmd, f"{label.lstrip('-') or 'unpinned'} launch"
                         )
+                    # Every relaunch passes here with a label (and every in-place respawn
+                    # through the attempt loop below): an auto tensor attempt never runs
+                    # one. It is abandoned and the whole load redone without the policy,
+                    # so each recovery only ever runs as it does on main.
+                    if label and _auto.engaged:
+                        self._kill_process()
+                        raise _AutoSplitAbandoned(f"recovery relaunch ({label.lstrip('-')})")
                     _fit_retry_allowed = self._fit_off_retry_eligible(run_cmd, use_fit)
                     _did_fit_retry = False
                     _did_moe_cache_retry = False
                     for _spawn_attempt in (0, 1, 2, 3):
+                        if _spawn_attempt and _auto.engaged:
+                            return False
                         # Defensive kill: drop an orphan Popen a concurrent load may
                         # have stored before we overwrite the reference (#5161).
                         # Also reaps the crashed first attempt on the retry pass.
@@ -33735,6 +34293,10 @@ class LlamaCppBackend:
                 # exit below, so a failed spawn cannot leave it stuck on.
                 self._memory_pending_launch = _mem_settings
                 self._vram_fraction_pending = _budget_priced_placement()
+                # A launch gate dropped the auto tensor split (single-GPU / forced-CPU arch
+                # gate): the plan it priced is gone, so redo the load without the policy.
+                if _auto.engaged and not self._tensor_parallel:
+                    raise _AutoSplitAbandoned("a launch gate dropped the tensor split")
                 healthy = False
                 try:
                     healthy = _spawn_and_wait(cmd)
@@ -33792,6 +34354,13 @@ class LlamaCppBackend:
                             "update llama.cpp to use tensor parallelism with a "
                             "quantized cache."
                         )
+                # An auto tensor attempt that did not come up goes no further: none of the
+                # recoveries below (arch-crash, CPU, flash-attn, MTP, single-sequence) and
+                # none of their memos (the scheduler-abort latch keys the unchanged intent)
+                # may run for it. The load is redone without the policy.
+                if not healthy and _auto.engaged and not _load_cancelled():
+                    self._kill_process()
+                    raise _AutoSplitAbandoned("the tensor split did not start")
                 # "device kernel image is invalid": the auto-pinned device's arch has
                 # no kernels in this binary (#7624: an iGPU whose shared-RAM "free
                 # memory" outranked the dGPU). The proactive mapped_targets gate cannot
@@ -35173,8 +35742,12 @@ class LlamaCppBackend:
         mtp_drafter_unloadable: bool = False,
         eagle3_draft_path: Optional[str] = None,
         mtp_trained: Optional[bool] = None,
+        split_mode: Optional[str] = None,
     ) -> List[str]:
         """Return the llama-server flag list for the requested spec mode.
+
+        ``split_mode`` ("tensor" / "layer" / None) picks Studio's own MTP depth from
+        split_policy.MTP_DRAFT_DEPTH_BY_SPLIT; a user depth or a trained head's wins.
 
         Side effects: sets ``self._speculative_type`` (resolved internal
         emit), ``self._requested_spec_mode`` (canonical UI mode for the
@@ -35373,7 +35946,7 @@ class LlamaCppBackend:
                 return n
             if mtp_trained and trained_steps and self._spec_drafter_kind == "mtp":
                 return trained_steps  # the depth the exported head was trained for
-            return 2 if gpus else 3
+            return _mtp_draft_depth_for_split(split_mode if gpus else None, 2 if gpus else 3)
 
         def _emit_dspark() -> None:
             """Append --model-draft <sidecar> --spec-type draft-dspark + n-max.
