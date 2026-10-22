@@ -4565,12 +4565,22 @@ function Install-UnslothStudio {
     }
 
     function Test-MirrorConfigured {
-        param([ValidateSet('uv', 'pip')][string]$Tool)
-        if ($Tool -eq 'uv') {
-            if ("$env:UV_DEFAULT_INDEX$env:UV_INDEX_URL$env:UV_INDEX$env:UV_EXTRA_INDEX_URL") { return $true }
-            $pattern = '^\s*(\[\[(tool\.uv\.)?index\]\]|(pip\.)?(index|index-url|default-index|extra-index-url|no-index)\s*=)'
+        param([ValidateSet('uv', 'python', 'pip')][string]$Tool)
+        if ($Tool -ne 'pip') {
+            if ($Tool -eq 'python') {
+                # UV_ASTRAL_MIRROR_URL also serves Python builds, but UV_PYTHON_INSTALL_MIRROR would win over it.
+                if ("$env:UV_PYTHON_INSTALL_MIRROR$env:UV_ASTRAL_MIRROR_URL") { return $true }
+                $pattern = '^\s*python-install-mirror\s*='
+            } else {
+                if ("$env:UV_DEFAULT_INDEX$env:UV_INDEX_URL$env:UV_INDEX$env:UV_EXTRA_INDEX_URL") { return $true }
+                $pattern = '^\s*(\[\[(tool\.uv\.)?index\]\]|(pip\.)?(index|index-url|default-index|extra-index-url|no-index)\s*=)'
+            }
+            # uv reads UV_CONFIG_FILE in place of every discovered file, and none with UV_NO_CONFIG.
             $files = @($env:UV_CONFIG_FILE, "$env:APPDATA\uv\uv.toml", "$env:ProgramData\uv\uv.toml")
             $dir = (Get-Location -PSProvider FileSystem).ProviderPath
+            # uv's bool parser (Test-UvEnvFlag), inlined: setup.ps1 reaches this before it defines that helper.
+            if (@('1', 't', 'true', 'y', 'yes', 'on') -contains "$env:UV_NO_CONFIG".Trim().ToLowerInvariant()) { $files = @(); $dir = $null }
+            elseif ($env:UV_CONFIG_FILE) { $files = @($env:UV_CONFIG_FILE); $dir = $null }
             while ($dir) {
                 $pyproject = Join-Path $dir 'pyproject.toml'
                 if (Test-Path -LiteralPath (Join-Path $dir 'uv.toml') -PathType Leaf) { $files += Join-Path $dir 'uv.toml'; break }
@@ -4672,6 +4682,8 @@ function Install-UnslothStudio {
         $cernet = 'https://tuna.mirrors.cernet.edu.cn'
         $npmMirror = 'https://registry.npmmirror.com'
         $pypiMirror = "$cernet/pypi/web/simple"
+        # GitHub-release mirrors keep only the newest Python builds, while a pinned uv asks for the builds it shipped with; npmmirror keeps every release.
+        $pythonMirror = "$npmMirror/-/binary/python-build-standalone"
         $minBps = 1MB
         $useUv = -not (Test-MirrorConfigured -Tool uv)
         $usePip = -not (Test-MirrorConfigured -Tool pip)
@@ -4692,6 +4704,7 @@ function Install-UnslothStudio {
         }
         if (-not $env:UNSLOTH_NODE_MIRROR) { $hosts['node'] = @('node', 'npmmirror-node', "$npmMirror/-/binary/node", $null, $null) }
         if (-not "$env:UNSLOTH_NPM_REGISTRY$env:NPM_CONFIG_REGISTRY") { $hosts['npm'] = @('npm', 'npmmirror', $npmMirror, $null, $null) }
+        if (-not (Test-MirrorConfigured -Tool python)) { $hosts['python'] = @('astral', 'npmmirror', $pythonMirror, $null, $null) }
         if (-not "$env:UNSLOTH_UV_WHEEL_MIRROR$env:UV_DOWNLOAD_URL$env:INSTALLER_DOWNLOAD_URL$env:UV_INSTALLER_GHE_BASE_URL$env:UV_INSTALLER_GITHUB_BASE_URL") {
             $hosts['uvbin'] = @('astral', 'cernet-pypi', "$cernet/pypi/web", $null, $null)
         }
@@ -4715,6 +4728,7 @@ function Install-UnslothStudio {
                 'torch' { "UNSLOTH_PYTORCH_MIRROR=$to" }
                 'node' { "UNSLOTH_NODE_MIRROR=$to" }
                 'npm' { "UNSLOTH_NPM_REGISTRY=$to" }
+                'python' { "UV_PYTHON_INSTALL_MIRROR=$to" }
                 'uvbin' { "UNSLOTH_UV_WHEEL_MIRROR=$to" }
             }
         }
@@ -4740,7 +4754,7 @@ function Install-UnslothStudio {
             if ($slow.Count -eq 0) { return }
             $sources = @($slow | ForEach-Object { $hosts[$_][1] } | Select-Object -Unique)
             $indexes = Start-MirrorProbe -Urls @($slow | ForEach-Object { $hosts[$_][3]; $hosts[$_][4] } | Where-Object { $_ }) -Seconds 4 -LastByte 1023
-            $race = Wait-MirrorProbe (Start-MirrorProbe -Urls @($slow | ForEach-Object { $artifact[$hosts[$_][0]] }; $sources | ForEach-Object { $artifact[$_] }) -Seconds 4 -LastByte 1048575)
+            $race = Wait-MirrorProbe (Start-MirrorProbe -Urls @(@($slow | ForEach-Object { $artifact[$hosts[$_][0]] }) + @($sources | ForEach-Object { $artifact[$_] }) | Select-Object -Unique) -Seconds 4 -LastByte 1048575)
             $sourceIndexes = Wait-MirrorProbe $indexes
             foreach ($url in $sourceIndexes.Keys) { $answered[$url] = $sourceIndexes[$url] }
         } finally {
@@ -4765,7 +4779,7 @@ function Install-UnslothStudio {
 
     function Get-MirrorName {
         param([string]$Name)
-        @{ pypi = 'PyPI'; unsynced = 'The PyPI mirror'; torch = 'download.pytorch.org'; node = 'nodejs.org'; npm = 'registry.npmjs.org'; uvbin = 'releases.astral.sh (uv)' }[$Name]
+        @{ pypi = 'PyPI'; unsynced = 'The PyPI mirror'; torch = 'download.pytorch.org'; node = 'nodejs.org'; npm = 'registry.npmjs.org'; python = 'releases.astral.sh (Python builds)'; uvbin = 'releases.astral.sh (uv)' }[$Name]
     }
 
     function Set-MirrorEnv {
@@ -4797,6 +4811,7 @@ function Install-UnslothStudio {
             return
         }
         if ($Output -match 'download(-r2)?\.pytorch\.org') { 'torch' }
+        elseif ($Output -match 'python-build-standalone') { 'python' }
         elseif ($Output -match 'registry\.npmjs\.org') { 'npm' }
         elseif ($Output -match 'pypi\.org|pythonhosted\.org') { 'pypi' }
         elseif ($Ran -and $Output -notmatch 'https?://') { $Ran }
@@ -4901,10 +4916,10 @@ function Install-UnslothStudio {
         }) | ForEach-Object { "$_" }
         $torchArg = [bool](@($words) -like 'https://download.pytorch.org/whl*')
         $pinned = [bool](@($words) -match '^--(index-url|default-index)$')
-        $ran = if ($torchArg) { 'torch' } elseif ($pinned -or @($words) -match '^(--find-links|--no-index|--torch-backend.*|venv)$|://') { '' } else { 'pypi' }
+        $ran = if ($torchArg) { 'torch' } elseif ($pinned -or @($words) -match '^(--find-links|--no-index|--torch-backend.*|venv)$|://') { '' } elseif ($Command.ToString() -match '(^|\s)python\s+install(\s|$)') { 'python' } else { 'pypi' }
         $failed = Get-MirrorFailedHost -Output $Output -Ran $ran
         $ownIndex = $pinned -or @($words) -contains '--no-index'
-        if (-not (($failed -eq 'torch' -and $torchArg) -or ($failed -eq 'pypi' -and -not $pinned) -or ($failed -eq 'unsynced' -and -not $ownIndex))) { return $Code }
+        if (-not (($failed -eq 'torch' -and $torchArg) -or ($failed -eq 'pypi' -and -not $pinned) -or ($failed -eq 'unsynced' -and -not $ownIndex) -or $failed -eq 'python')) { return $Code }
         $pairs = @(Pop-MirrorSpare $failed)
         if (-not $pairs) { return $Code }
         $saved = @{}
@@ -6784,7 +6799,7 @@ exit 0
     if ($SkipTorch) { $InitialGpuBranch = "no_torch" }
     Write-TauriDiag -GpuBranch $InitialGpuBranch -TorchIndexFamily "none" -PythonVersionForDiag $DiagPythonVersion
 
-    foreach ($_mirrorEnvName in @('_UNSLOTH_MIRROR_PROBED', '_UNSLOTH_MIRROR_SPARE', 'UV_INDEX', 'UV_DEFAULT_INDEX', 'UV_INDEX_STRATEGY', 'PIP_INDEX_URL', 'PIP_EXTRA_INDEX_URL', 'UNSLOTH_PYTORCH_MIRROR', 'UNSLOTH_NODE_MIRROR', 'UNSLOTH_NPM_REGISTRY', 'UNSLOTH_UV_WHEEL_MIRROR')) {
+    foreach ($_mirrorEnvName in @('_UNSLOTH_MIRROR_PROBED', '_UNSLOTH_MIRROR_SPARE', 'UV_INDEX', 'UV_DEFAULT_INDEX', 'UV_INDEX_STRATEGY', 'PIP_INDEX_URL', 'PIP_EXTRA_INDEX_URL', 'UNSLOTH_PYTORCH_MIRROR', 'UNSLOTH_NODE_MIRROR', 'UNSLOTH_NPM_REGISTRY', 'UNSLOTH_UV_WHEEL_MIRROR', 'UV_PYTHON_INSTALL_MIRROR')) {
         $script:MirrorEnvSaved[$_mirrorEnvName] = [Environment]::GetEnvironmentVariable($_mirrorEnvName)
     }
     Invoke-MirrorFallback
@@ -7194,7 +7209,8 @@ exit 0
             if ($tried.ContainsKey($version)) { continue }
             $tried[$version] = $true
             $key = "cpython-$version-windows-$uvArch-none"
-            $null = Invoke-InstallCommand -NoMirror -Label "install uv-managed Python $key" {
+            # A transport failure reruns once through the python-build-standalone mirror when the mirror fallback is on.
+            $null = Invoke-InstallCommand -Label "install uv-managed Python $key" {
                 & $script:UvExe python install --no-bin --no-registry $key
             }
             # Asked even when the install failed: a runtime installed earlier serves an offline machine.
