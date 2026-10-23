@@ -1,0 +1,335 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
+
+"""A tile verdict with offload groups still resident streams them at the decode, not before the denoise.
+
+Seen on a 15 GB T4 (Qwen-Image-2.1 fp16, edit at 1024x1024): with 5374 MiB of the text encoder resident, the request
+guard streamed only the MiB the request was priced at, the verdict then said "tile", and the edit decoded in 40-latent
+tiles (PSNR 52.6 dB, max abs 27/255 against the same edit with the encoder streamed, which decoded untiled). Every text
+encoder and transformer output was bit-identical between the two; the first differing module was the decoder input.
+Streaming the groups before the denoise made every step stream them too, so the tiling now waits for the decode:
+the denoise keeps the groups resident, the decode streams the shortfall, decodes untiled and pins them back.
+CPU-only: the decode figures, the snapshot and the group release are stubbed.
+"""
+
+from __future__ import annotations
+
+import types
+
+import pytest
+
+import core.inference.diffusion as diffusion
+from core.inference.diffusion_memory import (
+    ACTIVATION_RUN,
+    ACTIVATION_TILE,
+    ImageActivationVerdict,
+)
+
+UNTILED_NEED = 9000  # MiB the whole-frame decode needs, past FREE_FRACTION
+
+
+class _Card:
+    """Free MiB the decode-time check sees, raised by a release."""
+
+    def __init__(self, free_mib: int, resident_mib: int) -> None:
+        self.free = free_mib
+        self.resident = resident_mib
+        self.releases: list = []
+        self.restored = 0
+
+
+@pytest.fixture
+def card(monkeypatch):
+    c = _Card(free_mib = 6000, resident_mib = 4283)
+
+    def release(
+        pipe,
+        need,
+        logger = None,
+        reason = "",
+        device = None,
+        **kw,
+    ):
+        if c.resident <= 0:
+            return None
+        c.releases.append((need, reason))
+        freed = min(need, c.resident)
+        c.resident -= freed
+        c.free += freed
+
+        def restore():
+            c.restored += 1
+            c.resident += freed
+            c.free -= freed
+
+        return restore
+
+    monkeypatch.setattr(diffusion, "resident_group_mib", lambda pipe: c.resident)
+    monkeypatch.setattr(diffusion, "release_resident_groups", release)
+    monkeypatch.setattr(
+        diffusion, "_untiled_decode_shortfall_mib", lambda vae, z: UNTILED_NEED - c.free
+    )
+    monkeypatch.delenv(diffusion.RELEASE_BEFORE_TILING_ENV, raising = False)
+    return c
+
+
+def _decide(card):
+    return diffusion._release_for_untiled_decode(object(), None, "z", "cuda:0", None)
+
+
+def test_the_shortfall_streams_and_the_decode_runs_untiled(card):
+    untiled, restore = _decide(card)
+    # short 3000 MiB, plus a quarter for the budget's reserve and 256 MiB: 4006 of the 4283 resident
+    assert untiled and card.releases == [(4006, "an untiled VAE decode")]
+    assert card.resident == 277
+    restore()
+    assert card.resident == 4283 and card.restored == 1
+
+
+def test_a_frame_that_already_fits_decodes_untiled_without_streaming(card):
+    card.free = 9500
+    assert _decide(card) == (True, None)
+    assert card.releases == []
+
+
+def test_a_short_first_release_streams_the_rest_once(card, monkeypatch):
+    real = diffusion.release_resident_groups
+    monkeypatch.setattr(
+        diffusion,
+        "release_resident_groups",
+        lambda pipe, need, *a, **k: real(pipe, need if card.releases else need // 4, *a, **k),
+    )
+    untiled, restore = _decide(card)
+    assert untiled and len(card.releases) == 2 and card.resident == 0
+    restore()
+    assert card.resident == 4283 and card.restored == 2
+
+
+def test_still_short_after_every_group_pins_back_and_tiles(card, monkeypatch):
+    monkeypatch.setattr(diffusion, "_untiled_decode_shortfall_mib", lambda vae, z: 1)
+    assert _decide(card) == (False, None)
+    assert card.resident == 4283 and card.restored >= 1
+
+
+def test_a_shortfall_past_every_resident_group_streams_nothing(card):
+    card.resident = 2000  # short 3000 MiB: even all of it leaves the decode tiled
+    assert _decide(card) == (False, None)
+    assert card.releases == []
+
+
+def test_unknown_decode_figures_tile_without_streaming(card, monkeypatch):
+    monkeypatch.setattr(diffusion, "_untiled_decode_shortfall_mib", lambda vae, z: None)
+    assert _decide(card) == (False, None)
+    assert card.releases == []
+
+
+def test_a_broken_release_tiles_and_pins_back(card, monkeypatch):
+    calls = {"n": 0}
+    real = diffusion.release_resident_groups
+
+    def flaky(pipe, need, *a, **k):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("copy stream broke")
+        return real(pipe, need // 4, *a, **k)
+
+    monkeypatch.setattr(diffusion, "release_resident_groups", flaky)
+    assert _decide(card) == (False, None)
+    assert card.resident == 4283 and card.restored == 1
+
+
+def test_a_cancel_mid_release_pins_back_and_propagates(card, monkeypatch):
+    real = diffusion._untiled_decode_shortfall_mib
+    calls = {"n": 0}
+
+    def cancel(vae, z):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise KeyboardInterrupt
+        return real(vae, z)
+
+    monkeypatch.setattr(diffusion, "_untiled_decode_shortfall_mib", cancel)
+    with pytest.raises(KeyboardInterrupt):
+        _decide(card)
+    assert card.resident == 4283 and card.restored == 1
+
+
+def test_chained_restore_runs_the_later_release_first():
+    order: list = []
+    chained = diffusion._chain_restores(
+        lambda: order.append("later"), lambda: order.append("first")
+    )
+    chained()
+    assert order == ["later", "first"]
+    only = lambda: None  # noqa: E731
+    assert diffusion._chain_restores(None, only) is only
+    assert diffusion._chain_restores(only, None) is only
+    assert diffusion._chain_restores(None, None) is None
+
+
+def test_generate_defers_the_tiling_to_the_decode():
+    import inspect
+
+    src = inspect.getsource(diffusion.DiffusionBackend.generate)
+    # the request keeps its tiling engagement (and its refusals) and hands the tiling to the decode
+    assert src.index("restore_vae = _tile_for_verdict(") < src.index("_defer_tiling_to_decode(")
+    assert "release_for_untiled_decode" not in src  # nothing streams before the denoise
+
+
+def test_the_untiled_decode_shortfall_uses_the_wide_tile_rule(monkeypatch):
+    import core.inference.diffusion_vae_tiling as tiling
+
+    monkeypatch.setattr(tiling, "_free_mib", lambda vae, z: (1000.0, 1.0))
+    monkeypatch.setattr(tiling, "_geometry", lambda vae: (16, 32, 4))
+    monkeypatch.setattr(tiling, "_fused", lambda vae: True)
+    z = types.SimpleNamespace(shape = (1, 16, 1, 64, 64), dim = lambda: 5)
+    vae = types.SimpleNamespace(use_slicing = True)
+    per_latent = tiling.decode_mib_per_latent(16, True, "SimpleNamespace")
+    want = 64 * 64 * per_latent / tiling.FREE_FRACTION - 1000
+    assert abs(diffusion._untiled_decode_shortfall_mib(vae, z) - want) <= 1
+    monkeypatch.setattr(tiling, "_free_mib", lambda vae, z: None)
+    assert diffusion._untiled_decode_shortfall_mib(vae, z) is None
+
+
+class _Vae:
+    """A VAE whose decode records the tiling and the resident MiB it ran with."""
+
+    def __init__(
+        self,
+        card: _Card,
+        fail: BaseException | None = None,
+        encode_oom: int = 0,
+    ) -> None:
+        self.card = card
+        self.use_tiling = True  # what engage_vae_tiling left
+        self.fail = fail
+        self.encode_oom = encode_oom
+        self.decodes: list = []
+        self.encodes: list = []
+
+    def decode(self, z):
+        self.decodes.append((self.use_tiling, self.card.resident))
+        if self.fail is not None:
+            raise self.fail
+        return z
+
+    def encode(self, x):
+        self.encodes.append(self.use_tiling)
+        if self.encode_oom:
+            self.encode_oom -= 1
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return x
+
+    def disable_tiling(self):
+        self.use_tiling = False
+
+
+def _priced(free: int) -> ImageActivationVerdict:
+    # untiled: 6952 MiB of activations + the 2048 MiB fixed overhead = 9000 MiB
+    return ImageActivationVerdict(
+        ACTIVATION_TILE, needed_mib = 6952, tiled_needed_mib = 2952, budget_mib = free
+    )
+
+
+TARGET = types.SimpleNamespace(torch_device = "cuda:0")
+
+
+def _armed(
+    card,
+    vae,
+    verdict = None,
+):
+    pipe = types.SimpleNamespace(vae = vae)
+    undone: list = []
+
+    def restore_vae():
+        undone.append(True)
+        vae.disable_tiling()
+
+    restore = diffusion._defer_tiling_to_decode(
+        pipe, pipe, verdict or _priced(6000), TARGET, {}, restore_vae, None
+    )
+    return restore, undone
+
+
+def test_the_denoise_keeps_the_groups_and_the_decode_streams_them_untiled(card):
+    vae = _Vae(card)
+    restore, undone = _armed(card, vae)
+    assert vae.use_tiling is False and card.releases == []  # nothing streamed before the denoise
+    assert vae.encode("x") == "x" and vae.encodes == [False]  # the edit's encode runs untiled too
+    assert vae.decode("z") == "z"
+    assert vae.decodes == [(False, 277)]  # the shortfall streamed, the decode untiled
+    assert (
+        card.resident == 4283 and card.restored == 1
+    )  # pinned back as soon as the decode returned
+    stats = vae.__dict__[diffusion.RELEASE_BEFORE_TILING_STATS]
+    assert stats["untiled"] == 1 and stats["tiled"] == 0 and stats["released_mib"] == 4006
+    restore()
+    assert "decode" not in vae.__dict__ and "encode" not in vae.__dict__  # the wrappers are gone
+    assert undone == [True] and vae.use_tiling is False
+
+
+def test_every_decode_of_a_request_streams_and_pins_back_on_its_own(card):
+    vae = _Vae(card)
+    restore, _ = _armed(card, vae)
+    vae.decode("a")
+    vae.decode("b")
+    assert vae.decodes == [(False, 277), (False, 277)] and card.restored == 2
+    restore()
+
+
+def test_a_decode_that_still_does_not_fit_tiles_as_before(card, monkeypatch):
+    vae = _Vae(card)
+    restore, _ = _armed(card, vae)
+    monkeypatch.setattr(diffusion, "_untiled_decode_shortfall_mib", lambda vae, z: 1)
+    vae.decode("z")
+    assert vae.decodes == [(True, 4283)] and vae.use_tiling is False
+    assert vae.__dict__[diffusion.RELEASE_BEFORE_TILING_STATS]["tiled"] == 1
+    restore()
+
+
+def test_a_failing_or_cancelled_decode_pins_the_groups_back(card):
+    for exc in (RuntimeError("decode broke"), KeyboardInterrupt()):
+        vae = _Vae(card, fail = exc)
+        restore, _ = _armed(card, vae)
+        with pytest.raises(type(exc)):
+            vae.decode("z")
+        assert card.resident == 4283 and vae.use_tiling is False
+        restore()
+
+
+def test_an_untiled_encode_out_of_memory_retries_tiled(card):
+    vae = _Vae(card, encode_oom = 1)
+    restore, _ = _armed(card, vae)
+    assert vae.encode("x") == "x"
+    assert vae.encodes == [False, True] and vae.use_tiling is False
+    assert vae.__dict__[diffusion.RELEASE_BEFORE_TILING_STATS]["encode_oom"] == 1
+    restore()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["kill", "run", "overridden", "nothing_resident", "hopeless", "split", "not_engaged"],
+)
+def test_cases_that_do_not_stream_keep_the_request_tiling(card, monkeypatch, case):
+    verdict = _priced(6000)
+    vae = _Vae(card)
+    if case == "kill":
+        monkeypatch.setenv(diffusion.RELEASE_BEFORE_TILING_ENV, "0")
+    elif case == "run":
+        verdict = ImageActivationVerdict(ACTIVATION_RUN)
+    elif case == "overridden":
+        verdict = ImageActivationVerdict(ACTIVATION_TILE, overridden = True)
+    elif case == "nothing_resident":
+        card.resident = 0
+    elif case == "hopeless":
+        card.resident = 2000  # the request is short 3000 MiB
+    elif case == "split":
+        monkeypatch.setattr(diffusion, "_vae_on_other_card", lambda pipe, target: "cuda:1")
+    elif case == "not_engaged":
+        vae.use_tiling = False
+    pipe = types.SimpleNamespace(vae = vae)
+    restore_vae = vae.disable_tiling
+    out = diffusion._defer_tiling_to_decode(pipe, pipe, verdict, TARGET, {}, restore_vae, None)
+    assert out is restore_vae and "decode" not in vae.__dict__ and "encode" not in vae.__dict__
+    assert card.releases == []
