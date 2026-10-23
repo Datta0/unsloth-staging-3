@@ -35,6 +35,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from core.inference.inference_gate import holds_inference
 from core._torchao_stub import (
     alias_torchao_fqn_to_config,
     hide_xformers_built_for_another_torch,
@@ -12561,7 +12562,7 @@ class DiffusionBackend:
         )
 
     @_release_render_on_unload
-    @with_hires
+    @holds_inference
     def generate(
         self,
         *,

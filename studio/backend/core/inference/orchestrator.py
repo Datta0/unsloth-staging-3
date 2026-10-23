@@ -14,6 +14,7 @@ import contextlib
 import os
 import signal
 from loggers import get_logger
+from core.inference.inference_gate import holds_inference
 from utils.gpu_memory_events import invalidates_gpu_memory as _invalidates_gpu_memory
 import multiprocessing as mp
 import queue
@@ -1743,6 +1744,7 @@ class InferenceOrchestrator:
                 logger.exception("Inference dispatcher: failed to route a response; continuing")
                 continue
 
+    @holds_inference
     def _generate_dispatched(
         self,
         messages: list = None,
@@ -2068,6 +2070,7 @@ class InferenceOrchestrator:
     load_generation: int = 0
 
     @_invalidates_gpu_memory("inference load")
+    @holds_inference
     def load_model(
         self,
         config,
@@ -3041,6 +3044,7 @@ class InferenceOrchestrator:
                     reply_returns = calls_tools,
                 ),
                 count_tokens = _count,
+                cancel_check = lambda: bool(cancel_event is not None and cancel_event.is_set()),
             )
             fitted = recall["conversation"]
             truncation = {**truncation, **recall["counts"]}
@@ -3592,6 +3596,7 @@ class InferenceOrchestrator:
             if callable(close):
                 close()
 
+    @holds_inference
     def _generate_inner(
         self,
         messages: list = None,
@@ -3894,6 +3899,7 @@ class InferenceOrchestrator:
         )
         return outputs
 
+    @holds_inference
     def generate_audio_response(
         self,
         text: str,
@@ -4145,6 +4151,7 @@ class InferenceOrchestrator:
                     self._release_worker(cancel_event)
                     release_mailbox()
 
+    @holds_inference
     def generate_whisper_response(
         self,
         audio_array,
@@ -4165,6 +4172,7 @@ class InferenceOrchestrator:
             extra_audio_arrays = extra_audio_arrays,
         )
 
+    @holds_inference
     def generate_audio_input_response(
         self,
         messages,
