@@ -52,20 +52,57 @@ def saving_progress(media: str) -> Optional[dict]:
     return None
 
 
-@contextlib.contextmanager
-def _saving_marker(media: str, account: Optional[str]):
-    key = (media, account)
+def _enter_saving(key: tuple[str, Optional[str]]) -> None:
     with _lock:
         _saving[key] = _saving.get(key, 0) + 1
+
+
+def _leave_saving(key: tuple[str, Optional[str]]) -> None:
+    with _lock:
+        left = _saving.get(key, 1) - 1
+        if left > 0:
+            _saving[key] = left
+        else:
+            _saving.pop(key, None)
+
+
+# (media, account id) -> how many load POSTs are still before their engine registers the load.
+_preparing: dict[tuple[str, Optional[str]], int] = {}
+
+
+def load_preparing(media: str) -> bool:
+    """Whether one of the caller's load POSTs is still in its preflight (evidence, checks, acquire)."""
+    with _lock:
+        return bool(_preparing.get((media, _account_id())))
+
+
+@contextlib.contextmanager
+def preparing_load(media: str):
+    """Held around a load POST: until begin_load registers the load, load-progress still
+    describes the previous model, and a page reopened then must not read its "ready" or null
+    as this load having ended."""
+    key = (media, _account_id())
+    with _lock:
+        _preparing[key] = _preparing.get(key, 0) + 1
     try:
         yield
     finally:
         with _lock:
-            left = _saving.get(key, 1) - 1
+            left = _preparing.get(key, 1) - 1
             if left > 0:
-                _saving[key] = left
+                _preparing[key] = left
             else:
-                _saving.pop(key, None)
+                _preparing.pop(key, None)
+
+
+@contextlib.contextmanager
+def _saving_marker(media: str, account: Optional[str]):
+    key = (media, account)
+    _enter_saving(key)
+    try:
+        yield
+    finally:
+        _leave_saving(key)
 
 
 def _delete(manifest) -> None:
@@ -103,13 +140,21 @@ class SwapSave:
         manifest: Optional[dict] = None,
         *,
         log_swap: bool = True,
+        saving: Optional[tuple[str, Optional[str]]] = None,
     ):
         self._manifest = manifest
         # Off logs the eviction here; When they fit's residency code already logs it as "evicted".
         self._log_swap = log_swap
+        # The save's progress marker, held through the acquire: chat's eviction and the VRAM wait run
+        # before begin_load registers the load, and a page resumed during the save must not read that
+        # gap as a load that ended.
+        self._saving = saving
 
     def close(self) -> None:
         global _pending, _committed
+        saving, self._saving = self._saving, None
+        if saving is not None:
+            _leave_saving(saving)
         manifest, self._manifest = self._manifest, None
         if manifest is None:
             return
@@ -256,7 +301,9 @@ async def save_chat_kv_before_swap(
     future = loop.create_future()
     manifest = None
     cancelled = None
-    with _saving_marker(media, account):
+    saving = (media, account)
+    _enter_saving(saving)
+    try:
         threading.Thread(
             target = _save_in_thread,
             args = (llama, should_abort, abort, loop, future),
@@ -280,19 +327,23 @@ async def save_chat_kv_before_swap(
                 )
             else:
                 logger.debug("chat KV swap save failed: %s", exc)
-    if cancelled is not None:
-        raise cancelled
-    try:
-        if manifest and (abort.is_set() or _chat_busy(counted)):
+        if cancelled is not None:
+            raise cancelled
+        try:
+            if manifest and (abort.is_set() or _chat_busy(counted)):
+                _delete(manifest)
+                manifest = None
+        except Exception:
             _delete(manifest)
             manifest = None
-    except Exception:
-        _delete(manifest)
-        manifest = None
+    except BaseException:
+        _leave_saving(saving)
+        raise
+    # From here the returned handle owns the marker, released by close() once the acquire is done.
     if not manifest:
-        return SwapSave()
+        return SwapSave(saving = saving)
     entry = {"identity": identity, "origin": "swap", **manifest}
     with _lock:
         older, _pending = _pending, entry
     _delete(older)
-    return SwapSave(entry, log_swap = policy == "off")
+    return SwapSave(entry, log_swap = policy == "off", saving = saving)
